@@ -89,3 +89,33 @@ To keep the compiler's IR parser minimal, high-level constructs are aggressively
 Codecs do not bind to specific, named types. Instead, they act as **declarative predicates** that filter based on topological location and structural constraints. 
 
 Because the metamodel tracks exact integer bounds, a codec signature can express logic like: *"I can encode any integer, as long as its maximum value fits in a byte."*
+
+```mermaid
+graph TD
+    subgraph Tier1 [Tier 1: The Semantic Model - The Route]
+        SM[Abstract Data Intent <br/> Struct, List, Integer, Union, Char]
+    end
+
+    PROJ[Projection Engine <br/> Composable Mapping Rules]
+
+    subgraph Generation [Compile-Time Generation]
+        TDM[Tier 2: Target Data Model <br/> Native Host Memory / C++ Structs]
+        IR[Parser & Formatter Layer <br/> Zero-Allocation IR Codecs]
+    end
+
+    subgraph Tier3 [Tier 3: The Wire Format - The Bytes]
+        WF[(Physical Wire Representation <br/> LEB128, Bit-packed, JSON, YAML)]
+    end
+
+    SM --> PROJ
+    PROJ ==>|Generates memory structures| TDM
+    PROJ ==>|Generates execution logic| IR
+
+    TDM <==>|"Inversion of Control ($target Proxy)"| IR
+    IR <==>|"Stream Iterator"| WF
+
+    style Tier1 fill:#f3e5f5,stroke:#ab47bc,stroke-width:2px,color:#000
+    style Tier3 fill:#e8f5e9,stroke:#66bb6a,stroke-width:2px,color:#000
+    style Generation fill:#fff3e0,stroke:#ffa726,stroke-width:2px,color:#000
+    style PROJ fill:#eceff1,stroke:#78909c,stroke-width:2px,color:#000
+```
