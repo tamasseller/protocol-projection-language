@@ -1,0 +1,35 @@
+{
+  "scopeName": "inline.ir",
+  "injectionSelector": "L:source.ts -comment -string",
+  "patterns": [
+    {
+      "begin": "([a-zA-Z0-9_]*ir)\s*(`)",
+      "beginCaptures": {
+        "1": { "name": "entity.name.function.ts" },
+        "2": { "name": "punctuation.definition.string.template.begin.ts" }
+      },
+      "end": "(`)",
+      "endCaptures": {
+        "1": { "name": "punctuation.definition.string.template.end.ts" }
+      },
+      "patterns": [
+        {
+          "match": "\\b(SWITCH|CASE|DEFAULT|FOR|TRAP|READ_[A-Z0-9]+|WRITE_[A-Z0-9]+)\\b",
+          "name": "keyword.control.ir"
+        },
+        {
+          "begin": "\\$\\{",
+          "beginCaptures": {
+            "0": { "name": "punctuation.definition.template-expression.begin.ts" }
+          },
+          "end": "\\}",
+          "endCaptures": {
+            "0": { "name": "punctuation.definition.template-expression.end.ts" }
+          },
+          "contentName": "meta.embedded.line.ts",
+          "patterns": [{ "include": "source.ts" }]
+        }
+      ]
+    }
+  ]
+}

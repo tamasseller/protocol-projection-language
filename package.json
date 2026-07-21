@@ -1,0 +1,16 @@
+{
+  "name": "declarative-serialization-compiler",
+  "version": "1.0.0",
+  "description": "Zero-allocation multi-pass serialization compiler",
+  "main": "src/index.ts",
+  "scripts": {
+    "build": "tsc",
+    "start": "ts-node src/index.ts"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.4.0"
+  }
+}

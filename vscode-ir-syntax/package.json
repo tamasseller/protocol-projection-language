@@ -1,0 +1,16 @@
+{
+  "name": "vscode-ir-syntax",
+  "displayName": "IR DSL Syntax",
+  "version": "1.0.0",
+  "engines": { "vscode": "^1.80.0" },
+  "categories": ["Programming Languages"],
+  "contributes": {
+    "grammars": [
+      {
+        "scopeName": "inline.ir",
+        "injectTo": ["source.ts", "source.tsx"],
+        "path": "./syntaxes/ir.tmLanguage.json"
+      }
+    ]
+  }
+}
