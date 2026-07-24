@@ -5,10 +5,12 @@
   "main": "src/index.ts",
   "scripts": {
     "build": "tsc",
-    "start": "ts-node src/index.ts"
+    "start": "ts-node src/index.ts",
+    "test": "ts-node --project tsconfig.test.json test/matcher.runtime.test.ts",
+    "test:types": "tsc --project tsconfig.test.json"
   },
   "devDependencies": {
-    "@types/node": "^20.19.43",
+    "@types/node": "^26.1.1",
     "ts-node": "^10.9.2",
     "typescript": "^5.4.0"
   }

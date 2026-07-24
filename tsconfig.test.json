@@ -1,0 +1,14 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "noEmit": true
+  },
+  "include": ["src", "test"],
+  "exclude": [
+    "src/index.ts",
+    "src/codecs.ts",
+    "src/ir-builder.ts"
+  ]
+}
+

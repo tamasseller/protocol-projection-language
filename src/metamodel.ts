@@ -35,13 +35,13 @@ export interface ListType
 export interface StructType 
 {
     kind: SemanticTypeKinds.Struct
-    fields: SemanticField[]
+    fields: Map<string, SemanticType>
 }
 
 export interface UnionType 
 {
     kind: SemanticTypeKinds.Union
-    variants: SemanticField[]
+    variants: Map<string, SemanticType>
 }
 
 export const kindOf = (t: SemanticType): SemanticTypeKinds | "reference" => typeof t === "function" ? "reference" : t.kind
@@ -71,11 +71,11 @@ export const list = (T: SemanticType, capacity?: number): ListType => ({kind: Se
 export const struct = (def: {[k: string]: SemanticType}): StructType =>
 ({
     kind: SemanticTypeKinds.Struct,
-    fields: Object.entries(def).map(([k, v]) => ({name: k, type: v}))
+    fields: new Map(Object.entries(def))
 })
 
 export const union = (def: {[k: string]: SemanticType}): UnionType =>
 ({
     kind: SemanticTypeKinds.Union,
-    variants: Object.entries(def).map(([k, v]) => ({name: k, type: v}))
+    variants: new Map(Object.entries(def))
 })
