@@ -234,24 +234,69 @@ export const matchAnyOf = <P extends AnyOfPattern>(T: SemanticType, P: P): Match
 
 ////////////////////////////////////////////////////////////////////////////////////////////////
 
-export type TypePattern = UnitPattern | IntegerPattern | ListPattern | StructPattern | StructFieldsPattern | UnionPattern | AnyOfPattern
-export type TypeMatch = UnitMatch | IntegerMatch | ListMatch | StructMatch | StructFieldsMatch | UnionMatch | AnyOfMatch
+/**
+ * The hole / boundary pattern (iburg-style nonterminal leaf).
+ *
+ * A rule covers every position its pattern matches, EXCEPT at `Star`
+ * positions: there coverage stops and independent matching (re-dispatch
+ * to root) happens. This is the explicit, author-written edge of the
+ * pattern tree — the selector between "absorb" and "re-dispatch."
+ *
+ * Without `inner`: matches any type, always succeeds. The runner treats
+ * it as a re-dispatch boundary (don't cover, don't descend).
+ *
+ * With `inner`: matches only if `inner` matches (lookahead/filter), but
+ * still re-dispatches independently. The inner witness is carried for
+ * the rule author's inspection.
+ */
+export interface StarPattern<I extends TypePattern | undefined = TypePattern | undefined>
+{
+    kind: "star"
+    inner?: I
+}
+
+export const isStarPattern = (P: TypePattern): P is StarPattern => (P as StarPattern).kind === "star"
+
+export interface StarMatch
+{
+    kind: "star"
+    /** Present only if the StarPattern had an `inner`; carries its witness. */
+    innerMatch?: TypeMatch
+}
+
+export const matchStar = <P extends StarPattern>(T: SemanticType, P: P): MatchOf<P> | undefined =>
+{
+    if(P.inner !== undefined)
+    {
+        const m = matchType(T, P.inner)
+        if(m === undefined) return undefined
+        return {kind: "star", innerMatch: m} as MatchOf<P>
+    }
+    return {kind: "star"} as MatchOf<P>
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////
+
+export type TypePattern = UnitPattern | IntegerPattern | ListPattern | StructPattern | StructFieldsPattern | UnionPattern | AnyOfPattern | StarPattern
+export type TypeMatch = UnitMatch | IntegerMatch | ListMatch | StructMatch | StructFieldsMatch | UnionMatch | AnyOfMatch | StarMatch
 
 export type MatchOf<P extends TypePattern> =
-    P extends AnyOfPattern         ? AnyOfMatch<ReturnType<P["alternatives"]>>
-  : P extends ListPattern           ? ListMatch<MatchOf<P["elementPattern"]>>
-  : P extends StructFieldsPattern   ? StructFieldsMatch<MatchOf<P["elementPattern"]>>
-  : P extends StructPattern         ? StructMatch<P["fieldPatterns"]>
-  : P extends UnionPattern          ? UnionMatch<P["variantPatterns"]>
-  : P extends IntegerPattern        ? IntegerMatch
-  : P extends UnitPattern            ? UnitMatch
+    P extends StarPattern            ? StarMatch
+  : P extends AnyOfPattern           ? AnyOfMatch<ReturnType<P["alternatives"]>>
+  : P extends ListPattern             ? ListMatch<MatchOf<P["elementPattern"]>>
+  : P extends StructFieldsPattern     ? StructFieldsMatch<MatchOf<P["elementPattern"]>>
+  : P extends StructPattern           ? StructMatch<P["fieldPatterns"]>
+  : P extends UnionPattern            ? UnionMatch<P["variantPatterns"]>
+  : P extends IntegerPattern          ? IntegerMatch
+  : P extends UnitPattern              ? UnitMatch
   : never
 
 export function matchType<P extends TypePattern>(T: SemanticType, P: P): MatchOf<P> | undefined
 {
-    // AnyOf is type-agnostic: it dispatches before the type-kind switch
-    // and re-enters matchType per alternative (which handles references).
-    if(isAnyOfPattern(P))       return matchAnyOf(T, P)
+    // Star and AnyOf are type-agnostic: they dispatch before the type-kind
+    // switch and re-enter matchType per alternative (which handles references).
+    if(isStarPattern(P))         return matchStar(T, P)
+    if(isAnyOfPattern(P))        return matchAnyOf(T, P)
     if(isUnit(T))               return (isUnitPattern(P)           ? matchUnit(T, P)           : undefined) as MatchOf<P> | undefined
     if(isInteger(T))            return (isIntegerPattern(P)        ? matchInteger(T, P)        : undefined) as MatchOf<P> | undefined
     if(isList(T))               return (isListPattern(P)          ? matchList(T, P)           : undefined) as MatchOf<P> | undefined
@@ -321,24 +366,18 @@ export const pAnyOf = <Ps extends readonly TypePattern[]>(alternatives: () => Ps
     alternatives,
 })
 
-// Compile-time and runtime tests live under /test at the project root.
-// See test/matcher.types.test.ts and test/matcher.runtime.test.ts.
+/**
+ * The hole / re-dispatch boundary (iburg-style nonterminal leaf).
+ *
+ * `pStar()` — match anything, re-dispatch independently, do NOT cover.
+ * `pStar(inner)` — match only if `inner` matches (lookahead/filter),
+ *                  but still re-dispatch independently.
+ *
+ * This is the explicit, author-written edge of the pattern tree: the
+ * selector between "absorb this subtree" and "handle it independently."
+ */
+export const pStar = <I extends TypePattern | undefined = undefined>(inner?: I): StarPattern<I> => ({
+    kind: "star",
+    inner,
+})
 
-// export function printTypeAst(T: SemanticType): string
-// {
-//     if(isUnit(T)) return printUnit(T)
-//     if(isInteger(T)) return printInteger(T)
-//     if(isList(T)) return printList(T)
-//     if(isStruct(T)) return printStruct(T)
-//     if(isUnion(T)) return printUnion(T)
-//     if(isReference(T)) return printReference(T)
-
-//     throw "Nope"
-// }
-
-// const printUnit = (_: UnitType): string => "-"
-// const printInteger = (S: IntegerType): string => `(${S.min}, ${S.max})`
-// const printList = (S: ListType): string => printTypeAst(S.elementType) + "[" + (S.capacity ?? "") + "]"
-// const printStruct = (S: StructType): string => `{${S.fields.map(({name, type}) => `${name}: ${printTypeAst(type)}`).join("; ")}}`
-// const printUnion = (S: UnionType): string => `<${S.variants.map(({name, type}) => `${name}: ${printTypeAst(type)}`).join(" | ")}>`
-// const printReference = (S: () => SemanticType): string => "^"

@@ -1,0 +1,166 @@
+/**
+ * Layer 1: Ruleset runner with automatic coverage (default-absorb).
+ *
+ * A rule covers every position its pattern matches, EXCEPT at `pStar`
+ * holes (iburg-style nonterminal leaves): there coverage stops and
+ * independent matching (re-dispatch to root) happens. Coverage is derived
+ * automatically from the (TypeNode, Pattern, Match) witness — no manual
+ * claim extraction by the rule author.
+ *
+ * Pre-order traversal (parents before children) ensures a parent rule
+ * runs before the iteration reaches its children, so covered descendants
+ * are already marked when visited.
+ *
+ * Pure compile-time host machinery. No IR impact.
+ */
+import {TypeGraph, TypeNode, Step, child} from "./type-graph"
+import {
+    TypePattern,
+    TypeMatch,
+    MatchOf,
+    matchType,
+    isStarPattern,
+    isAnyOfPattern,
+    isListPattern,
+    isStructPattern,
+    isStructFieldsPattern,
+    isUnionPattern,
+    AnyOfMatch,
+    StructFieldsMatch,
+    StructMatch,
+    UnionMatch,
+    ListMatch,
+} from "./matcher"
+
+export interface Rule<C>
+{
+    readonly pattern: TypePattern
+    readonly produce: (match: MatchOf<TypePattern>, nodeId: number, graph: TypeGraph) => C
+}
+
+/**
+ * Run a ruleset against the type graph.
+ *
+ * For each TypeNode (in id order, pre-order): if already covered by an
+ * earlier rule's coverage set, skip. Otherwise try rules in priority
+ * order; first match wins; call produce() to assign a capability; then
+ * derive the coverage set (all positions the witness touches, except
+ * under pStar holes) so descendants are skipped.
+ *
+ * @returns Map<nodeId, C> — covered-but-not-directly-matched nodes are
+ *   absent (they inherit the absorbing rule's capability conceptually;
+ *   direct queries return undefined, same as unmatched nodes for now).
+ */
+export function runRuleset<C>(
+    graph: TypeGraph,
+    rules: ReadonlyArray<Rule<C>>,
+): Map<number, C>
+{
+    const result = new Map<number, C>()
+    const covered = new Set<number>()
+
+    for(const node of graph.nodes.values())
+    {
+        if(covered.has(node.id)) continue
+
+        for(const rule of rules)
+        {
+            const m = matchType(node.type, rule.pattern)
+            if(m !== undefined)
+            {
+                result.set(node.id, rule.produce(m, node.id, graph))
+                deriveCoverage(node, rule.pattern, m, graph, covered)
+                break
+            }
+        }
+    }
+
+    return result
+}
+
+/**
+ * Walk (TypeNode, Pattern, Match) in lockstep. Cover THIS node for
+ * non-leaf patterns (except Star and AnyOf, which don't claim the node
+ * they sit at), then descend into children — stopping at Star holes.
+ *
+ * Coverage rule:
+ * - Star: boundary. Do NOT cover, do NOT descend. (Re-dispatch happens
+ *   via normal iteration, which will reach this node uncovered.)
+ * - AnyOf: don't cover the AnyOf position itself (it's a dispatcher, not
+ *   a structural node); follow the winning branch into its witness.
+ * - Struct/Union/List/StructFields: cover THIS node, descend into each
+ *   child via the witness's structural correlation.
+ * - Unit/Integer: leaves. No children; nothing to cover below.
+ */
+function deriveCoverage(
+    node: TypeNode,
+    pattern: TypePattern,
+    match: TypeMatch,
+    graph: TypeGraph,
+    covered: Set<number>,
+): void
+{
+    // Hole: stop. Don't cover, don't descend.
+    if(isStarPattern(pattern)) return
+
+    // AnyOf: dispatcher; follow the winning branch, don't cover here.
+    if(isAnyOfPattern(pattern))
+    {
+        const am = match as AnyOfMatch
+        const alts = pattern.alternatives()
+        deriveCoverage(node, alts[am.branch] as TypePattern, am.match, graph, covered)
+        return
+    }
+
+    // Structural non-leaf patterns: cover THIS node, then descend.
+    if(isStructFieldsPattern(pattern))
+    {
+        covered.add(node.id)
+        const sm = match as StructFieldsMatch
+        for(const f of sm.fieldMatches)
+        {
+            const childNode = child(node, {field: f.name})
+            if(childNode) deriveCoverage(childNode, pattern.elementPattern, f.match, graph, covered)
+        }
+        return
+    }
+
+    if(isStructPattern(pattern))
+    {
+        covered.add(node.id)
+        const sm = match as StructMatch
+        for(const [name, subPattern] of Object.entries(pattern.fieldPatterns))
+        {
+            const childNode = child(node, {field: name})
+            if(childNode) deriveCoverage(childNode, subPattern as TypePattern, sm.fieldMatches[name], graph, covered)
+        }
+        return
+    }
+
+    if(isUnionPattern(pattern))
+    {
+        covered.add(node.id)
+        const um = match as UnionMatch
+        for(const [name, subPattern] of Object.entries(pattern.variantPatterns))
+        {
+            const childNode = child(node, {variant: name})
+            if(childNode) deriveCoverage(childNode, subPattern as TypePattern, um.variantMatches[name], graph, covered)
+        }
+        return
+    }
+
+    if(isListPattern(pattern))
+    {
+        covered.add(node.id)
+        const lm = match as ListMatch
+        const childNode = child(node, {element: true})
+        if(childNode) deriveCoverage(childNode, pattern.elementPattern, lm.elementMatch, graph, covered)
+        return
+    }
+
+    // Unit, Integer: leaves. They ARE covered positions (absorbed by the
+    // enclosing rule) — only pStar is a hole. No children to descend into.
+    covered.add(node.id)
+}
+
+export {TypeGraph, TypeNode, Step, child}

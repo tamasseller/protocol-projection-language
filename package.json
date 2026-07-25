@@ -6,7 +6,7 @@
   "scripts": {
     "build": "tsc",
     "start": "ts-node src/index.ts",
-    "test": "ts-node --project tsconfig.test.json test/matcher.runtime.test.ts",
+    "test": "ts-node --project tsconfig.test.json test/run-all.ts",
     "test:types": "tsc --project tsconfig.test.json"
   },
   "devDependencies": {

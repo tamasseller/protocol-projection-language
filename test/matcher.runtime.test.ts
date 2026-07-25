@@ -13,7 +13,7 @@ import {test} from "node:test"
 import * as assert from "node:assert/strict"
 
 import {integer, list, struct, union, unit} from "../src/metamodel"
-import {AnyOfMatch, matchType, pAnyOf, pInteger, pList, pStruct, pStructFields, pUnion, pUnit, StructFieldsMatch} from "../src/matcher"
+import {AnyOfMatch, matchType, pAnyOf, pInteger, pList, pStar, pStruct, pStructFields, pUnion, pUnit, StructFieldsMatch} from "../src/matcher"
 import {SemanticTypeKinds} from "../src/metamodel"
 
 ////////////////////////////////////////////////////////////////////////////////////////////////
@@ -272,4 +272,37 @@ test("structfields+anyof: all-optional struct yields all branch 0", () => {
     assert.equal(m?.fieldMatches.length, 2)
     assert.equal((m?.fieldMatches[0].match as AnyOfMatch | undefined)?.branch, 0)
     assert.equal((m?.fieldMatches[1].match as AnyOfMatch | undefined)?.branch, 0)
+})
+
+////////////////////////////////////////////////////////////////////////////////////////////////
+// Star (hole / re-dispatch boundary)
+////////////////////////////////////////////////////////////////////////////////////////////////
+
+test("star: pStar() matches any type", () => {
+    assert.notEqual(matchType(integer(0, 1), pStar()), undefined)
+    assert.notEqual(matchType(unit, pStar()), undefined)
+    assert.notEqual(matchType(struct({a: integer(0, 1)}), pStar()), undefined)
+})
+
+test("star: pStar(inner) matches only if inner matches", () => {
+    assert.notEqual(matchType(integer(0, 1), pStar(pInteger(0, 255))), undefined)
+    assert.equal(matchType(unit, pStar(pInteger(0, 255))), undefined)
+})
+
+test("star: pStar(inner) carries the inner witness", () => {
+    const m = matchType(integer(10, 100), pStar(pInteger(0, 255))) as any
+    assert.equal(m?.kind, "star")
+    assert.equal(m?.innerMatch?.kind, SemanticTypeKinds.Integer)
+    assert.equal(m?.innerMatch?.min, 10)
+})
+
+test("star: nested under pUnion marks the value variant as a hole", () => {
+    // Optional<T> = union({value: T, empty: unit}). The value variant
+    // uses pStar — the re-dispatch boundary.
+    const Optional = (T: any) => union({value: T, empty: unit})
+    const T = Optional(integer(0, 255))
+    const m = matchType(T, pUnion({value: pStar(), empty: pUnit()})) as any
+    assert.equal(m?.kind, SemanticTypeKinds.Union)
+    assert.equal(m?.variantMatches?.value?.kind, "star")
+    assert.equal(m?.variantMatches?.empty?.kind, SemanticTypeKinds.Unit)
 })

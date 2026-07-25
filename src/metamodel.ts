@@ -13,6 +13,9 @@ export const enum SemanticTypeKinds
 
 export type SemanticType = UnitType | IntegerType | StructType | UnionType | ListType | (() => SemanticType)
 
+/** A SemanticType with reference thunks deref'd — the form stored in a TypeNode. */
+export type ConcreteSemanticType = UnitType | IntegerType | StructType | UnionType | ListType
+
 export type SemanticField = {name: string; type: SemanticType}
 
 export interface UnitType {kind: SemanticTypeKinds.Unit}
