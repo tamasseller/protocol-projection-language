@@ -9,8 +9,13 @@ import * as assert from "node:assert/strict"
 import {integer, list, struct, union, unit} from "../src/metamodel"
 import {buildTypeGraph, child} from "../src/type-graph"
 import {Rule, runRuleset} from "../src/projection"
+import {extractTraits, TraitRegistry, tag, defineTrait, TypeNameTrait, named} from "../src/traits"
 import {pInteger, pList, pStar, pStruct, pStructFields, pUnion, pUnit, pAnyOf} from "../src/matcher"
 // pList imported for completeness; not all are used in every test.
+
+// Test-local convenience: run a ruleset with traits extracted from the graph.
+const run = <C>(g: ReturnType<typeof buildTypeGraph>, rules: ReadonlyArray<Rule<C>>): Map<number, C> =>
+    runRuleset(g, rules, extractTraits(g))
 
 ////////////////////////////////////////////////////////////////////////////////////////////////
 // Single ruleset: basic coverage
@@ -27,7 +32,7 @@ test("runner: first matching rule per node wins", () => {
         {pattern: pStruct({a: pStar(), b: pStar()}), produce: (_m, id) => `struct@${id}`},
     ]
 
-    const r = runRuleset(g, rules)
+    const r = run(g, rules)
     assert.equal(r.size, 3)
     const aId = child(g.root, {field: "a"})!.id
     const bId = child(g.root, {field: "b"})!.id
@@ -41,7 +46,7 @@ test("runner: uncovered nodes are absent from the result", () => {
     const g = buildTypeGraph(T)
 
     // A ruleset that only handles integers.
-    const r = runRuleset(g, [{pattern: pInteger(0, 255), produce: () => "int"}])
+    const r = run(g, [{pattern: pInteger(0, 255), produce: () => "int"}])
     const aId = child(g.root, {field: "a"})!.id
     const bId = child(g.root, {field: "b"})!.id
     assert.equal(r.has(aId), true)
@@ -54,7 +59,7 @@ test("runner: priority order — earlier rule shadows later", () => {
     const T = integer(0, 1)
     const g = buildTypeGraph(T)
 
-    const r = runRuleset(g, [
+    const r = run(g, [
         {pattern: pInteger(0, 255), produce: () => "specific"},  // matches first
         {pattern: pInteger(0, 1),   produce: () => "narrower"},   // would also match, but shadowed
     ])
@@ -77,7 +82,7 @@ test("runner: recursive type handled without infinite recursion", () => {
     // the given patterns (pUnion needs exact variant set, and the union
     // has `internal` which the pattern omits). The key assertion is that
     // the runner terminates on the cyclic graph without infinite recursion.
-    const r = runRuleset(g, [
+    const r = run(g, [
         {pattern: pInteger(0, 1),  produce: () => "leaf"},
     ])
 
@@ -101,7 +106,7 @@ test("runner: structfields+anyof partition produces per-field branch tags", () =
     interface FieldPlan {name: string, optional: boolean, childNodeId: number}
     interface WireCap {kind: "presence-bitmap", fields: FieldPlan[]}
 
-    const r = runRuleset<WireCap>(g, [
+    const r = run<WireCap>(g, [
         {
             pattern: pStructFields(pAnyOf(() => [
                 pUnion({value: pInteger(0, 255), empty: pUnit()}),  // branch 0: optional
@@ -140,7 +145,7 @@ test("cross-ruleset: target ruleset queried by node id from wire callback", () =
 
     // Target ruleset: how does the host language represent each node?
     type TargetCap = {kind: "c++-field", cxxType: string}
-    const target = runRuleset<TargetCap>(g, [
+    const target = run<TargetCap>(g, [
         {pattern: pInteger(0, 255),   produce: () => ({kind: "c++-field", cxxType: "uint8_t"})},
         {pattern: pInteger(0, 65535), produce: () => ({kind: "c++-field", cxxType: "uint16_t"})},
         {
@@ -152,7 +157,7 @@ test("cross-ruleset: target ruleset queried by node id from wire callback", () =
     // Wire ruleset: emits presence-bitmap plan; for each field, queries
     // the target ruleset (already computed) for the accessor.
     interface WireCap {kind: "presence-bitmap", fields: Array<{name: string, target?: TargetCap}>}
-    const wire = runRuleset<WireCap>(g, [
+    const wire = run<WireCap>(g, [
         {
             pattern: pStructFields(pAnyOf(() => [
                 pUnion({value: pInteger(0, 255), empty: pUnit()}),
@@ -178,7 +183,7 @@ test("cross-ruleset: uncovered node returns undefined (not an error)", () => {
     const g = buildTypeGraph(T)
 
     // Target ruleset only covers integers.
-    const target = runRuleset(g, [{pattern: pInteger(0, 1), produce: () => "int"}])
+    const target = run(g, [{pattern: pInteger(0, 1), produce: () => "int"}])
 
     const bId = child(g.root, {field: "b"})!.id
     assert.equal(target.get(bId), undefined)  // unit uncovered — just absent
@@ -193,7 +198,7 @@ test("coverage: pStar holes are NOT covered — they get independent capabilitie
     const T = struct({a: integer(0, 1), b: integer(0, 1)})
     const g = buildTypeGraph(T)
 
-    const r = runRuleset<string>(g, [
+    const r = run<string>(g, [
         {pattern: pStruct({a: pStar(), b: pStar()}), produce: () => "struct"},
         {pattern: pInteger(0, 1),                    produce: () => "int"},
     ])
@@ -213,7 +218,7 @@ test("coverage: non-pStar children ARE covered — inhibited from independent ma
     const T = struct({a: integer(0, 1)})
     const g = buildTypeGraph(T)
 
-    const r = runRuleset<string>(g, [
+    const r = run<string>(g, [
         // `a` matched with pInteger but NOT pStar → covered (absorbed).
         {pattern: pStruct({a: pInteger(0, 1)}), produce: () => "struct"},
         {pattern: pInteger(0, 1),               produce: () => "int"},
@@ -233,7 +238,7 @@ test("coverage: presence-bitmap absorbs optionals, re-dispatches value types", (
     const g = buildTypeGraph(T)
 
     type Cap = {kind: "bitmap"} | {kind: "int", bits: number}
-    const r = runRuleset<Cap>(g, [
+    const r = run<Cap>(g, [
         {
             // Bitmap rule: struct whose fields are either optional-unions
             // (value re-dispatched) or plain ints (re-dispatched).
@@ -273,7 +278,7 @@ test("coverage: fully-absorbing struct rule covers all descendants", () => {
     const T = struct({a: struct({x: integer(0, 1)})})
     const g = buildTypeGraph(T)
 
-    const r = runRuleset<string>(g, [
+    const r = run<string>(g, [
         {pattern: pStruct({a: pStruct({x: pInteger(0, 1)})}), produce: () => "outer"},
         {pattern: pInteger(0, 1), produce: () => "int"},
     ])
@@ -284,4 +289,123 @@ test("coverage: fully-absorbing struct rule covers all descendants", () => {
     assert.equal(r.get(aId), undefined)   // covered
     assert.equal(r.get(xId), undefined)   // covered
     assert.equal(r.size, 1)
+})
+
+////////////////////////////////////////////////////////////////////////////////////////////////
+// Traits: pre-seeding, extraction, and cross-projection communication
+////////////////////////////////////////////////////////////////////////////////////////////////
+
+test("traits: named() pre-seeds TypeNameTrait, extractTraits copies to registry", () => {
+    const Ts = named("Timestamp", struct({secs: integer(0, 4294967295), nanos: integer(0, 999999999)}))
+    const g = buildTypeGraph(Ts)
+    const traits = extractTraits(g)
+
+    assert.equal(traits.get(TypeNameTrait, g.root.id), "Timestamp")
+    // Children have no name trait.
+    const secsId = child(g.root, {field: "secs"})!.id
+    assert.equal(traits.get(TypeNameTrait, secsId), undefined)
+})
+
+test("traits: unnamed nodes have no TypeNameTrait", () => {
+    const g = buildTypeGraph(struct({a: integer(0, 1)}))
+    const traits = extractTraits(g)
+    assert.equal(traits.get(TypeNameTrait, g.root.id), undefined)
+})
+
+test("traits: custom trait via tag() + defineTrait()", () => {
+    const DocTrait = defineTrait<string>()
+    const T = struct({a: integer(0, 1)})
+    tag(DocTrait, "A simple struct", T)
+
+    const g = buildTypeGraph(T)
+    const traits = extractTraits(g)
+
+    assert.equal(traits.get(DocTrait, g.root.id), "A simple struct")
+    // TypeNameTrait not attached → absent.
+    assert.equal(traits.get(TypeNameTrait, g.root.id), undefined)
+})
+
+test("traits: multiple traits on the same type object", () => {
+    const DocTrait = defineTrait<string>()
+    const UnitTrait = defineTrait<string>()
+
+    const T = named("MyType", struct({a: integer(0, 1)}))
+    tag(DocTrait, "Documented", T)
+    tag(UnitTrait, "seconds", T)
+
+    const g = buildTypeGraph(T)
+    const traits = extractTraits(g)
+
+    assert.equal(traits.get(TypeNameTrait, g.root.id), "MyType")
+    assert.equal(traits.get(DocTrait, g.root.id), "Documented")
+    assert.equal(traits.get(UnitTrait, g.root.id), "seconds")
+})
+
+test("traits: named thunk (recursive type) carries name", () => {
+    const T = named("Tree", (): any => union({
+        internal: struct({a: T, b: T}),
+        leaf: integer(0, 1),
+    }))
+
+    const g = buildTypeGraph(T)
+    const traits = extractTraits(g)
+
+    // The thunk is the root → name is on node 0.
+    assert.equal(traits.get(TypeNameTrait, g.root.id), "Tree")
+    // The struct and integer children have no names.
+    assert.equal(traits.get(TypeNameTrait, child(g.root, {variant: "internal"})!.id), undefined)
+    assert.equal(traits.get(TypeNameTrait, child(g.root, {variant: "leaf"})!.id), undefined)
+})
+
+test("traits: produce callback reads traits via registry", () => {
+    const Ts = named("Timestamp", struct({secs: integer(0, 4294967295)}))
+    const g = buildTypeGraph(Ts)
+    const traits = extractTraits(g)
+
+    // A ruleset that uses the name trait for its capability.
+    const r = runRuleset(g, [
+        {pattern: pStructFields(pStar()), produce: (_m, nodeId, _graph, tr) => {
+            return tr.get(TypeNameTrait, nodeId) ?? `T${nodeId}`
+        }},
+    ], traits)
+
+    assert.equal(r.get(g.root.id), "Timestamp")
+})
+
+test("traits: produce callback WRITES traits (cross-projection)", () => {
+    const T = struct({a: integer(0, 1)})
+    const g = buildTypeGraph(T)
+    const traits = extractTraits(g)
+
+    // A "target" ruleset that writes an accessor trait for each field.
+    const AccessorTrait = defineTrait<string>()
+    const target = runRuleset(g, [
+        {pattern: pStructFields(pStar()), produce: (_m, nodeId, graph, tr) => {
+            const node = graph.nodes.get(nodeId)!
+            for(const e of node.edges) {
+                if("field" in e.step) tr.set(AccessorTrait, e.target.id, `obj.${e.step.field}`)
+            }
+            return "struct"
+        }},
+    ], traits)
+
+    // The "codec" ruleset reads the accessor trait.
+    const aId = child(g.root, {field: "a"})!.id
+    assert.equal(traits.get(AccessorTrait, aId), "obj.a")
+    // The struct itself has no accessor.
+    assert.equal(traits.get(AccessorTrait, g.root.id), undefined)
+})
+
+test("traits: different TraitDef instances are distinct channels", () => {
+    const A = defineTrait<string>()
+    const B = defineTrait<string>()
+
+    const T = struct({a: integer(0, 1)})
+    tag(A, "from-A", T)
+
+    const g = buildTypeGraph(T)
+    const traits = extractTraits(g)
+
+    assert.equal(traits.get(A, g.root.id), "from-A")
+    assert.equal(traits.get(B, g.root.id), undefined)  // B is a different channel
 })

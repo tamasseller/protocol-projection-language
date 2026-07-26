@@ -44,6 +44,9 @@ export interface TypeEdge
  * A materialized node in the shared type graph.
  *
  * `type` is always concrete (derefed) — never a thunk function.
+ * `source` is the original type object (thunk or value) this node was
+ * materialized from — used for trait extraction (symbol-keyed bags
+ * attached at definition time) and provenance diagnostics.
  * Back-edges are represented by `target` pointing at an already-allocated
  * TypeNode (one encountered earlier in the DFS).
  */
@@ -51,6 +54,7 @@ export interface TypeNode
 {
     readonly id: number
     readonly type: ConcreteSemanticType
+    readonly source: object
     readonly edges: readonly TypeEdge[]
 }
 
@@ -91,7 +95,7 @@ export function buildTypeGraph(rootType: SemanticType): TypeGraph
         if(existing !== undefined) return existing
 
         const derefed = (typeof t === "function" ? (t as () => SemanticType)() : t) as ConcreteSemanticType
-        const node: TypeNode = {id: nextId++, type: derefed, edges: []}
+        const node: TypeNode = {id: nextId++, type: derefed, source: key, edges: []}
         byObject.set(key, node)
         nodes.set(node.id, node)
 

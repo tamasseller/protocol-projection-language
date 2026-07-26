@@ -14,6 +14,7 @@
  * Pure compile-time host machinery. No IR impact.
  */
 import {TypeGraph, TypeNode, Step, child} from "./type-graph"
+import {TraitRegistry} from "./traits"
 import {
     TypePattern,
     TypeMatch,
@@ -25,17 +26,19 @@ import {
     isStructPattern,
     isStructFieldsPattern,
     isUnionPattern,
+    isUnionFieldsPattern,
     AnyOfMatch,
     StructFieldsMatch,
     StructMatch,
     UnionMatch,
+    UnionFieldsMatch,
     ListMatch,
 } from "./matcher"
 
 export interface Rule<C>
 {
     readonly pattern: TypePattern
-    readonly produce: (match: MatchOf<TypePattern>, nodeId: number, graph: TypeGraph) => C
+    readonly produce: (match: MatchOf<TypePattern>, nodeId: number, graph: TypeGraph, traits: TraitRegistry) => C
 }
 
 /**
@@ -47,6 +50,10 @@ export interface Rule<C>
  * derive the coverage set (all positions the witness touches, except
  * under pStar holes) so descendants are skipped.
  *
+ * The produce callback receives a TraitRegistry, which it may read
+ * (for pre-seeded traits like names) and write (for cross-projection
+ * facets like accessors).
+ *
  * @returns Map<nodeId, C> — covered-but-not-directly-matched nodes are
  *   absent (they inherit the absorbing rule's capability conceptually;
  *   direct queries return undefined, same as unmatched nodes for now).
@@ -54,6 +61,7 @@ export interface Rule<C>
 export function runRuleset<C>(
     graph: TypeGraph,
     rules: ReadonlyArray<Rule<C>>,
+    traits: TraitRegistry,
 ): Map<number, C>
 {
     const result = new Map<number, C>()
@@ -68,7 +76,7 @@ export function runRuleset<C>(
             const m = matchType(node.type, rule.pattern)
             if(m !== undefined)
             {
-                result.set(node.id, rule.produce(m, node.id, graph))
+                result.set(node.id, rule.produce(m, node.id, graph, traits))
                 deriveCoverage(node, rule.pattern, m, graph, covered)
                 break
             }
@@ -133,6 +141,18 @@ function deriveCoverage(
         {
             const childNode = child(node, {field: name})
             if(childNode) deriveCoverage(childNode, subPattern as TypePattern, sm.fieldMatches[name], graph, covered)
+        }
+        return
+    }
+
+    if(isUnionFieldsPattern(pattern))
+    {
+        covered.add(node.id)
+        const um = match as UnionFieldsMatch
+        for(const v of um.variantMatches)
+        {
+            const childNode = child(node, {variant: v.name})
+            if(childNode) deriveCoverage(childNode, pattern.elementPattern, v.match, graph, covered)
         }
         return
     }

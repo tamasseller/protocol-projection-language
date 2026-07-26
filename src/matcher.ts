@@ -199,6 +199,43 @@ export const matchUnion = <P extends UnionPattern>(T: UnionType, P: P): MatchOf<
 
 ////////////////////////////////////////////////////////////////////////////////////////////////
 
+/**
+ * Homogeneous-variants union pattern: matches a union whose EVERY variant's
+ * type matches `elementPattern`, regardless of variant names. The witness
+ * is an ordered collection (one entry per variant of T) — the mirror of
+ * StructFieldsPattern for unions.
+ */
+export interface UnionFieldsPattern<E extends TypePattern = TypePattern>
+{
+    kind: SemanticTypeKinds.Union
+    variants: "all"
+    elementPattern: E
+}
+
+export const isUnionFieldsPattern = (P: TypePattern): P is UnionFieldsPattern => P.kind === SemanticTypeKinds.Union && (P as UnionFieldsPattern).variants === "all"
+
+export interface UnionFieldsMatch<E extends TypeMatch = TypeMatch>
+{
+    kind: SemanticTypeKinds.Union
+    variantMatches: Array<{name: string, match: E}>
+}
+
+export const matchUnionFields = <P extends UnionFieldsPattern>(T: UnionType, P: P): MatchOf<P> | undefined =>
+{
+    const variantMatches: Array<{name: string, match: TypeMatch}> = []
+
+    for(const [name, type] of T.variants.entries())
+    {
+        const m = matchType(type, P.elementPattern)
+        if(m === undefined) return undefined;
+        variantMatches.push({name, match: m})
+    }
+
+    return {kind: SemanticTypeKinds.Union, variantMatches} as MatchOf<P>
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////
+
 export interface AnyOfPattern<Ps extends readonly TypePattern[] = readonly TypePattern[]>
 {
     kind: "anyof"
@@ -277,14 +314,15 @@ export const matchStar = <P extends StarPattern>(T: SemanticType, P: P): MatchOf
 
 ////////////////////////////////////////////////////////////////////////////////////////////////
 
-export type TypePattern = UnitPattern | IntegerPattern | ListPattern | StructPattern | StructFieldsPattern | UnionPattern | AnyOfPattern | StarPattern
-export type TypeMatch = UnitMatch | IntegerMatch | ListMatch | StructMatch | StructFieldsMatch | UnionMatch | AnyOfMatch | StarMatch
+export type TypePattern = UnitPattern | IntegerPattern | ListPattern | StructPattern | StructFieldsPattern | UnionPattern | UnionFieldsPattern | AnyOfPattern | StarPattern
+export type TypeMatch = UnitMatch | IntegerMatch | ListMatch | StructMatch | StructFieldsMatch | UnionMatch | UnionFieldsMatch | AnyOfMatch | StarMatch
 
 export type MatchOf<P extends TypePattern> =
     P extends StarPattern            ? StarMatch
   : P extends AnyOfPattern           ? AnyOfMatch<ReturnType<P["alternatives"]>>
   : P extends ListPattern             ? ListMatch<MatchOf<P["elementPattern"]>>
   : P extends StructFieldsPattern     ? StructFieldsMatch<MatchOf<P["elementPattern"]>>
+  : P extends UnionFieldsPattern      ? UnionFieldsMatch<MatchOf<P["elementPattern"]>>
   : P extends StructPattern           ? StructMatch<P["fieldPatterns"]>
   : P extends UnionPattern            ? UnionMatch<P["variantPatterns"]>
   : P extends IntegerPattern          ? IntegerMatch
@@ -303,10 +341,15 @@ export function matchType<P extends TypePattern>(T: SemanticType, P: P): MatchOf
     if(isStruct(T))
     {
         if(isStructFieldsPattern(P)) return matchStructFields(T, P) as MatchOf<P> | undefined
-        if(isStructPattern(P))        return matchStruct(T, P)       as MatchOf<P> | undefined
+        if(isStructPattern(P))       return matchStruct(T, P)       as MatchOf<P> | undefined
         return undefined
     }
-    if(isUnion(T))              return (isUnionPattern(P)         ? matchUnion(T, P)          : undefined) as MatchOf<P> | undefined
+    if(isUnion(T))
+    {
+        if(isUnionFieldsPattern(P)) return matchUnionFields(T, P) as MatchOf<P> | undefined
+        if(isUnionPattern(P))       return matchUnion(T, P)       as MatchOf<P> | undefined
+        return undefined
+    }
     if(isReference(T))          return matchType(T(), P)
 
     throw new Error("Nope.")
@@ -350,6 +393,17 @@ export const pStructFields = <E extends TypePattern>(elementPattern: E): StructF
 export const pUnion = <V extends {[name: string]: TypePattern}>(variantPatterns: V): UnionPattern<V> => ({
     kind: SemanticTypeKinds.Union,
     variantPatterns,
+})
+
+/**
+ * Homogeneous-variants union pattern: every variant of T must match
+ * `elementPattern`, regardless of name. The witness is an ordered
+ * array (one entry per variant of T) — the mirror of pStructFields.
+ */
+export const pUnionFields = <E extends TypePattern>(elementPattern: E): UnionFieldsPattern<E> => ({
+    kind: SemanticTypeKinds.Union,
+    variants: "all",
+    elementPattern,
 })
 
 /**
