@@ -15,9 +15,9 @@
  *
  * Pure compile-time host machinery. No IR impact.
  */
-import {TypeGraph, TypeNode, child} from "../type-graph"
-import {Rule, runRuleset} from "../projection"
-import {TraitRegistry, TypeNameTrait} from "../traits"
+import {TypeGraph, TypeNode, child} from "@ppl/core"
+import {Rule, runRuleset} from "@ppl/core"
+import {TraitRegistry, TypeNameTrait} from "@ppl/core"
 import {
     pInteger,
     pUnit,
@@ -26,7 +26,7 @@ import {
     pUnionFields,
     pList,
     pUnion,
-} from "../matcher"
+} from "@ppl/core"
 import {
     ConcreteSemanticType,
     isInteger,
@@ -38,7 +38,7 @@ import {
     ListType,
     StructType,
     UnionType,
-} from "../metamodel"
+} from "@ppl/core"
 
 /**
  * A C++ type declaration: the capability produced by each rule.
@@ -268,13 +268,13 @@ export function emitCppHeader(
  * Convenience: build the TypeGraph, run the C++ ruleset, and emit the header.
  */
 export function generateCppHeader(
-    rootType: import("../metamodel").SemanticType,
+    rootType: import("@ppl/core").SemanticType,
     rootName?: string,
 ): string
 {
     // Lazy import to avoid circular dependency at module load
-    const {buildTypeGraph} = require("../type-graph")
-    const {extractTraits} = require("../traits")
+    const {buildTypeGraph} = require("@ppl/core")
+    const {extractTraits} = require("@ppl/core")
 
     const graph: TypeGraph = buildTypeGraph(rootType)
     const traits: TraitRegistry = extractTraits(graph)

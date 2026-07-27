@@ -6,11 +6,11 @@
 import {test} from "node:test"
 import * as assert from "node:assert/strict"
 
-import {integer, list, struct, union, unit} from "../src/metamodel"
-import {buildTypeGraph, child} from "../src/type-graph"
-import {runRuleset} from "../src/projection"
-import {extractTraits, named} from "../src/traits"
-import {cppRules, emitCppHeader, refOf, TypeDecl} from "../src/targets/cpp"
+import {integer, list, struct, union, unit} from "@ppl/core"
+import {buildTypeGraph, child} from "@ppl/core"
+import {runRuleset} from "@ppl/core"
+import {extractTraits, named} from "@ppl/core"
+import {cppRules, emitCppHeader, refOf, TypeDecl} from "../src/cpp-emitter"
 
 ////////////////////////////////////////////////////////////////////////////////////////////////
 // Integer width selection

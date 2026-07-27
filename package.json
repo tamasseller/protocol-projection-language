@@ -1,13 +1,19 @@
 {
-  "name": "declarative-serialization-compiler",
+  "private": true,
+  "name": "ppl-monorepo",
   "version": "1.0.0",
-  "description": "Zero-allocation multi-pass serialization compiler",
-  "main": "src/index.ts",
+  "description": "Declarative Serialization Compiler — monorepo root",
+  "workspaces": [
+    "packages/core",
+    "packages/codecs",
+    "packages/target-cpp",
+    "packages/target-js"
+  ],
   "scripts": {
-    "build": "tsc",
-    "start": "ts-node src/index.ts",
-    "test": "ts-node --project tsconfig.test.json test/run-all.ts",
-    "test:types": "tsc --project tsconfig.test.json"
+    "build": "npm run build --workspaces",
+    "test": "npm run test --workspaces",
+    "test:types": "npm run test:types --workspaces --if-present",
+    "clean": "rm -rf packages/*/dist packages/*/node_modules node_modules"
   },
   "devDependencies": {
     "@types/node": "^26.1.1",
