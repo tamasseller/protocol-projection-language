@@ -4,6 +4,7 @@
     { "path": "packages/core" },
     { "path": "packages/codecs" },
     { "path": "packages/target-cpp" },
-    { "path": "packages/target-js" }
+    {"path": "packages/target-js"},
+    {"path": "packages/example"}
   ]
 }
