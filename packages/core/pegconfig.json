@@ -1,0 +1,28 @@
+{
+    "dts": true,
+    "returnTypes": {
+        "Program": "import(\"./ast.js\").Program",
+        "Statement": "import(\"./ast.js\").Statement",
+        "Expression": "import(\"./ast.js\").Expression",
+        "Block": "import(\"./ast.js\").BlockStatement",
+        "IfStatement": "import(\"./ast.js\").IfStatement",
+        "WhileStatement": "import(\"./ast.js\").WhileStatement",
+        "DoWhileStatement": "import(\"./ast.js\").DoWhileStatement",
+        "ForStatement": "import(\"./ast.js\").ForStatement",
+        "SwitchStatement": "import(\"./ast.js\").SwitchStatement",
+        "SwitchCase": "import(\"./ast.js\").SwitchCase",
+        "DeclarationStatement": "import(\"./ast.js\").VariableDeclaration",
+        "ReturnStatement": "import(\"./ast.js\").ReturnStatement",
+        "BreakStatement": "import(\"./ast.js\").BreakStatement",
+        "ContinueStatement": "import(\"./ast.js\").ContinueStatement",
+        "ExpressionStatement": "import(\"./ast.js\").ExpressionStatement",
+        "AssignmentExpression": "import(\"./ast.js\").AssignmentExpression",
+        "ConditionalExpression": "import(\"./ast.js\").ConditionalExpression",
+        "PrefixExpression": "import(\"./ast.js\").UnaryExpression | import(\"./ast.js\").UpdateExpression",
+        "PostfixExpression": "import(\"./ast.js\").UpdateExpression",
+        "CallExpression": "import(\"./ast.js\").CallExpression",
+        "Literal": "import(\"./ast.js\").Literal",
+        "Identifier": "import(\"./ast.js\").Identifier",
+        "LeftHandSideExpression": "import(\"./ast.js\").Identifier"
+    }
+}
