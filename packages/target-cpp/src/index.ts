@@ -6,3 +6,4 @@
  * semantic type graph.
  */
 export * from "./cpp-emitter"
+export * from "./c-emitter"

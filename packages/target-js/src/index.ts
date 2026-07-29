@@ -1,63 +1,48 @@
 /**
  * @ppl/target-js — JavaScript/TypeScript target emitter.
  *
- * Generates idiomatic JS/TS type declarations and runtime codec
- * functions from the semantic type graph. The JS target emits
- * DataView-based, zero-allocation encoders/decoders.
+ * Generates idiomatic JS/TS type declarations from the semantic type
+ * graph. The JS target is the "Proper Platform" side of the three-way
+ * split — the desktop/server/cloud consumer that parses telemetry.
  *
- * This is a stub — full implementation pending.
+ * Two API levels:
+ *  - Ruleset API (composable): `tsTypeRules`, `projectTSTypes`,
+ *    `emitTSDeclarations`, `TSTypeDecl` — for projects that want to
+ *    compose this projection with others over a shared type graph.
+ *  - Convenience API (one-shot): `generateJsTypes` / `generateJsCodecs`
+ *    — build the graph and emit in a single call.
+ *
+ * Codec (encoder/decoder) generation is still pending — see
+ * `generateJsCodecs`.
  */
-import {
-    TypeGraph,
-    TypeNode,
-    TraitRegistry,
-    TypeNameTrait,
-} from "@ppl/core"
+export * from "./ts-emitter"
 
-// ——————————————————————————————————————————————
-// Placeholder: JS type reference resolution
-// ——————————————————————————————————————————————
-
-/** Resolve a JS/TS type reference for a node (inline or by-name). */
-export function jsRefOf(
-    node: TypeNode,
-    graph: TypeGraph,
-    traits: TraitRegistry,
-): string
-{
-    // Placeholder — full implementation pending
-    return traits.get(TypeNameTrait, node.id) ?? `T${node.id}`
-}
-
-// ——————————————————————————————————————————————
-// Placeholder: JS type declaration emission
-// ——————————————————————————————————————————————
-
-export interface JsTypeDecl
-{
-    readonly ref: string
-    readonly decl?: string
-    readonly deps: readonly number[]
-}
+import {SemanticType, TypeGraph, TraitRegistry, buildTypeGraph, extractTraits} from "@ppl/core"
+import {projectTSTypes, emitTSDeclarations} from "./ts-emitter"
 
 /**
- * Generate a TypeScript type declaration string from the semantic
- * type graph. Stub — returns a placeholder.
+ * One-shot: build the type graph for `rootType` and emit TypeScript
+ * declarations. Convenience wrapper around the composable ruleset API.
  */
 export function generateJsTypes(
-    _rootType: import("@ppl/core").SemanticType,
+    rootType: SemanticType,
     _rootName?: string,
 ): string
 {
-    return "// @ppl/target-js: type generation not yet implemented\n"
+    const graph: TypeGraph = buildTypeGraph(rootType)
+    const traits: TraitRegistry = extractTraits(graph)
+    const result = projectTSTypes(graph, traits)
+    return emitTSDeclarations(result)
 }
 
 /**
- * Generate JavaScript runtime codec functions from the semantic
- * type graph. Stub — returns a placeholder.
+ * One-shot: emit runtime codec functions (encoder/decoder) for `rootType`.
+ *
+ * STATUS: STUB — codec IR generation is not yet implemented. Returns a
+ * placeholder so dependents can wire up the call site today.
  */
 export function generateJsCodecs(
-    _rootType: import("@ppl/core").SemanticType,
+    _rootType: SemanticType,
     _rootName?: string,
 ): string
 {

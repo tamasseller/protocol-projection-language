@@ -1,5 +1,5 @@
 /**
- * ts-adapter/ts-types.ts — TypeScript type projection.
+ * ts-emitter.ts — TypeScript type projection.
  *
  * Projects the semantic type graph into idiomatic TypeScript types
  * suitable for desktop/server/cloud consumers:
@@ -8,9 +8,12 @@
  *  - `interface` / `type` for structs and unions
  *  - `T[]` for lists
  *
- * This is the "Proper Platform" side of the three-way split from
- * ARCHITECTURE.md — the cloud gateway / mobile app / bridge that
- * parses telemetry dynamically.
+ * This is the "Proper Platform" target — the cloud gateway / mobile app /
+ * bridge that consumes the wire data. Uses the projection runner
+ * (runRuleset) to walk the type graph and produce TSTypeDecl capabilities
+ * per node.
+ *
+ * Pure compile-time host machinery. No IR impact.
  */
 import {
     TypeGraph,
@@ -35,8 +38,6 @@ import {
 import {
     isInteger,
     isList,
-    isStruct,
-    isUnion,
     isUnit,
 } from "@ppl/core"
 
@@ -67,7 +68,7 @@ function nameOf(nodeId: number, traits: TraitRegistry): string
  * Resolve a TS type reference for a node.
  * Integers → "number", Unit → "null", Lists → "T[]", others → by name.
  */
-function tsRefOf(node: TypeNode, traits: TraitRegistry): string
+export function tsRefOf(node: TypeNode, traits: TraitRegistry): string
 {
     const t = node.type
 

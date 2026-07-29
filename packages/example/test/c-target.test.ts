@@ -1,24 +1,22 @@
 /**
- * C type projection tests — verify NO STL types appear.
+ * C target integration test.
+ *
+ * Verifies that the GENERIC C projection from @ppl/target-cpp, when
+ * COMPOSED over this project's schema (via compose.ts), produces the
+ * correct bare-metal C header — no STL, fixed arrays, manual tagged
+ * unions.
  */
 import {test} from "node:test"
 import * as assert from "node:assert/strict"
 
-import {TelemetryPacket} from "../src/schema"
-import {buildTypeGraph, child} from "@ppl/core"
-import {extractTraits} from "@ppl/core"
-import {projectCTypes, emitCHeader} from "../src/embedded/c-types"
-
-const g = buildTypeGraph(TelemetryPacket)
-const traits = extractTraits(g)
-const result = projectCTypes(g, traits)
-const header = emitCHeader(result)
+import {child} from "@ppl/core"
+import {graph as g, cTypes as result, cHeader as header} from "../src/compose"
 
 // ——————————————————————————————————————————————
 // No STL
 // ——————————————————————————————————————————————
 
-test("c-types: no STL types appear in the output", () =>
+test("c-target: no STL types appear in the output", () =>
 {
     assert.ok(!header.includes("std::"))
     assert.ok(!header.includes("vector"))
@@ -29,7 +27,7 @@ test("c-types: no STL types appear in the output", () =>
     assert.ok(!header.includes("<optional>"))
 })
 
-test("c-types: includes only stdint.h", () =>
+test("c-target: includes only stdint.h", () =>
 {
     assert.ok(header.includes("#include <stdint.h>"))
 })
@@ -38,7 +36,7 @@ test("c-types: includes only stdint.h", () =>
 // Root struct: TelemetryPacket
 // ——————————————————————————————————————————————
 
-test("c-types: TelemetryPacket is a typedef struct", () =>
+test("c-target: TelemetryPacket is a typedef struct", () =>
 {
     const decl = result.get(g.root.id)!
     assert.equal(decl.ref, "TelemetryPacket")
@@ -46,24 +44,24 @@ test("c-types: TelemetryPacket is a typedef struct", () =>
     assert.ok(decl.decl!.includes("} TelemetryPacket;"))
 })
 
-test("c-types: TelemetryPacket has deviceId as uint32_t", () =>
+test("c-target: TelemetryPacket has deviceId as uint32_t", () =>
 {
     assert.ok(result.get(g.root.id)!.decl!.includes("uint32_t deviceId;"))
 })
 
-test("c-types: TelemetryPacket has timestamp as named struct", () =>
+test("c-target: TelemetryPacket has timestamp as named struct", () =>
 {
     assert.ok(result.get(g.root.id)!.decl!.includes("Timestamp timestamp;"))
 })
 
-test("c-types: TelemetryPacket has readings as fixed array + count", () =>
+test("c-target: TelemetryPacket has readings as fixed array + count", () =>
 {
     const decl = result.get(g.root.id)!.decl!
     assert.ok(decl.includes("SensorReading readings[16];"), "missing readings array")
     assert.ok(decl.includes("uint8_t readings_count;"), "missing readings count")
 })
 
-test("c-types: TelemetryPacket has status as uint16_t", () =>
+test("c-target: TelemetryPacket has status as uint16_t", () =>
 {
     assert.ok(result.get(g.root.id)!.decl!.includes("uint16_t status;"))
 })
@@ -72,14 +70,14 @@ test("c-types: TelemetryPacket has status as uint16_t", () =>
 // Nested struct: Timestamp
 // ——————————————————————————————————————————————
 
-test("c-types: Timestamp is a typedef struct", () =>
+test("c-target: Timestamp is a typedef struct", () =>
 {
     const tsNode = child(g.root, {field: "timestamp"})!
     const decl = result.get(tsNode.id)!
     assert.ok(decl.decl!.includes("typedef struct Timestamp {"))
 })
 
-test("c-types: Timestamp has uint32_t secs and nanos", () =>
+test("c-target: Timestamp has uint32_t secs and nanos", () =>
 {
     const tsNode = child(g.root, {field: "timestamp"})!
     const decl = result.get(tsNode.id)!.decl!
@@ -91,7 +89,7 @@ test("c-types: Timestamp has uint32_t secs and nanos", () =>
 // SensorKind — all-unit union → just a tag
 // ——————————————————————————————————————————————
 
-test("c-types: SensorKind is a tagged union with no data union", () =>
+test("c-target: SensorKind is a tagged union with no data union", () =>
 {
     const readingsNode = child(g.root, {field: "readings"})!
     const readingNode = child(readingsNode, {element: true})!
@@ -108,7 +106,7 @@ test("c-types: SensorKind is a tagged union with no data union", () =>
 // SensorReading
 // ——————————————————————————————————————————————
 
-test("c-types: SensorReading has sensor, value, unit fields", () =>
+test("c-target: SensorReading has sensor, value, unit fields", () =>
 {
     const readingsNode = child(g.root, {field: "readings"})!
     const readingNode = child(readingsNode, {element: true})!
@@ -122,7 +120,7 @@ test("c-types: SensorReading has sensor, value, unit fields", () =>
 // Full header emission
 // ——————————————————————————————————————————————
 
-test("c-types: emitCHeader includes all named struct/union types", () =>
+test("c-target: emitCHeader includes all named struct/union types", () =>
 {
     // DeviceID is just an integer → inline uint32_t, no typedef struct.
     // Only check the types that actually produce declarations.
@@ -132,7 +130,7 @@ test("c-types: emitCHeader includes all named struct/union types", () =>
     assert.ok(header.includes("typedef struct TelemetryPacket"))
 })
 
-test("c-types: header has forward declarations before definitions", () =>
+test("c-target: header has forward declarations before definitions", () =>
 {
     const fwdIdx = header.indexOf("typedef struct TelemetryPacket TelemetryPacket;")
     const defIdx = header.indexOf("typedef struct TelemetryPacket {")

@@ -129,30 +129,44 @@ This lets one procedure freely mix three description styles:
 | Register | Named locals, loop counters, running checksums |
 | Hybrid | RPN expression that spills intermediate to a local |
 
-### 2.6 Addressing modes and the 6-combo constraint
+### 2.6 Addressing modes and the 7-combo constraint
 
-Of the four addressing modes, only **literal** and **peek** are read-write
-capable. **Push** is write-only; **pop** is read-only. This means the output
-target is *forced* for push and pop — those modes carry one fewer bit of
-freedom. For a binary-class instruction (two inputs, one output, accumulator is
-one input), the valid (mode × output) combinations are:
+There are five addressing modes. **Register** and **peek** are read-write
+capable. **Pop** and **imm** (immediate literal) are read-only. **Push** is
+write-only. This means the output target is *forced* for push, pop, and imm —
+those modes carry one fewer bit of freedom than the read-write modes. For a
+binary-class instruction (two inputs, one output, accumulator is one input),
+the valid (mode × output) combinations are:
 
 | # | Mode | Input from | Output to | Example |
 |---|------|-----------|-----------|---------|
-| 1 | literal | `rN` | `acc` | `acc = acc + rN` |
-| 2 | literal | `rN` | `rN` | `rN = acc + rN` |
+| 1 | register | `rN` | `acc` | `acc = acc + rN` |
+| 2 | register | `rN` | `rN` | `rN = acc + rN` |
 | 3 | peek | `[tos-1]` | `acc` | `acc = acc + peek` |
 | 4 | peek | `[tos-1]` | `[tos-1]` | `peek = acc + peek` |
 | 5 | pop | `[--tos]` | `acc` | `acc = acc + pop` (pure stack binary) |
 | 6 | push | *(none — unary)* | `[tos++]` | `push(op(acc))` (subsumes `DUP`) |
+| 7 | imm | `imm` | `acc` | `acc = acc + imm` (subsumes `CONST`) |
 
-That is **6 valid combinations** — not 8. The two eliminated combos (pop with
-output-to-pop; push with output-to-acc) are semantically invalid and must never
-appear in code, so carrying bits for them is wasted space.
+That is **7 valid combinations**. Modes that are read-only (pop, imm) or
+write-only (push) fix the output target, so the semantically invalid pairings
+(pop→pop, push→acc, imm→rN/peek/push) never appear in code and carry no
+encoding bits.
 
+> **Naming note.** The mode is called **register** (addressed by index `rN`),
+> not "literal", to avoid collision with the **imm** mode which carries an
+> integer literal. Earlier drafts conflated the two, which hid the fact that
+> there was no immediate operand path at all — the gap that motivated adding
+> the `imm` mode (combo 7).
+>
 > **`DUP` is subsumed.** Combo 6 (`push(op(acc))` with op = identity) *is*
 > `DUP`. No dedicated `DUP` opcode is needed; it is the push mode of the
 > MOVE/identity instruction.
+>
+> **`CONST`/`CONST_SMALL` are subsumed.** Combo 7 (MOVE with op = identity,
+> imm source, output → `acc`) *is* a constant load. No standalone immediate
+> opcodes are needed; the small/extended immediate split becomes a property of
+> the `imm` mode sub-encoding (see §3.1), shared by ALU, comparison, and MOVE.
 >
 > **`SWAP` is dropped.** No DSL-level construct maps directly to a swap (C has
 > no tuple exchange; `tmp=a; a=b; b=tmp` lowers to MOVEs). The lowering pass
@@ -160,16 +174,32 @@ appear in code, so carrying bits for them is wasted space.
 > register. A dedicated `SWAP` opcode would consume encoding space for no
 > guaranteed benefit.
 
-### 2.7 Arithmetic-encoding-like packing (decode cost is irrelevant)
+### 2.7 Prefix code + bounded joint table-lookup (not arithmetic coding)
 
-Since backend decode effort is explicitly unconstrained, the encoding need not
-be byte-aligned or fixed-width. A **6-combo space fits in ~2.58 bits** (log₂6),
-so an arithmetic-coding-style scheme could pack binary-class opcodes across bit
-boundaries and recover the wasted fractional bits. Whether this complexity pays
-off depends on the frequency distribution of instruction classes in real codecs
-— it must be measured before committing. The principle stands: *the opcode is a
-prefix code, and its width is a function of the instruction class, not a
-constant.*
+Backend decode effort is explicitly unconstrained, so the encoding need not be
+byte-aligned or fixed-width. But that freedom is deliberately capped at two
+mechanisms:
+
+1. **Static prefix code.** Each instruction class has a fixed-width field sized
+   to `ceil(log₂(states))` over a *static* prior (a representative codec
+   corpus), not per-codec adaptive frequencies. Rare opcodes still consume
+   code-space and can push a field wider — they are *not* "free when unused."
+2. **Bounded joint table-lookup.** When two adjacent fields each round up past
+   a whole-bit boundary but their product fits a whole number of bits, they may
+   share a code subspace: pack `(fieldA, fieldB) → flatIndex`, decode via one
+   table, store `ceil(log₂(|A|·|B|))` bits instead of
+   `ceil(log₂|A|) + ceil(log₂|B|)`. Bounded scope (a pair or small tuple), no
+   state, no carry — fully testable. A 4-state comparison field joined with a
+   neighbor is a natural candidate.
+
+**Explicitly ruled out:** a true arithmetic-coding layer as the outermost
+encoding. An adaptive, stateful, carry-across-opcodes coder would be an
+unexhaustable source of gotchas (renormalization, underflow, byte-flush
+ordering, end-of-stream) for negligible gain once the prefix code is efficient.
+The arithmetic-coding framing in earlier drafts was a figure of speech; the
+real commitment is the two mechanisms above. *The opcode is a prefix code, and
+its width is a function of the instruction class; adjacent under-full fields
+may share a table, but nothing carries fractional bits across instructions.*
 
 ### 2.8 Comparisons and ordering via branch inversion
 
@@ -310,44 +340,66 @@ This section replaces the ISA table. Operations are grouped by their "mode
 dynamic range" — the set of valid (addressing-mode × output-target)
 combinations — because that is what determines the encoding width.
 
-### 3.1 Binary-class (6 mode combos)
+### 3.1 Binary-class (7 mode combos)
 
 Each has the accumulator as one input and an "other operand" addressed by one
-of the 6 valid combos from §2.6.
+of the 7 valid combos from §2.6.
 
-**Binary ALU** — `ADD, SUB, MUL, AND, OR, XOR, SHL, SHR`
-- Semantics: `result = acc ⟨op⟩ other_operand` (or `op(acc)` for combo 6).
+**Binary ALU** — `ADD, SUB, RSUB, MUL, AND, OR, XOR, SHL, SHR`
+- Semantics: `result = acc ⟨op⟩ other_operand` (`other ⟨op⟩ acc` for `RSUB`;
+  `op(acc)` for combo 6).
 - Output target per the combo table (§2.6).
 - **No `DIV`/`MOD`.** Many MCUs lack hardware division; these would silently
   emit expensive software loops. Codec arithmetic is dominated by shifts,
   masks, adds, and compares — division essentially never appears. Modulo by a
   power of two (e.g. ring-buffer wrap) is `AND (N-1)`. If a codec truly needs
-  division, the lowering pass can emit a call to a software helper; the
-  ISA stays minimal. This also shrinks the binary-class set to 8 ops × 6 combos
-  = 48 states (≈5.58 bits), a cleaner fit for arithmetic-encoding packing (§2.7).
+  division, the lowering pass can emit a call to a software helper; the ISA
+  stays minimal.
+- **State count:** 9 ops × 7 combos = **63 states = 6 bits**. `RSUB`
+  (`other − acc`) is added because it fits the 6-bit budget for free and
+  appears in real codecs (checksum complement, `capacity − remaining`,
+  `expected − actual`). ARM keeps `RSB` for the same reason.
+- **Reverse shifts deliberately omitted.** `RSHL`/`RSHR` (`other ⟨shift⟩ acc`)
+  would push the class to 10 × 7 = 70 states = **7 bits**, taxing every binary
+  op permanently for a case that is rare in codecs (the value being shifted is
+  almost always the freshly-loaded field in `acc`, not a computed expression).
+  When it does occur, the lowering pass spills one register
+  (`STORE rShift; LOAD_FIELD value; SHL rShift`) — 1 extra byte in a rare case,
+  strictly cheaper than a permanent +1 bit. `RSUB` is decomposable
+  (`NEG; ADD rN`) *and* free, which is why it's kept; `RSHL`/`RSHR` are
+  irreducible *and* costly, which is why they're dropped.
 
-**MOVE** — transfer between `acc` and the addressed register.
-- Read-direction (operand → acc): combos 1, 3, 5 (literal, peek, pop).
-  - `LOAD rN`, `LOAD [tos-1]`, `POP` (pop into acc).
-- Write-direction (acc → operand): combos 2, 4, 6 (literal, peek, push).
+**MOVE** — transfer between `acc` and the addressed register/immediate.
+- Read-direction (operand → acc): combos 1, 3, 5, 7 (register, peek, pop, imm).
+  - `LOAD rN`, `LOAD [tos-1]`, `POP` (pop into acc), `LOAD_IMM imm` (≡ `CONST`).
+- Write-direction (acc → operand): combos 2, 4, 6 (register, peek, push).
   - `STORE rN`, `STORE [tos-1]` (overwrite top), `PUSH acc` (≡ DUP).
-- Same 6-shape dynamic range as binary ALU → can share a format.
+- Same 7-shape dynamic range as binary ALU → can share a format.
+- **`imm` sub-encoding:** small immediate (3–4 bits, inline) or extended
+  (trailing LEB128), shared by MOVE/ALU/comparison. This replaces the former
+  standalone `CONST`/`CONST_SMALL` opcodes (deleted class, ex §3.5).
 
-> `DUP` is the identity-MOVE in push mode (combo 6). No separate opcode.
+> `DUP` is the identity-MOVE in push mode (combo 6). `CONST` is the
+> identity-MOVE in imm mode (combo 7, output → acc). No separate opcodes.
 
-### 3.2 Comparison-class (3 mode combos)
+### 3.2 Comparison-class (4 mode combos)
 
 The "other operand" is **read-only** (result always → `acc` as a boolean), so
-only the three read-capable modes apply:
+the four read-capable modes apply (register, peek, pop, imm):
 
 | # | Mode | Input from |
 |---|------|-----------|
-| 1 | literal | `rN` |
+| 1 | register | `rN` |
 | 2 | peek | `[tos-1]` |
 | 3 | pop | `[--tos]` |
+| 4 | imm | `imm` |
 
 **Comparisons** — `LT, LE, EQ, NE` → boolean in `acc`. `GT`/`GE` derived by
-branch inversion (§2.8). **3 valid combos.**
+branch inversion (§2.8). **4 ops × 4 modes = 16 states = exactly 4 bits** —
+a clean field, and a prime candidate for joint table-lookup with a neighbor
+(§2.7). The `imm` combo is the workhorse here: tag dispatch, magic-byte
+checks, and width comparisons (`EQ_IMM tag`) dominate real codec comparisons
+and no longer require a separate `CONST; CMP` pair.
 
 ### 3.3 Unary-class (no other operand)
 
@@ -363,17 +415,22 @@ see §2.3).
 
 All single-byte encodable.
 
-### 3.5 Immediate class
+### 3.5 Immediate operands (folded into MOVE/ALU/comparison)
 
-**`CONST imm`** — `acc = LEB128 immediate`. No mode bits; the immediate follows.
+~~`CONST imm` / `CONST_SMALL imm`~~ — **deleted as a standalone class.**
+Constants now flow through the `imm` addressing mode (combo 7, §2.6):
 
-**`CONST_SMALL imm`** *(short form)* — `acc = imm` where `imm ∈ {0..7}` (or
-`{0..15}`), packed into a single byte with the opcode. Small constants dominate
-codec arithmetic: `0` (accumulator init, zero-compare), `1` (increments,
-flags), `2`/`4` (byte widths), powers of two (masks, shift amounts). The
-short form saves one byte per occurrence for the most frequent immediates.
-Java's `iconst_0`–`iconst_5` and Wasm's `i32.const 0` shortcut demonstrate
-the value of this optimization.
+- `MOVE` + imm (output → `acc`) replaces both `CONST` and `CONST_SMALL`.
+- Binary ALU + imm (`ADD_IMM`, `AND_IMM`, …) folds a constant into its
+  consumer — the common case, e.g. `ADD_IMM 1`, `SHL_IMM 2`, `AND_IMM 0x0F`.
+- Comparison + imm (`EQ_IMM`, `LT_IMM`, …) handles tag/magic-byte/width checks.
+
+The small/extended immediate split (inline 3–4 bits vs trailing LEB128) is a
+property of the `imm` mode sub-encoding shared across all three classes — one
+immediate mechanism instead of three opcodes. Small constants (`0`, `1`, `2`,
+`4`, powers of two) dominate codec arithmetic; the inline form keeps them in
+one byte, mirroring Java's `iconst_0`–`iconst_5` and Wasm's `i32.const`
+shortcut.
 
 ### 3.6 Stream I/O class
 
@@ -459,10 +516,10 @@ CLONE_RD 0 1            ; reader fork at packet start
 CLONE_WR 0 2            ; writer fork parked at checksum field
 WRITE i0, 1             ; placeholder byte via original writer
 ; ... serialize rest of packet with original writer i0 ...
-CONST 0
+MOVE_IMM 0               ; acc = 0  (MOVE + imm, output→acc)
 LOOP                     ; checksum loop over reader fork
   READ 1, 1              ; acc = next byte from reader
-  ADD chksum_reg         ; chksum_reg += acc  (combo 2: literal, out=rN)
+  ADD chksum_reg         ; chksum_reg += acc  (combo 2: register, out=rN)
   LOOP_ITER
 WRITE 2, 1               ; emit checksum via parked writer fork
 RETURN
@@ -473,11 +530,12 @@ RETURN
 The abstract operations above are stable; the **byte layout is not yet
 fixed**. Guiding principles gathered so far:
 
-1. **Opcodes are a prefix code, not a fixed width.** The `5|1|2` layout is
-   attractive *for binary-class ops only* (6 combos fit in ~2.58 bits; an
-   arithmetic-coding-like scheme could recover the fractional bits since decode
-   cost is irrelevant — §2.7). Other instruction classes should use the format
-   that minimizes *their* expected size.
+1. **Opcodes are a prefix code, sized to `ceil(log₂(states))` per class.**
+   Binary-class is 9 ops × 7 modes = 63 states = 6 bits; comparison-class is
+   4 × 4 = 16 states = exactly 4 bits. Adjacent under-full fields may share a
+   code subspace via bounded joint table-lookup (§2.7) — the *only* mechanism
+   for recovering fractional bits. A true arithmetic-coding outer layer is
+   explicitly ruled out (complexity/testability).
 2. **No-operand instructions** (`NEG`, `NOT`, `RETURN`, `BLOCK_END`,
    `LOOP_ITER`) can be a single byte. `DUP`/`SWAP` are no longer in this set
    (`DUP` is subsumed by MOVE push-mode; `SWAP` is dropped — §2.6).
@@ -485,8 +543,8 @@ fixed**. Guiding principles gathered so far:
    literal offset reaches the first 8 fields of the current codec's target
    type. Larger offsets escape to an extended form. Must be measured against
    real schemas.
-4. **Comparison-class** has only 3 mode combos — potentially a narrower format
-   than binary-class (6 combos).
+4. **Comparison-class** is 4 ops × 4 modes = 16 states = exactly 4 bits — a
+   clean field, and a joint table-lookup candidate when paired with a neighbor.
 5. **Stream I/O** common case (`i < 4`, `w ∈ {1,2,4}`) packs opcode + iterator
    + width into a single byte.
 6. **Immediates, offsets, field indices, type indices, branch targets** all use
@@ -494,8 +552,10 @@ fixed**. Guiding principles gathered so far:
 7. **Deduplication** of field/variant names via a string table, and stripping
    of all non-normative info (type names, comments), happens at the binary
    serializer layer, not the IR layer.
-8. **Short-form `CONST_SMALL`** (§3.5): 3-bit immediate (0–7 or 0–15) packed
-   into the opcode byte for the most frequent small constants.
+8. **Short-form immediate** (§3.5, now the `imm` mode sub-encoding): 3–4-bit
+   inline immediate packed with the opcode for the most frequent small
+   constants, shared across MOVE/ALU/comparison; extended form escapes to
+   trailing LEB128.
 9. **List cursor IDs** (§3.9) are small literals (`< 4`), packable with the
    opcode like stream iterator IDs.
 10. **Multi-type field references** (§2.9): short form `(0, field_idx)` fits in

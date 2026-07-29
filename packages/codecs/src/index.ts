@@ -7,3 +7,4 @@
  */
 export * from "./ir-builder"
 export * from "./codecs"
+export * from "./wire-format"

@@ -6,6 +6,7 @@
 import "./matcher.runtime.test"
 import "./type-graph.runtime.test"
 import "./projection.runtime.test"
+import "./grammar.test"
 
 // NOTE: matcher.types.test.ts is compile-time only — it verifies
 // type-level narrowing via `tsc` (run via `npm run test:types`).

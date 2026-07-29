@@ -1,22 +1,22 @@
 /**
- * Wire format projection tests.
+ * Wire format integration test.
+ *
+ * Verifies that the GENERIC wire-format projection from @ppl/codecs,
+ * when COMPOSED over this project's schema (via compose.ts), produces
+ * the correct binary layout descriptors.
  */
 import {test} from "node:test"
 import * as assert from "node:assert/strict"
 
-import {TelemetryPacket} from "../src/schema"
-import {buildTypeGraph, child} from "@ppl/core"
+import {child} from "@ppl/core"
 import {
-    projectWireFormat,
     WireShape,
     WireFixed,
     WireCounted,
     WireTagged,
     WireStructFields,
-} from "../src/embedded/wire-format"
-
-const g = buildTypeGraph(TelemetryPacket)
-const result = projectWireFormat(g)
+} from "@ppl/codecs"
+import {graph as g, wireShapes as result} from "../src/compose"
 
 // Helper: assert shape kind
 function assertKind(s: WireShape, kind: string): asserts s is any

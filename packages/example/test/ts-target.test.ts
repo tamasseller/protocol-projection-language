@@ -1,45 +1,42 @@
 /**
- * TS type projection tests.
+ * TS target integration test.
+ *
+ * Verifies that the GENERIC TypeScript projection from @ppl/target-js,
+ * when COMPOSED over this project's schema (via compose.ts), produces
+ * the correct desktop/server type declarations.
  */
 import {test} from "node:test"
 import * as assert from "node:assert/strict"
 
-import {TelemetryPacket} from "../src/schema"
-import {buildTypeGraph, child} from "@ppl/core"
-import {extractTraits} from "@ppl/core"
-import {projectTSTypes, emitTSDeclarations} from "../src/ts-adapter/ts-types"
-
-const g = buildTypeGraph(TelemetryPacket)
-const traits = extractTraits(g)
-const result = projectTSTypes(g, traits)
-const output = emitTSDeclarations(result)
+import {child} from "@ppl/core"
+import {graph as g, tsTypes as result, tsDeclarations as output} from "../src/compose"
 
 // ——————————————————————————————————————————————
 // Root
 // ——————————————————————————————————————————————
 
-test("ts-types: TelemetryPacket is an interface", () =>
+test("ts-target: TelemetryPacket is an interface", () =>
 {
     const decl = result.get(g.root.id)!
     assert.ok(decl.decl!.includes("interface TelemetryPacket {"))
 })
 
-test("ts-types: TelemetryPacket has deviceId: number", () =>
+test("ts-target: TelemetryPacket has deviceId: number", () =>
 {
     assert.ok(result.get(g.root.id)!.decl!.includes("deviceId: number;"))
 })
 
-test("ts-types: TelemetryPacket has timestamp: Timestamp", () =>
+test("ts-target: TelemetryPacket has timestamp: Timestamp", () =>
 {
     assert.ok(result.get(g.root.id)!.decl!.includes("timestamp: Timestamp;"))
 })
 
-test("ts-types: TelemetryPacket has readings as SensorReading[]", () =>
+test("ts-target: TelemetryPacket has readings as SensorReading[]", () =>
 {
     assert.ok(result.get(g.root.id)!.decl!.includes("readings: SensorReading[];"))
 })
 
-test("ts-types: TelemetryPacket has status: number", () =>
+test("ts-target: TelemetryPacket has status: number", () =>
 {
     assert.ok(result.get(g.root.id)!.decl!.includes("status: number;"))
 })
@@ -48,7 +45,7 @@ test("ts-types: TelemetryPacket has status: number", () =>
 // Timestamp
 // ——————————————————————————————————————————————
 
-test("ts-types: Timestamp is an interface with secs and nanos", () =>
+test("ts-target: Timestamp is an interface with secs and nanos", () =>
 {
     const tsNode = child(g.root, {field: "timestamp"})!
     const decl = result.get(tsNode.id)!.decl!
@@ -61,7 +58,7 @@ test("ts-types: Timestamp is an interface with secs and nanos", () =>
 // SensorKind — all-unit union → string literal union
 // ——————————————————————————————————————————————
 
-test("ts-types: SensorKind is a string literal union (all-unit)", () =>
+test("ts-target: SensorKind is a string literal union (all-unit)", () =>
 {
     const readingsNode = child(g.root, {field: "readings"})!
     const readingNode = child(readingsNode, {element: true})!
@@ -78,7 +75,7 @@ test("ts-types: SensorKind is a string literal union (all-unit)", () =>
 // SensorReading
 // ——————————————————————————————————————————————
 
-test("ts-types: SensorReading is an interface", () =>
+test("ts-target: SensorReading is an interface", () =>
 {
     const readingsNode = child(g.root, {field: "readings"})!
     const readingNode = child(readingsNode, {element: true})!
@@ -93,7 +90,7 @@ test("ts-types: SensorReading is an interface", () =>
 // Full output
 // ——————————————————————————————————————————————
 
-test("ts-types: emitTSDeclarations includes all named types", () =>
+test("ts-target: emitTSDeclarations includes all named types", () =>
 {
     assert.ok(output.includes("interface Timestamp"))
     assert.ok(output.includes("type SensorKind"))

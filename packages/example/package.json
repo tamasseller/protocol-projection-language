@@ -9,7 +9,10 @@
     "test:types": "tsc --project tsconfig.test.json --noEmit"
   },
   "dependencies": {
-    "@ppl/core": "*"
+    "@ppl/core": "*",
+    "@ppl/codecs": "*",
+    "@ppl/target-cpp": "*",
+    "@ppl/target-js": "*"
   },
   "devDependencies": {
     "@types/node": "^26.1.1",

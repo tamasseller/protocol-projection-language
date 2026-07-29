@@ -1,5 +1,5 @@
 /**
- * embedded/c-types.ts — C type projection (NO STL).
+ * c-emitter.ts — Bare-metal C type projection (NO STL).
  *
  * Projects the semantic type graph into idiomatic bare-metal C types:
  *  - Fixed-size arrays instead of std::vector
@@ -7,8 +7,12 @@
  *  - No heap allocation — every type has a compile-time-known size
  *  - C99-compatible (no C++ features)
  *
- * Uses the projection runner (runRuleset) to walk the type graph and
- * produce CTypeDecl capabilities per node.
+ * This is the *embedded* dialect of the C/C++ target, distinct from the
+ * STL-based C++ emitter in `cpp-emitter.ts`. It uses the projection runner
+ * (runRuleset) to walk the type graph and produce CTypeDecl capabilities
+ * per node.
+ *
+ * Pure compile-time host machinery. No IR impact.
  */
 import {
     TypeGraph,
@@ -63,7 +67,7 @@ function nameOf(nodeId: number, traits: TraitRegistry): string
 }
 
 /** Pick the smallest C integer type that fits the range. */
-function cIntType(t: IntegerType): string
+export function cIntType(t: IntegerType): string
 {
     const {min, max} = t
     if (min >= 0)
@@ -93,7 +97,7 @@ function cIntType(t: IntegerType): string
  * Union   → by name
  * List    → resolved by its enclosing struct (shouldn't be hit directly)
  */
-function cRefOf(
+export function cRefOf(
     node: TypeNode,
     traits: TraitRegistry,
 ): string
@@ -129,8 +133,8 @@ export function cTypeRules(): ReadonlyArray<Rule<CTypeDecl>>
         // 1. Integer → fixed-width C type
         {
             pattern: pInteger(-Infinity, Infinity),
-            produce: (_m, nodeId, _graph) => ({
-                ref: cIntType({min: -Infinity, max: Infinity} as IntegerType),
+            produce: (_m, nodeId, graph) => ({
+                ref: cIntType(graph.nodes.get(nodeId)!.type as IntegerType),
                 deps: [],
             }),
         },

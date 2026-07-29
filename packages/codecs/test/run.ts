@@ -2,6 +2,8 @@
  * Test entry point for @ppl/codecs.
  * Run via: npm test (from this package) or npm test (from root)
  */
+import "./wire-format.runtime.test"
+
 import {test} from "node:test"
 import * as assert from "node:assert/strict"
 

@@ -1,11 +1,11 @@
 /**
- * embedded/wire-format.ts — Binary wire layout projection.
+ * wire-format.ts — Binary wire layout projection.
  *
  * Projects the same semantic type graph into a description of the
  * binary wire format. This is the "signal" level from ARCHITECTURE.md:
  * the physical byte layout independent of the host data model.
  *
- * Wire format conventions (this example):
+ * Wire format conventions (default profile):
  *  - Little-endian byte order
  *  - Struct fields serialized in declaration order, packed
  *  - Integers: exactly ceil(log2(range)/8) bytes (no varint)
@@ -13,14 +13,18 @@
  *  - Unions:  1-byte tag, then the active variant's payload
  *  - Units:   0 bytes (no wire representation — purely symbolic)
  *
- * Uses runRuleset to produce a WireShape tree per TypeNode.
+ * Uses runRuleset to produce a WireShape tree per TypeNode. This is the
+ * generic wire-shape descriptor layer; the IR instruction emission
+ * (encoding/decoding opcodes) is a separate concern built on top of it.
+ *
+ * Pure compile-time host machinery. No IR impact.
  */
 import {
     TypeGraph,
-    TypeNode,
     child,
     Rule,
     runRuleset,
+    TraitRegistry,
 } from "@ppl/core"
 import {
     pInteger,
@@ -83,7 +87,7 @@ export type WireShape = WireFixed | WireCounted | WireTagged | WireStructFields
 // ——————————————————————————————————————————————
 
 /** Bytes needed to represent the integer range on the wire (fixed-width). */
-function intWireSize(t: IntegerType): number
+export function intWireSize(t: IntegerType): number
 {
     // Find the smallest power-of-2 byte count that fits the range.
     const range = t.max - t.min
@@ -94,7 +98,7 @@ function intWireSize(t: IntegerType): number
 }
 
 /** Total fixed wire size of any WireShape (variable-sized portions = 0). */
-function wireSize(s: WireShape): number
+export function wireSize(s: WireShape): number
 {
     switch (s.kind)
     {
@@ -232,11 +236,12 @@ export function wireFormatRules(): ReadonlyArray<Rule<WireShape>>
 
 /**
  * Run the wire-format projection on a type graph.
+ *
+ * Wire format is purely structural — it does not need traits, so a fresh
+ * empty registry is used internally.
  */
 export function projectWireFormat(graph: TypeGraph): Map<number, WireShape>
 {
-    // Wire format doesn't need traits — we use a fresh empty registry.
-    const {TraitRegistry} = require("@ppl/core") as typeof import("@ppl/core")
     return runRuleset(graph, wireFormatRules(), new TraitRegistry())
 }
 
