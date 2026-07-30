@@ -48,32 +48,45 @@ the same instruction.
 
 The whole point of structured control flow (§2.1) is to avoid carrying branch
 offsets. So `BR_TABLE` does **not** encode target offsets or block lengths. It
-carries only **N**, the static case count (the runtime selector lives in
-`acc`). The construct is a sequence of N case-blocks, each terminated by its
-own `BLOCK_END`:
+carries only **N**, the static case count. The runtime selector lives in `acc`,
+and the semantics are **lenient with an implicit default**:
+
+- `acc < N` → execute `case[acc]`, then fall through to after the construct.
+- `acc ≥ N` → skip all cases (the **implicit default**), falling through to
+  after the construct.
+
+Each case-block is closed by `BLOCK_END` **or** by an unconditional terminator
+(`RETURN`/`TRAP`/`BREAK`/`CONTINUE` — see §3.4), whichever comes first:
 
 ```
-BR_TABLE N            ; N = static case count; selector in acc picks block[acc]
-  <case 0 block>
-BLOCK_END
+BR_TABLE N            ; case[acc] for acc<N; acc≥N → fall through (implicit default)
+  <case 0 block>      ; ends at its BLOCK_END or a terminator
   <case 1 block>
-BLOCK_END
   ...
   <case N-1 block>
-BLOCK_END
+; <- implicit default lands here (acc≥N), and so does any case that fell through
 ```
 
-An `if-else` is just N=2; an `if`-without-`else` is N=2 with an empty else
-block (a lone `BLOCK_END`, 1 byte). A `switch` is N = variant count.
+This collapses the common shapes:
 
-**The decoder can always find the BLOCK_ENDs** because it parses the construct
-as a tree: read N, then parse N case-blocks sequentially. Each case-block is a
-statement list parsed until *its own* terminating `BLOCK_END`. Nested
-constructs inside a case (inner `if`/`switch`/`loop`) are parsed recursively
-and consume their own `BLOCK_END`s internally, so the first `BLOCK_END`
-encountered at the case's nesting level closes that case. After N such
-closings, the construct is complete. No `ELSE` marker, no offsets — one marker
-closes every block shape.
+- **`if-else`** = N=2 (`case[0]`, `case[1]`); the implicit default is
+  unreachable because comparisons yield 0/1.
+- **`if`-without-`else`** = **N=1**: the body is `case[0]`, reached when
+  `acc=0`; `acc≠0` hits the implicit default (skip). No empty trailing block.
+  The lowering emits the **complementary comparison** so `acc=0` means "run the
+  body" (§2.8) — e.g. `if (a < b) body` emits `GE`, giving `acc=0` when `a<b`.
+- **`switch`** = N = variant count; the implicit default is the natural home
+  for an out-of-range trap (§4.7), so an exhaustive switch with a trap-default
+  needs no validate-then-dispatch preamble.
+
+**The decoder can always find the case boundaries** because it parses the
+construct as a tree: read N, then parse N case-blocks sequentially. Each
+case-block is a statement list parsed until *its own* closing `BLOCK_END` or
+terminator. Nested constructs inside a case are parsed recursively and consume
+their own closers internally, so the first closer at the case's nesting level
+closes that case. After N closings, the construct is complete; whatever follows
+is the implicit-default fall-through point. No `ELSE` marker, no offsets — one
+construct shape covers `if`, `if-else`, and `switch`.
 
 ### 2.4 Stream iterators as small literals
 
@@ -201,18 +214,36 @@ real commitment is the two mechanisms above. *The opcode is a prefix code, and
 its width is a function of the instruction class; adjacent under-full fields
 may share a table, but nothing carries fractional bits across instructions.*
 
-### 2.8 Comparisons and ordering via branch inversion
+### 2.8 All six comparisons; complementary-comparison lowering
 
-The accumulator is always operand 1, so "reversing operands" to derive `>` /
-`>=` is *not* free (it would need a `SWAP`, which we dropped). Instead we
-exploit structured control flow: **branch inversion is free**. Negating a
-comparison is realized by swapping the then/else blocks, so:
+The accumulator is always operand 1. We carry **all six** relational
+comparisons — `LT, LE, GT, GE, EQ, NE` — as first-class ops (each yields a
+0/1 boolean in `acc`). Earlier drafts derived `GT`/`GE` by *branch inversion*
+(swapping the then/else blocks of an if-else). That trick is free for
+if-else but **breaks down for if-without-else** (there is no `else` block to
+swap) and for the lenient `BR_TABLE` form (§2.3), where `if-without-else`
+lowers to `N=1` with the body at `case[0]` — reached when `acc=0`. To place
+the body at `case[0]` for every relational condition, the lowering emits the
+**complementary comparison** so that `acc=0` means "condition true":
 
-- `LT`  →  `!(a < b)`  =  `a >= b`  =  `GE`
-- `LE`  →  `!(a <= b)` =  `a > b`   =  `GT`
+| DSL condition | emit | `acc=0` when |
+|---------------|------|--------------|
+| `a < b`  | `GE` | `a < b`  |
+| `a <= b` | `GT` | `a <= b` |
+| `a > b`  | `LE` | `a > b`  |
+| `a >= b` | `LT` | `a >= b` |
+| `a == b` | `NE` | `a == b` |
+| `a != b` | `EQ` | `a != b` |
 
-We therefore carry only `LT`, `LE`, `EQ`, `NE` and derive `GT`/`GE` by branch
-inversion. No operand swap, no extra opcodes.
+The `GT`/`GE` rows are exactly why those two ops must be carried: without
+them, `if (a <= b) body` and `if (a < b) body` could not lower to a clean
+`N=1` switch. Cost: comparison-class grows from 4 to 6 ops → `6 × 4 = 24
+states = 5 bits` (§3.2), +1 bit per comparison — affordable, and it removes a
+messy lowering special-case.
+
+Branch inversion (swapping then/else) remains an *optional* if-else lowering
+choice when the direct comparison is cheaper, but it is no longer the
+derivation mechanism for `GT`/`GE`.
 
 ### 2.9 Target accessors — object handles (one of the two codec interfaces)
 
@@ -396,6 +427,167 @@ ir`…` ──PEG──▶ C-AST fragment  ┘  (resolve labels,
 
 Step 1 (this milestone) wires only the `ir` tag → PEG parser → `IrFragment`.
 
+### 2.12 ISA split — generic core + codec extension
+
+The instruction set is split into two parts, in the style of an ISA extension
+(rather than a literal coprocessor — there is one execution engine and one
+decoder; the extension operations are leaf nodes the base treats as
+opaque-with-declared-effects):
+
+- **Generic core** — ALU/MOVE/comparison/unary/control-flow, including a
+  general **`CALL`** for non-codec procedure invocation with argument passing
+  (§3.8, §2.14). This is the reusable substrate: a TOS-hybrid accumulator
+  machine with structured control flow, applicable to filter expressions,
+  packet matchers, small state machines — anything that compiles to its
+  abstract operations. It contains **zero** codec-domain concepts.
+- **Codec extension** — stream I/O (§3.6), target accessors (§3.7), and
+  **`CALL_CODEC`** (§3.7). These are the domain-specific operations.
+
+The split is what makes the generic core reusable for other domains and what
+makes the codec extension swappable. The discipline that holds the line:
+*nothing codec-specific is baked into the generic core's semantics, encoding,
+or tooling.*
+
+**Procedure header carries an ABI selector, not a domain tag.** The header
+field selects *how the instructions in the body are interpreted* — currently
+`{GENERIC, CODEC_ENCODER, CODEC_DECODER}` — and is the natural extension
+point for future ABIs (e.g. a packet-filter ABI) without inventing a parallel
+mechanism. `CODEC_ENCODER` vs `CODEC_DECODER` are genuinely different ABIs:
+they sit on opposite sides of the codec interface (encoder reads object,
+writes stream; decoder reads stream, writes object) and that direction bit is
+what disambiguates the `LOAD_VAL`/`STORE_VAL` opcode-slot overlap (§2.9). The
+field is an *ABI/ISA selector*, not a "codec vs generic" tag — and `CODEC_*`
+procedures may take runtime value args exactly like `GENERIC` ones, so
+**`CALL_CODEC` is a true superset of `CALL`** (§2.14, §3.7).
+
+**Opcode-space skew (toward generic).** Generic ops are short and
+high-variability (binary-ALU is 9 × 7 = 63 states; comparison is 6 × 4 = 24;
+both want inline-immediate single-byte forms). Domain ops are mostly long
+anyway (`CALL_CODEC` carries `codec_idx + ref`; `ENTER` carries `dst, src,
+ref`) and the codec extension has a better prior on per-op likelihood, so it
+can use **extended encodings for the less-frequent domain ops** without
+hurting density. The split is therefore skewed: the generic core occupies the
+bulk of opcode space (lower portion), the codec extension occupies the rest
+(top portion). The exact ratio is a §7 layout-time call; the principle is that
+generic gets the dense space because that's where the per-instruction size
+leverage is. A true arithmetic-coding outer layer remains ruled out (§2.7).
+
+**Abnormal termination is generic, not codec-specific.** A codec may need to
+signal failure — checksum mismatch, invalid variant tag, malformed length,
+etc. The *reasons* are domain-specific, but the *action* (stop execution,
+report an error code, unwind) is identical and domain-neutral: it is a property
+of the execution engine, not of codecs. Every VM needs an abnormal-termination
+path, and encoding "abort" as a degenerate loop or jump-to-nowhere would
+violate the structured-control-flow invariant (§2.1) for no benefit. So the
+generic core provides a single **`TRAP imm`** opcode (§3.4); codec validation
+uses it with high error codes, generic code with low codes. There are no
+codec-specific semantics to layer on (no stream cleanup, no handle teardown —
+the host owns both and decides the response), so adding a parallel codec-
+domain trap would be redundant. Precedent is uniform: x86 `INT`, ARM
+`BKPT`/`SVC`, RISC-V `EBREAK`, Wasm `unreachable`, eBPF exit-with-non-zero are
+all generic. The error-code space is opaque to the ISA; partitioning (`0` =
+unreachable/panic, low = reserved generic, high = codec-defined, reported to
+the host) is by convention — see §3.4.
+
+### 2.13 Recursion and termination
+
+The semantic type system is recursive by nature (`list(T)`, structs that
+reference each other, etc.), so codec procedures **must** be able to recurse —
+a flat ban would make generically encoding `list(T)` impossible. Recursion is
+therefore allowed, with one structural restriction that preserves static
+termination and a bounded stack depth:
+
+- **Direct codec calls (by literal codec name) form an acyclic graph.** A
+  pseudo-C `ir\`…\`` block may invoke a codec by a literal identifier resolved
+  at compile time; the AST stitching layer rejects any cycle over these.
+- **Dispatch codec calls (target resolved by the ruleset projection) may be
+  recursive.** When a codec delegates to "the codec the projection picks for
+  this child type," the target is not a literal (at compile time) — it's whatever 
+  the projection resolves to, which can be the same codec again (e.g. `list(T)` 
+  where `T` is itself a list).
+
+The invariant this buys: **the codec call graph is at most as recursive as the
+data itself is.** Recursion depth at runtime is bounded by the depth of the
+data structure being encoded, which is statically known per type. Therefore
+the worst-case stack depth is `max_data_depth(type) × max_frame_size`, computed
+at compile time over the dispatch call graph — preserving the zero-allocation /
+bounded-resource guarantee. The DSL restriction that enforces this: *recursive
+calls appear only via projection dispatch, never via literal codec ids in
+`ir\`…\`` blocks.*
+
+### 2.14 Calling convention
+
+The machine already has the right primitives — infinite register file with
+named locals, TOS as a pointer into it, `acc` as implicit operand. The calling
+convention fixes how a `CALL` partitions that space.
+
+**Frame layout.** Logically the register file is a flat array indexed from 0.
+Each `CALL proc_idx, arg_count` opens a new frame whose base `F_callee` is
+**defined as the caller's TOS at call time** — i.e. the frame boundary is the
+top of the caller's live stack, not an arbitrary static boundary. The callee
+sees:
+
+- `r0 .. r(N-1)` — the `N` args (`N = arg_count`, declared in the target's
+  header). These *are* the top `N` slots of the caller's TOS, pushed by the
+  caller immediately before the call (see Argument passing below). `r0` is the
+  deepest (first pushed), `r(N-1)` the shallowest (last pushed, just below
+  `F_callee + N`).
+- `rN ..` — callee-local scratch (backend-allocated), starting at the slot
+  above the last arg.
+- TOS entry point = `rN` = `F_callee + N` (first free slot above args); callee
+  pushes/pops from there.
+
+Everything the caller had live *below* its call-time TOS (its own locals, its
+own deeper pushed values) sits below `F_callee` and is untouched. The backend
+maps logical indices to physical registers/stack slots — the convention is
+purely about *visibility*, not storage.
+
+**Argument passing.** The caller computes each arg into `acc` and `PUSH`es it
+(MOVE in combo-6 push mode, §2.6/§3.1) — arg0 first, then arg1, …, arg(N-1)
+last — so that after the N pushes the top of the caller's TOS is exactly the
+arg block the callee will see as `r0..r(N-1)`. Then `CALL proc_idx, N` sets
+`F_callee` to the current TOS and transfers control. In short: **args are the
+top of the caller's stack, and the frame boundary is that stack top.**
+
+**Return.** Single value, in `acc` — already the implicit work register and
+where every procedure naturally leaves its result. On `RETURN` the frame is
+popped (TOS rewound to `F_callee`, discarding the arg block and any callee
+scratch), and the caller resumes with `acc` holding the result. Multi-value
+return is deferred (would need either a struct-handle return or a TOS-based
+convention; no use case yet).
+
+**TOS discipline.** Per-frame. Callee enters with empty TOS (entry pointer =
+`rN` = `F_callee + N`) and the verifier statically requires balanced
+pushes/pops — the same discipline that makes structured control flow work
+(§2.1). On `RETURN`, TOS must be back at `rN`. The caller's TOS contents
+below `F_callee` were never touched and are visible again at their original
+indices after the call returns (the arg block, having lived in the top N
+slots, is consumed by the call and is no longer on the caller's TOS — this
+matches stack calling conventions where args are caller-popped or
+callee-popped at return).
+
+**Codec entry protocol (the ABI addition).** For `CODEC_*` procedures, the
+entry protocol layers on top of the generic frame:
+
+- `i0` ← caller's `i0` (stream iterator inherited across delegation — both
+  ends of a codec share the wire).
+- `o0` ← the child handle (from `CALL_CODEC`'s `src, ref`).
+- Direction bit ← from the procedure's ABI kind (`CODEC_ENCODER` vs
+  `CODEC_DECODER`).
+- Any runtime args follow the generic convention (slots `r0..r(N-1)`), with
+  `o0` bound separately from the arg slots.
+
+So `CALL_CODEC codec_idx, src, ref, [args…]` ≡ "compute `child(src, ref)`,
+bind it to callee's `o0`, bind caller's `i0` to callee's `i0`, set direction
+bit, then `CALL`." The codec ABI is the generic ABI plus three entry
+bindings — `CALL_CODEC` is a true superset of `CALL`, not a parallel mechanism.
+
+**Static verification (preserved).** All statically checkable: TOS balance per
+procedure; direct-call-graph acyclicity (literal codec indices only — §2.13);
+stack-depth bound `max_data_depth(type) × max_frame_size` over the dispatch
+call graph. No dynamic dispatch, no function pointers, no variadic — any of
+those would break the bound.
+
 ## 3. Abstract operations (grouped by operand-mode constraints)
 
 This section replaces the ISA table. Operations are grouped by their "mode
@@ -456,21 +648,22 @@ the four read-capable modes apply (register, peek, pop, imm):
 | 3 | pop | `[--tos]` |
 | 4 | imm | `imm` |
 
-**Comparisons** — `LT, LE, EQ, NE` → boolean in `acc`. `GT`/`GE` derived by
-branch inversion (§2.8). **4 ops × 4 modes = 16 states = exactly 4 bits** —
-a clean field, and a prime candidate for joint table-lookup with a neighbor
-(§2.7). The `imm` combo is the workhorse here: tag dispatch, magic-byte
-checks, and width comparisons (`EQ_IMM tag`) dominate real codec comparisons
-and no longer require a separate `CONST; CMP` pair.
+**Comparisons** — `LT, LE, GT, GE, EQ, NE` → boolean in `acc` (all six carried
+as first-class — §2.8). **6 ops × 4 modes = 24 states = 5 bits** (was 4 when
+only `LT/LE/EQ/NE` were carried and `GT`/`GE` were derived by branch
+inversion; carrying all six removes the if-without-else lowering special-case).
+The `imm` combo is the workhorse here: tag dispatch, magic-byte checks, and
+width comparisons (`EQ_IMM tag`, `LT_IMM bound`) dominate real codec
+comparisons and no longer require a separate `CONST; CMP` pair.
 
 ### 3.3 Unary-class (no other operand)
 
 **Unary ALU** — `NEG, NOT` — `acc = op(acc)`. No mode bits, no operands.
 Single-byte encodable.
 
-### 3.4 No-operand class
+### 3.4 No-operand (and terminator) class
 
-**`RETURN`** — end procedure.
+**`RETURN`** — end procedure; return value is whatever is in `acc`.
 **`BLOCK_END`** — close the enclosing block. Its semantics are determined by the
 block's **start marker** (§3.8):
   - closes a `BR_TABLE` case → unconditional fall-through to after the construct
@@ -503,10 +696,41 @@ is determined statically by the enclosing `LOOP` scope.
 > targets a switch — it always unambiguously targets the innermost loop. So
 > `BREAK`/`CONTINUE` only ever resolve against a `LOOP`, never a `BR_TABLE`.
 
+**`TRAP imm`** — **abnormal procedure termination** with error code `imm`. A
+control-flow terminator like `RETURN` (no fall-through; the verifier treats it
+as a procedure exit edge). The `imm` uses the same inline-small / LEB128-
+extended sub-encoding as the `imm` addressing mode (§3.5), so the small common
+codes (e.g. `0` for unreachable/panic) are single-byte. Despite carrying an
+immediate it is grouped here because its *nature* — a generic-core terminator,
+not an ALU/comparison op — is what determines its encoding and verification
+treatment.
+
+`TRAP` is the **generic core's abnormal-termination path** and is what codec
+validation (and any other domain) uses to signal failure; the opcode is
+domain-neutral. See §2.12 for the error-code partitioning convention.
+
+| `imm` range | Meaning |
+|-------------|---------|
+| `0` | unreachable / panic — a verifier-provable-never-reached assertion (e.g. placed after an exhaustive `BR_TABLE` over a union's variants, so a tag outside the valid range lands here). Equivalent in spirit to Wasm `unreachable`. |
+| `1 .. K` | reserved generic codes (overflow, bounds, stack-depth). |
+| `K+1 .. 255` | codec/wire-domain codes (checksum mismatch, invalid tag, malformed length, …). Defined by the codec author; reported to the host, which owns stream/handle teardown and decides the response. |
+
 All no-operand instructions (`RETURN`, `BLOCK_END`, `BREAK`, `CONTINUE`) are
-single-byte encodable. `BREAK`/`CONTINUE` are rare in generated codec code, so
-whether they get dedicated single-byte opcodes or ride the extended/escape
-mechanism (§7) is a layout-time decision.
+single-byte encodable. `TRAP imm` shares the `imm` sub-encoding so its common
+form (`TRAP 0`) is also single-byte. `BREAK`/`CONTINUE`/`TRAP` are relatively
+rare in generated codec code, so whether the rarer forms get dedicated
+single-byte opcodes or ride the extended/escape mechanism (§7) is a
+layout-time decision.
+
+> **Terminators close blocks.** Any unconditional control-flow terminator —
+> `RETURN`, `TRAP`, `BREAK`, `CONTINUE` — also **closes the enclosing
+> `BR_TABLE` case-block** (and, for `RETURN`/`TRAP`, ends the procedure). No
+> separate `BLOCK_END` is required after a terminator, and dead code following
+> one is rejected. This is the Wasm stack-polymorphic-terminator model. It
+> saves one `BLOCK_END` byte per terminal case and lets switch-cases that
+> `RETURN` or `TRAP` read naturally (see §4.7). Cases that fall through to a
+> shared post-construct instruction (e.g. a single trailing `RETURN`, as in
+> §4.2) still use `BLOCK_END` — it is optional, not banned.
 
 ### 3.5 Immediate operands (folded into MOVE/ALU/comparison)
 
@@ -567,11 +791,16 @@ decoder-side `ENTER` on a union variant selects+instantiates it.
 **`OPEN_LIST [src=o0]`** *(decoder)* — instantiate the list at the handle;
 `acc` = capacity hint (target may honor or ignore).
 
-**Delegation (fused — the only form):**
-**`CALL_CODEC codec_idx, [src=o0,] [type_ref,] ref`** — delegate to
-`child(src, ref)`. Invoked codec's `o0` is that child.
-**`CALL_CODEC_NEXT codec_idx, [src=o0]`** — fused enter-next + delegate: advance
-to the next list element of `src` and delegate.
+**Delegation (fused — the only form; a true superset of `CALL`):**
+**`CALL_CODEC codec_idx, [src=o0,] [type_ref,] ref, [arg_count]`** — delegate
+to `child(src, ref)`. Semantically `CALL + codec entry protocol` (§2.14):
+compute the child handle, bind callee's `o0` to it, bind callee's `i0` to
+caller's `i0`, set the direction bit from the invoked codec's ABI kind, then
+`CALL`. Optional runtime value args follow the generic calling convention
+(slots `r0..r(N-1)`), so a codec may take value args exactly like a generic
+procedure — `CALL_CODEC` is a true superset of `CALL`, not a parallel form.
+**`CALL_CODEC_NEXT codec_idx, [src=o0,] [arg_count]`** — fused enter-next +
+delegate: advance to the next list element of `src` and delegate.
 
 > **Deferred optimizations** (reconsider once opcode space is measured): fused
 > `LOAD_VAL src, ref` / `STORE_VAL src, ref` (enter+access a primitive child in
@@ -580,17 +809,21 @@ to the next list element of `src` and delegate.
 Handle IDs are small literals (like stream iterators, typically `< 4`). Field
 `ref`s (on `ENTER`/`CALL_CODEC`) benefit from the segmentation scheme (§7): a
 3-bit literal offset reaches the first 8 fields of the referenced type; larger
-the first 8 fields of the referenced type; larger indices escape.
+indices escape to an extended form.
 
 ### 3.8 Control flow class
 
 Two block **start markers**, both closed by `BLOCK_END` (§3.4):
 
-**`BR_TABLE N`** — opens an `if`/`switch`; dispatches on `acc` to one of N
-case-blocks (N=2 for `if`/`if-else`; N>2 for `switch`). Carries only the static
-count N (LEB128, usually 1 byte); the runtime selector is in `acc`. Each
-case-block is terminated by `BLOCK_END` (unconditional fall-through); no offsets
-or `ELSE` markers (§2.3).
+**`BR_TABLE N`** — opens an `if`/`switch`. Dispatches on `acc`: `acc < N` →
+`case[acc]`; `acc ≥ N` → **implicit default** (fall through after the last
+case). N=1 for `if`-without-`else` (body at `case[0]`, reached when `acc=0`
+via the complementary comparison — §2.8; the implicit default is the skip
+path, so no empty trailing block); N=2 for `if`/`if-else`; N>2 for `switch`
+(the implicit default is the natural trap home for an out-of-range selector,
+§4.7). Carries only the static count N (LEB128, usually 1 byte); the runtime
+selector is in `acc`. Each case-block is closed by `BLOCK_END` or an
+unconditional terminator (§3.4); no offsets or `ELSE` markers (§2.3).
 
 **`LOOP`** — opens a **top-test** loop. The continue-condition is in `acc` at
 the opener: `acc = 0` → exit (fall through to after the matching `BLOCK_END`);
@@ -617,6 +850,17 @@ carry no operand.
 > **One closer, two openers.** `BLOCK_END` is universal; `BR_TABLE` and `LOOP`
 > are the only block starts. This subsumes the earlier `LOOP_ITER`/`ELSE`
 > markers — both folded into `BLOCK_END` with start-declared semantics.
+
+**Procedure invocation (generic core):**
+**`CALL proc_idx, arg_count`** — invoke `procedure[proc_idx]`. Args have been
+placed by the caller in the slots that become `r0..r(N-1)` in the callee's
+frame (`N = arg_count`, declared in the target's header); return value comes
+back in `acc`. See §2.14 for the full calling convention. `CALL` is a generic-
+core instruction: it knows nothing about streams or object handles. The codec
+extension's `CALL_CODEC` (§3.7) is `CALL + codec entry protocol` — same
+calling convention, plus the `i0`/`o0`/direction bindings. Recursion rules
+(§2.13): direct calls (by literal procedure/codec index) form an acyclic
+graph; dispatch-resolved calls may recurse, bounded by data depth.
 
 ## 4. Worked examples
 
@@ -794,10 +1038,14 @@ RETURN
 First element encoded as-is; subsequent as delta from previous; all LEB128.
 `o0` is the list handle. The first element delegates cleanly
 (`CALL_CODEC_NEXT` would consume it — but we also need its value as the delta
-baseline, so it is read explicitly and `<LEB128>`-encoded inline). **Deltas are
-computed values in registers, not object handles, so they cannot be delegated**
-(`CALL_CODEC` takes a handle) — they are encoded by inlining the LEB128 IR via
-the stitching layer. `RSUB` (`r_cur − r_prev`) earns its keep here:
+baseline, so it is read explicitly and `CALL`s the shared `leb128_encode`
+generic procedure with the value as its arg). **Deltas are computed values in
+registers, not object handles, so they cannot be delegated via `CALL_CODEC`**
+(which binds `o0` to a child handle) — but they *can* be passed to a generic
+`CALL` as a value arg. This is exactly the gap §2.12's ISA split was added to
+close: the LEB128 IR lives once in the procedure table and is invoked
+everywhere, instead of being inlined by the stitching layer at every call
+site. `RSUB` (`r_cur − r_prev`) earns its keep here:
 
 ```
 COUNT                 ; acc = length (src=o0)
@@ -814,7 +1062,8 @@ ENTER_NEXT o1, o0     ; o1 = first element
 LOAD_VAL o1
 STORE r_prev          ; r_prev = baseline
 LOAD r_prev
-<LEB128>              ; inline-encode (stitching macro from §4.3)
+PUSH                  ; arg0 = value (top of caller TOS → callee's r0)
+CALL leb128_encode, 1 ; encode r_prev via shared generic procedure
 LOAD r_left
 SUB_IMM 1
 STORE r_left
@@ -827,7 +1076,8 @@ LOOP
   STORE r_cur
   LOAD r_prev
   RSUB r_cur          ; acc = r_cur − r_prev  (delta)
-  <LEB128>            ; inline-encode delta
+  PUSH                ; arg0 = delta (top of caller TOS → callee's r0)
+  CALL leb128_encode, 1 ; encode delta via shared procedure
   LOAD r_cur
   STORE r_prev        ; slide baseline
   LOAD r_left
@@ -838,12 +1088,69 @@ BLOCK_END
 RETURN
 ```
 
-> **Gap surfaced:** sub-codec delegation operates on object handles, not
-> register values, so a *computed* value (a delta, a checksum, a derived tag)
-> cannot be delegated — its encoding must be inlined by the stitching layer
-> (which is acceptable: that layer exists precisely to splice fragment IR).
-> If computed-value delegation turns out to be common, a register→handle
-> "box" op or a `CALL_CODEC_REG` form may be worth revisiting later.
+> **Gap closed by §2.12.** Sub-codec delegation (`CALL_CODEC`) operates on
+> object handles, not register values, so a *computed* value (a delta, a
+> checksum, a derived tag) cannot be delegated that way. But the generic
+> `CALL` added by the ISA split takes value args by the standard calling
+> convention (§2.14) — so a computed value is encoded by calling a shared
+> generic procedure (`leb128_encode` here) instead of inlining its IR via the
+> stitching layer at every call site. This is a real wire-size win (the
+> overriding metric of §1) *and* a real codegen-footprint win, and it's what
+> makes the ISA split pay for itself rather than being pure architectural
+> tidiness.
+
+### 4.7 Checksum validation + exhaustive union — stresses `TRAP` (decoder side)
+
+The decoder-side counterpart of §4.4. After reading the body, recompute the
+checksum over the reader fork and compare against the received byte; on
+mismatch `TRAP ERR_CHECKSUM`. `ERR_CHECKSUM` is a codec-defined high error code
+(§3.4) — opaque to the ISA, reported to the host. This is an `if-without-else`
+(trigger the trap only on mismatch), so it lowers to **N=1**: the trap is
+`case[0]` (reached when `acc=0`, i.e. mismatch — `EQ` naturally yields 0 on
+mismatch), and the implicit default is the "match, continue decode" path.
+Because `TRAP` is a terminator it closes `case[0]`; no `BLOCK_END` after it,
+and no `RETURN` — control does not continue past a trap:
+
+```
+; (assume reader fork i1 walked, checksum accumulated in r_sum, as in §4.4)
+LOAD r_sum
+READ 2, 1            ; acc = received checksum byte from parked writer fork
+EQ r_expected        ; acc = (computed == received)   [expected in a reg]
+BR_TABLE 1           ; case 0 (acc=0 → mismatch): trap; default (acc=1 → match): continue
+  TRAP ERR_CHECKSUM  ; terminator: closes case 0; no BLOCK_END, no RETURN follows
+; --- implicit default: match, continue decode ---
+; ...rest of decode...
+RETURN
+```
+
+Exhaustive-union decoding uses the **implicit default** as the out-of-range
+trap home (§2.3). A union decoder dispatches on the received tag via
+`BR_TABLE N` over all `N` valid variants; an out-of-range tag (`acc ≥ N`)
+falls through to the implicit default after the last case, which is a `TRAP`.
+Each variant case delegates to its variant's decoder and then `RETURN`s
+(`RETURN` closes the case — §3.4); the trap-default is itself a terminator, so
+nothing follows it:
+
+```
+READ i0, 1           ; acc = variant tag
+BR_TABLE 3           ; cases 0..2 valid; acc≥3 → implicit default (fall through)
+  CALL_CODEC codec_0, o0, 0   ; case 0: delegate to variant 0's decoder
+  RETURN                      ; done — RETURN closes case 0 (no BLOCK_END)
+  CALL_CODEC codec_1, o0, 1   ; case 1
+  RETURN
+  CALL_CODEC codec_2, o0, 2   ; case 2
+  RETURN
+TRAP ERR_BAD_TAG     ; implicit default (acc≥3, invalid tag) — terminator; nothing follows
+```
+
+> **Three mechanisms compose cleanly here.** (1) The implicit `BR_TABLE`
+> default (§2.3) gives the trap a home with no validate-then-dispatch
+> preamble. (2) Terminators close blocks (§3.4), so each `RETURN`-ended case
+> and the final `TRAP` need no trailing `BLOCK_END`, and there is no redundant
+> `RETURN` after the trap. (3) `TRAP` is the generic abnormal-termination path
+> (§2.12) — the host owns stream/handle teardown and decides the response
+> (retry, drop packet, log, …); the high error-code range is reserved for
+> codec-defined reasons by convention only.
 
 ## 7. Encoding strategy (deferred)
 
@@ -852,20 +1159,27 @@ fixed**. Guiding principles gathered so far:
 
 1. **Opcodes are a prefix code, sized to `ceil(log₂(states))` per class.**
    Binary-class is 9 ops × 7 modes = 63 states = 6 bits; comparison-class is
-   4 × 4 = 16 states = exactly 4 bits. Adjacent under-full fields may share a
-   code subspace via bounded joint table-lookup (§2.7) — the *only* mechanism
-   for recovering fractional bits. A true arithmetic-coding outer layer is
-   explicitly ruled out (complexity/testability).
-2. **No-operand instructions** (`NEG`, `NOT`, `RETURN`, `BLOCK_END`) can be a
-   single byte. `LOOP_ITER` is folded into `BLOCK_END` (loop blocks: conditional
-   back-edge on `acc`, declared by the `LOOP` start marker — §3.8);
-   `DUP`/`SWAP` are absent (§2.6).
-   (`DUP` is subsumed by MOVE push-mode; `SWAP` is dropped — §2.6).
+   6 × 4 = 24 states = 5 bits (all six relational comparisons — §2.8).
+   Adjacent under-full fields may share a code subspace via bounded joint
+   table-lookup (§2.7) — the *only* mechanism for recovering fractional bits.
+   A true arithmetic-coding outer layer is explicitly ruled out
+   (complexity/testability).
+2. **No-operand instructions** (`NEG`, `NOT`, `RETURN`, `BLOCK_END`,
+   `BREAK`, `CONTINUE`) can be a single byte. `LOOP_ITER` is folded into
+   `BLOCK_END` (loop blocks: conditional back-edge on `acc`, declared by the
+   `LOOP` start marker — §3.8); `DUP`/`SWAP` are absent (§2.6).
+   **`TRAP imm`** (§3.4, generic abnormal termination) shares the `imm`
+   sub-encoding, so its common form (`TRAP 0` = unreachable/panic) is also
+   single-byte; rare error codes escape to trailing LEB128. Error-code
+   partitioning (`0` = unreachable, low = reserved generic, high = codec-defined
+   per §3.4) is opaque to the ISA and lives at the host interface.
 3. **Field references** use the segmentation scheme grounded in §2.9: a 3-bit
    literal offset reaches the first 8 fields of the referenced type. Larger
    offsets escape to an extended form. Must be measured against real schemas.
-4. **Comparison-class** is 4 ops × 4 modes = 16 states = exactly 4 bits — a
-   clean field, and a joint table-lookup candidate when paired with a neighbor.
+4. **Comparison-class** is 6 ops × 4 modes = 24 states = 5 bits (all six
+   relational comparisons carried — §2.8). Still a tight, near-clean field;
+   joint table-lookup with a neighbor remains an option if measured
+   frequencies justify it.
 5. **Stream I/O** common case (`i < 4`, `w ∈ {1,2,4}`) packs opcode + iterator
    + width into a single byte.
 6. **Immediates, offsets, field indices, type indices, branch targets** all use
@@ -897,6 +1211,24 @@ fixed**. Guiding principles gathered so far:
 13. **`HAS_NEXT`** (§3.6, added): fills the stream-loop exhaustion gap surfaced
     by §4.4. Like `COUNT`/`TAG`, it is a 1-operand metadata query; packs with
     the iterator ID.
+14. **Opcode-space split, skewed toward generic** (§2.12): the generic core
+    occupies the bulk of opcode space (lower portion) because its instructions
+    are short and high-variability (binary-ALU 63 states, comparison 16, both
+    wanting inline-immediate single-byte forms). The codec extension occupies
+    the top portion; its instructions are mostly long anyway (`CALL_CODEC`,
+    `ENTER` carry multiple operands) and the extension has a good per-op
+    likelihood prior, so less-frequent domain ops use **extended encodings**
+    without hurting density. Exact split ratio deferred; the principle is that
+    generic gets the dense space because that's where the per-instruction size
+    leverage is.
+15. **Effect declarations for extension ops** (§2.12, *deferred — implementation
+    note only*): to make the generic core's tooling (VM, codegen, verifier,
+    liveness allocator) reusable across domains, each extension operation
+    publishes a declared-effect summary `{reads, writes, allocates:false}`.
+    Generic tooling operates on the generic core + these summaries; the codec
+    extension is a plugin. Out of scope to specify now; recorded so the
+    implementation doesn't accidentally couple generic tooling to codec
+    specifics.
 
 ### Open questions (encoding/target access)
 
@@ -907,11 +1239,25 @@ fixed**. Guiding principles gathered so far:
   out of scope for now.
 - **Fused value access** (§2.9/§3.7): measure whether `LOAD_VAL src, ref` /
   `ENTER_ACTIVE` earn dedicated opcodes once real codecs are counted.
-- **Computed-value delegation** (§4.6): sub-codecs take object handles, so a
-  computed value (delta, checksum, derived tag) cannot be delegated and must be
-  inlined by the stitching layer. If this pattern is common enough, a
-  register→handle "box" op or a `CALL_CODEC_REG` form may be worth adding
-  later.
+- **Computed-value delegation** (§4.6, *resolved by §2.12*): sub-codec
+  delegation (`CALL_CODEC`) operates on object handles, so a computed value
+  (delta, checksum, derived tag) cannot be delegated that way — but the
+  generic `CALL` added by the ISA split takes value args by the standard
+  calling convention, so a shared generic procedure (`leb128_encode`) is
+  invoked instead of inlining IR at every call site. No register→handle "box"
+  op or `CALL_CODEC_REG` form is needed.
+- **Recursion depth** (§2.13): the direct-codec-call graph is required to be
+  acyclic; dispatch-resolved calls may recurse, bounded by data depth. The
+  stack-depth bound `max_data_depth(type) × max_frame_size` is computable at
+  compile time. Confirm this holds once concrete recursive schemas
+  (e.g. self-referential structs) are encoded.
+- **`BR_TABLE` default-case semantics** (§4.7, *resolved*): `BR_TABLE` now has
+  an **implicit default** — `acc ≥ N` falls through after the last case (§2.3).
+  This gives the exhaustive-switch trap-default a home with no
+  validate-then-dispatch preamble, and lets `if-without-else` lower to N=1
+  (body at `case[0]`, default = skip) with no empty trailing block. Coupled
+  with terminators closing blocks (§3.4), the §4.7 exhaustive-union example
+  collapses to one `RETURN`-terminated case per variant plus a final `TRAP`.
 - **Optional-field modeling** (§4.5): confirmed that optionality-as-0/1-list +
   `COUNT` works without a dedicated `IS_PRESENT` op. Confirm this holds across
   realistic schemas before locking it in as the convention.
