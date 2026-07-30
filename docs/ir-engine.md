@@ -214,43 +214,151 @@ comparison is realized by swapping the then/else blocks, so:
 We therefore carry only `LT`, `LE`, `EQ`, `NE` and derive `GT`/`GE` by branch
 inversion. No operand swap, no extra opcodes.
 
-### 2.9 Object access — multi-type procedure references
+### 2.9 Target accessors — object handles (one of the two codec interfaces)
 
-~~Each codec procedure is compiled for a single target type~~ — **codecs can
-match multiple layers or irregular sections of the semantic type tree.** A
-packed-bitmap codec for a struct with optional fields touches multiple fields
-across the struct. A codec for a union-variant-inside-a-struct touches both the
-struct's tag field and the variant's data fields. Static restriction to a
-single type is too narrow.
+A codec has exactly two interfaces to the outside world: the **stream**
+(bytes on the wire, §2.4/§2.10) and the **target object** (the host data model:
+structs, unions, lists, primitives). Struct fields, union variants, list
+elements, and primitive values are all *target accessors* and are unified here.
 
-**Solution: each procedure carries a list of referenced types.** Usually this
-list has one entry (the codec's primary target type). Field references are 2D
-coordinates: `(type_ref_idx, field_idx)`.
+**Object handles are the symmetric counterpart of stream iterators.** Just as a
+codec receives an implicit stream iterator `i0` at entry, it receives an
+implicit **object handle `o0`** referring to the object it must encode/decode.
+Handles are small literal IDs (typically `< 4`), and the codec **enters** a
+field/variant/element of an existing handle to spawn a new handle referencing a
+nested construct:
 
-- **Short form**: `type_ref_idx = 0` (implicit) — accesses the first (primary)
-  referenced type. This covers the common single-type case.
-- **Extended form**: explicit `type_ref_idx` — accesses any type in the
-  procedure's reference list.
+```
+ENTER o_src, ref → o_dst   ; navigate from o_src to a child → new handle o_dst
+```
 
-The referenced-types list is part of the procedure header, not per-instruction.
-The short form keeps the common case compact (1 field index instead of 2).
+`ENTER` is the single navigation primitive. The source handle's type is
+**statically known** (derived from the navigation path), so the meaning of `ref`
+is disambiguated by that type's **kind** — one `ENTER` instruction, one `ref`
+encoding, three meanings:
 
-This also grounds the field segmentation idea (§7): since field indices are
-scoped to one type's field list, a 3-bit literal offset reaches the first 8
-fields of any referenced type.
+| `o_src` type kind | `ref` means | effect |
+|-------------------|------------|--------|
+| struct            | field #    | handle to that field's sub-object |
+| union             | variant #  | handle to that variant's payload |
 
-`CALL_CODEC codec_idx, field_idx` selects `object[field_idx]` and invokes
-`codec[codec_idx]`, which has its own referenced-types list. The invoked
-codec's primary type (index 0) becomes the child object's type.
+(Entering a **list**-typed struct field yields a handle to the *list as a
+whole*; element-by-element iteration is `ENTER_NEXT` — §3.7.)
 
-> **Open question — deep navigation.** When a codec references a child type
-> deep in the object tree (e.g. a union variant selected by a runtime tag
-> inside a struct field), the type_ref list must encode not just *which* type
-> but *how to reach it* (the path through the object tree, possibly involving
-> runtime lookups). The simple `(type_ref_idx, field_idx)` model handles
-> multiple types at the same level, but deep navigation may require either
-> explicit object-selection instructions or delegation via `CALL_CODEC`.
-> This needs concrete codec examples to resolve — left open for now.
+**This resolves deep navigation** (previously an open question): reaching a
+union variant nested inside a struct field is just two `ENTER`s —
+`ENTER o0, struct_field → o1; ENTER o1, variant_idx → o2` — followed by
+`LOAD_VAL`/`STORE_VAL` on `o2`. No path encode, no runtime lookups in the
+instruction stream; the path is the static sequence of `ENTER`s.
+
+#### Navigation then value-access (unfused is the core)
+
+The **natural core operations** are *unfused*: navigate to a child with `ENTER`,
+then access the value *at* a handle with `LOAD_VAL`/`STORE_VAL` (no `ref` — the
+handle already refers to the target primitive):
+
+- **`ENTER dst, src, ref`** — navigate to ANY child (struct field / union
+  variant / list-as-a-whole) → named handle `dst`.
+- **`LOAD_VAL [src=o0]`** — `acc` = primitive value *at* the handle (encoder).
+  No `ref`; the handle's referent IS the primitive.
+- **`STORE_VAL [src=o0]`** — primitive value *at* the handle = `acc` (decoder).
+
+This handles **delegated number codecs** (LEB128, fixed-width): the sub-codec
+receives `o0` already pointing at the primitive — it just `LOAD_VAL`s it, no
+`ref` needed. It also handles `union({x: number})`: `ENTER o1, o0, variant0`
+gives a handle to the number, then `LOAD_VAL o1` reads it.
+
+The **fused** `LOAD_VAL src, ref` (enter+load a primitive child in one op) is an
+**irregularization / deferred optimization** — it collapses the common
+struct-of-scalars case from `ENTER`+`LOAD_VAL` to a single instruction, but it
+is not a natural core operation. It will be reconsidered once opcode space is
+measured against real codecs.
+
+#### Delegation — fused, and the only form
+
+Delegation's entire purpose is that the caller does **not** want to deal with
+the sub-representation, so the fused form is natural and **sufficient as the
+only form**:
+
+- **`CALL_CODEC codec_idx, src, ref`** — invoke `codec[codec_idx]` on
+  `child(src, ref)`; the invoked codec's implicit `o0` is that child.
+- **`CALL_CODEC_NEXT codec_idx, src`** — fused enter-next + delegate: advance to
+  the next list element of `src` and delegate to `codec[codec_idx]` on it. This
+  is the list-element delegation form (no separate `ENTER_NEXT`+`CALL_CODEC`).
+
+The two-operand `CALL_CODEC codec_idx, handle` form (delegate on a pre-existing
+handle) is **dropped** — if you're delegating, the fused form is always used.
+Manual list iteration without delegation still uses `ENTER_NEXT` (§3.7).
+
+#### The type-reference list (kept, and now grounded)
+
+A procedure still carries a **referenced-types list** (the static set of
+object-tree node types it navigates among — usually one entry). Each handle's
+type is one of these, derivable at build time. The short form (implicit
+`type_ref 0`) targets the primary object; an extended form selects others for
+multi-layer codecs (e.g. a packed-bitmap codec touching several sibling types).
+This keeps field-segmentation (§7) intact: a 3-bit literal offset reaches the
+first 8 fields of the handle's referenced type.
+
+#### Two constraint axes (both static, both enable encoding overlap)
+
+1. **Directionality.** Every procedure is **either an encoder or a decoder**,
+   transitively through sub-codec invocations — an encoder never invokes a
+   decoder. Therefore target accessors are one-directional:
+   - **Encoder** → handles are **read-only** (`LOAD_VAL`, `ENTER` to navigate,
+     `COUNT`/`TAG` metadata queries).
+   - **Decoder** → handles are **write/init-only** (`STORE_VAL`; `ENTER` on a
+     union *selects+instantiates* the variant, on a list *opens/appends*;
+     `OPEN_LIST` with a capacity hint).
+   Because the direction is a single bit in the procedure header, **read and
+   write accessor opcodes can overlap** — disambiguated by that bit. `LOAD_VAL`
+   and `STORE_VAL` share one opcode slot.
+
+2. **Type-kind disambiguation.** The semantic type of every field/variant/
+   element/value is known at build time (captured in the codec's pattern-match
+   object). So only the *relevant* accessors are emitted, and **overlapping
+   representations** can be used: the same `ref` encoding means field/variant/
+   element depending on the source handle's type kind. No per-accessor tags.
+
+#### Lists — sequential, minimal obligation on targets
+
+Lists are entered like any other child, but element access is **sequential**
+(`ENTER_NEXT`), mirroring stream cursors. This is the *minimal* obligation on a
+target mapping — streaming, ring buffers, DMA descriptors, and fixed-capacity
+arrays all support sequential access natively; many cannot do random access at
+all, and random access would demand pre-allocation from every target. The list
+length is queried by `COUNT` (encoder) for the length prefix; capacity is
+supplied to `OPEN_LIST` (decoder) as a hint the target may honor or ignore. The
+**target manages all memory** (zero-allocation principle); the codec never
+allocates. Out-of-order codecs use the stitching layer to unroll.
+
+#### Initialization
+
+- **List capacity** — `OPEN_LIST` carries the count in `acc`; the target
+  pre-allocates if it can, ignores if it can't.
+- **Union variant** — implicit in `ENTER` on the decoder side: entering variant
+  `k` selects it active and yields a writable handle to its payload. No
+  dedicated `SELECT_VARIANT` instruction.
+
+#### Delegation
+
+`CALL_CODEC codec_idx, src, ref` is the **only** delegation form (fused — see
+above). The invoked codec's implicit `o0` is `child(src, ref)`, and its
+referenced-types list is its own. `CALL_CODEC_NEXT codec_idx, src` delegates to
+the next list element. There is no separate "delegate on a handle" form.
+
+> **Resolved questions.** (a) Encoder active-variant access: `TAG` → `BR_TABLE`
+> → `ENTER` (with the case's static variant index, read-only) is sufficient; no
+> dedicated encoder-side op. A fused `ENTER_ACTIVE` is a deferred optimization
+> (§7). (b) Fused vs separated delegation: fused is the only form. (c)
+> Read/write opcode overlap: confirmed — no counter-example exists on the target
+> side (encoder = read-only source, decoder = write-only sink, transitive); the
+> direction bit in the procedure header cleanly separates `LOAD_VAL` from
+> `STORE_VAL`. (d) Sequential-only list access: sufficient for now — multipass
+> read is possible by entering a list multiple times; random access and other
+> target-specific capabilities are deferred to a future **extension-point**
+> mechanism (call-out ops + trait processing bound by the type mapper at
+> code-gen time — system-wide consequences, out of scope for now).
 
 ### 2.10 Stream I/O is byte-granular, not field-granular
 
@@ -288,52 +396,6 @@ ir`…` ──PEG──▶ C-AST fragment  ┘  (resolve labels,
 
 Step 1 (this milestone) wires only the `ir` tag → PEG parser → `IrFragment`.
 
-### 2.12 List access — sequential cursor, mirroring stream iterators
-
-Lists require runtime-indexed element access, which `LOAD_FIELD`/
-`STORE_FIELD` (literal field indices) cannot express. The natural pattern for
-codecs is **sequential** — elements are consumed/emitted in order. This mirrors
-the stream iterator pattern (§2.4):
-
-- `OPEN_LIST_RD [type_ref,] field_idx, cursor` — open read cursor; `acc` =
-  element count. Target must support iteration.
-- `OPEN_LIST_WR [type_ref,] field_idx, cursor` — open write cursor; `acc` =
-  capacity hint (target may pre-allocate or ignore). Target must support
-  append.
-- `LOAD_NEXT_ELT cursor` — `acc` = next element from list (read).
-- `STORE_NEXT_ELT cursor` — next list slot = `acc` (append/write).
-- `CLOSE_LIST cursor` — finalize list (commit, set length, etc.).
-
-**Why sequential, not indexed?** Requiring iterate/append is the *minimal*
-obligation on target mappings — strictly less than requiring random access.
-Streaming targets, ring buffers, DMA descriptors, and fixed-capacity arrays all
-support sequential access natively; many cannot support random access at all.
-Random access would also demand pre-allocation from every target, which is
-"too much to ask." Codecs that truly need out-of-order access can use the
-metaprogramming/stitching layer to unroll into individual field accesses.
-
-The cursor ID is a small literal (like stream iterator IDs, typically `< 4`).
-
-### 2.13 Initialization — capacity and variant selection
-
-Two write-side initialization concerns:
-
-1. **List capacity**: handled by `OPEN_LIST_WR` — the capacity hint (in `acc`)
-   tells the target how many elements to expect. The target decides whether to
-   pre-allocate, use a fixed buffer, or ignore the hint. The zero-allocation
-   principle means the *target* manages memory, not the codec.
-
-2. **Union variant selection**: when writing to a union, the codec must select
-   which variant is active before writing variant fields. This is **implicit**
-in the multi-type reference mechanism (§2.9): the procedure's referenced-types
-   list includes both the union type (for the tag field) and the variant type
-   (for variant data fields). `STORE_FIELD` on the union's tag field sets the
-   active variant; subsequent field references to the variant type access the
-   variant's data. The target mapping knows its union representation and handles
-   the underlying storage — no dedicated `SELECT_VARIANT` instruction is needed.
-   *(Caveat: this assumes the deep-navigation question in §2.9 is resolved
-   favorably; if not, an explicit variant-selection instruction may be required.)*
-
 ## 3. Abstract operations (grouped by operand-mode constraints)
 
 This section replaces the ISA table. Operations are grouped by their "mode
@@ -364,7 +426,7 @@ of the 7 valid combos from §2.6.
   op permanently for a case that is rare in codecs (the value being shifted is
   almost always the freshly-loaded field in `acc`, not a computed expression).
   When it does occur, the lowering pass spills one register
-  (`STORE rShift; LOAD_FIELD value; SHL rShift`) — 1 extra byte in a rare case,
+  (`STORE rShift; LOAD_VAL value; SHL rShift`) — 1 extra byte in a rare case,
   strictly cheaper than a permanent +1 bit. `RSUB` is decomposable
   (`NEG; ADD rN`) *and* free, which is why it's kept; `RSHL`/`RSHR` are
   irreducible *and* costly, which is why they're dropped.
@@ -409,11 +471,42 @@ Single-byte encodable.
 ### 3.4 No-operand class
 
 **`RETURN`** — end procedure.
-**`BLOCK_END`** — close the enclosing `if` / `loop` / `block` (subsumes `ELSE`,
-see §2.3).
-**`LOOP_ITER`** — structured loop iteration check (advance/continue or exit).
+**`BLOCK_END`** — close the enclosing block. Its semantics are determined by the
+block's **start marker** (§3.8):
+  - closes a `BR_TABLE` case → unconditional fall-through to after the construct
+    (subsumes `ELSE`, §2.3);
+  - closes a `LOOP` → **unconditional back-edge** to the `LOOP` opener, which
+    then re-evaluates the continue-condition.
 
-All single-byte encodable.
+`LOOP_ITER` is therefore **folded into `BLOCK_END`** — there is one closer for
+all block shapes; the start marker declares the end semantics. Note the
+uniformity this produces: **the test always lives at the opener, and the closer
+is always unconditional** (`BR_TABLE` cases fall through; `LOOP` body
+back-edges). `DUP`/`SWAP` are also absent (`DUP` is MOVE push-mode, `SWAP` is
+dropped — §2.6).
+
+**`BREAK`** — structured exit from the innermost enclosing `LOOP`: jump to the
+instruction after its matching `BLOCK_END`. **`CONTINUE`** — structured
+re-test: jump to the innermost `LOOP`'s matching `BLOCK_END` (the back-edge,
+which returns to the opener for re-testing). Both are no-operand — the target
+is determined statically by the enclosing `LOOP` scope.
+
+> **Why these can't be avoided by nesting.** `continue` could *almost* be
+> expressed by putting the rest of the body inside the `else` of a `BR_TABLE`,
+> but only when the `continue` is the last statement; in general it must skip
+> forward over trailing code = a jump. `break` is worse: no amount of nesting
+> can exit an enclosing loop, so it is an irreducible structured jump. Both
+> therefore earn their own opcodes.
+>
+> **No switch-`break` ambiguity.** Because each `BR_TABLE` case is inherently
+> break-terminated by its `BLOCK_END` (fall-through), a DSL-level `break` never
+> targets a switch — it always unambiguously targets the innermost loop. So
+> `BREAK`/`CONTINUE` only ever resolve against a `LOOP`, never a `BR_TABLE`.
+
+All no-operand instructions (`RETURN`, `BLOCK_END`, `BREAK`, `CONTINUE`) are
+single-byte encodable. `BREAK`/`CONTINUE` are rare in generated codec code, so
+whether they get dedicated single-byte opcodes or ride the extended/escape
+mechanism (§7) is a layout-time decision.
 
 ### 3.5 Immediate operands (folded into MOVE/ALU/comparison)
 
@@ -436,94 +529,321 @@ shortcut.
 
 **`READ i, w`** — `acc = stream[i].read(w)` where `w ∈ {1,2,4}` bytes.
 **`WRITE i, w`** — `stream[i].write(acc, w)`.
+**`HAS_NEXT i`** — `acc = (stream[i] has ≥1 more byte)` — the readable-iterator
+exhaustion test. This is the stream-side counterpart of the target-side
+`COUNT`/`TAG` metadata queries, and is what makes pretest stream loops
+expressible (§4.4).
 **`CLONE_RD src, dst`** — fork readable iterator.
 **`CLONE_WR src, dst`** — fork writable iterator.
 **`SEEK i, Δ`** *(optional)* — advance/rewind by LEB128 delta.
 
 Iterator IDs are small literals (typically `< 4`); width `w` fits in 2 bits.
 The common case (`i < 4`, `w ∈ {1,2,4}`) can pack into a single byte with the
-opcode.
+opcode. `HAS_NEXT`/`CLONE_*` take only an iterator ID (or two), so they pack
+even tighter.
 
-### 3.7 Object access class
+### 3.7 Target access class
 
-**`LOAD_FIELD [type_ref,] f`** — `acc = object[f]` (struct field access; `f`
-relative to referenced type `type_ref`, default 0 — §2.9).
-**`STORE_FIELD [type_ref,] f`** — `object[f] = acc`.
-**`CALL_CODEC codec_idx, field_idx`** — invoke `codec[codec_idx]` on
-`object[field_idx]`; the invoked codec has its own referenced-types list (§2.9).
+Core operations are **unfused**: `ENTER` navigates to a child, then value/metadata
+ops access the handle directly (no `ref` — the handle already refers to the
+target). Delegation is the **only fused** op. The procedure's direction bit
+(encoder/decoder) selects read vs write semantics for the overlapping value ops
+(§2.9). `[type_ref,]` is the optional multi-type prefix on `ref`-bearing ops.
 
-Short form: `type_ref` omitted (implicit 0) — the common single-type case.
-Extended form: explicit `type_ref` index for multi-layer codecs (§2.9).
-Field index `f` benefits from the segmentation scheme (§7): a 3-bit literal
-offset reaches the first 8 fields of the referenced type; larger indices escape.
+**Navigation:**
+**`ENTER dst, src, [type_ref,] ref`** — navigate child of `src` → handle `dst`.
+`ref` = struct field # or union variant # (disambiguated by `src`'s type kind);
+decoder-side `ENTER` on a union variant selects+instantiates it.
+**`ENTER_NEXT dst, src`** — list element sequential advance → element handle.
+
+**Value access (operate on the handle, no `ref`):**
+**`LOAD_VAL [src=o0]`** *(encoder)* — `acc` = primitive value at the handle.
+**`STORE_VAL [src=o0]`** *(decoder)* — primitive value at the handle = `acc`.
+*(Same opcode slot — direction bit.)*
+
+**Metadata / initialization (operate on the handle, no `ref`):**
+**`COUNT [src=o0]`** *(encoder)* — `acc` = list length at the handle.
+**`TAG [src=o0]`** *(encoder)* — `acc` = union active variant index at the handle.
+**`OPEN_LIST [src=o0]`** *(decoder)* — instantiate the list at the handle;
+`acc` = capacity hint (target may honor or ignore).
+
+**Delegation (fused — the only form):**
+**`CALL_CODEC codec_idx, [src=o0,] [type_ref,] ref`** — delegate to
+`child(src, ref)`. Invoked codec's `o0` is that child.
+**`CALL_CODEC_NEXT codec_idx, [src=o0]`** — fused enter-next + delegate: advance
+to the next list element of `src` and delegate.
+
+> **Deferred optimizations** (reconsider once opcode space is measured): fused
+> `LOAD_VAL src, ref` / `STORE_VAL src, ref` (enter+access a primitive child in
+> one op); fused encoder `ENTER_ACTIVE` (enter active union variant in one op).
+
+Handle IDs are small literals (like stream iterators, typically `< 4`). Field
+`ref`s (on `ENTER`/`CALL_CODEC`) benefit from the segmentation scheme (§7): a
+3-bit literal offset reaches the first 8 fields of the referenced type; larger
+the first 8 fields of the referenced type; larger indices escape.
 
 ### 3.8 Control flow class
 
-**`BR_TABLE N`** — dispatch on `acc` to one of N case-blocks (N=2 for
-`if`/`if-else`; N>2 for `switch`). Carries only the static count N (LEB128,
-usually 1 byte); the runtime selector is in `acc`. Each case-block is
-terminated by `BLOCK_END`; no offsets or `ELSE` markers (§2.3).
+Two block **start markers**, both closed by `BLOCK_END` (§3.4):
 
-### 3.9 List cursor class
+**`BR_TABLE N`** — opens an `if`/`switch`; dispatches on `acc` to one of N
+case-blocks (N=2 for `if`/`if-else`; N>2 for `switch`). Carries only the static
+count N (LEB128, usually 1 byte); the runtime selector is in `acc`. Each
+case-block is terminated by `BLOCK_END` (unconditional fall-through); no offsets
+or `ELSE` markers (§2.3).
 
-**`OPEN_LIST_RD [type_ref,] field_idx, cursor`** — open read cursor; `acc` =
-count (§2.12).
-**`OPEN_LIST_WR [type_ref,] field_idx, cursor`** — open write cursor; `acc` =
-capacity hint (§2.12).
-**`LOAD_NEXT_ELT cursor`** — `acc` = next element (read).
-**`STORE_NEXT_ELT cursor`** — append `acc` to list (write).
-**`CLOSE_LIST cursor`** — finalize list.
+**`LOOP`** — opens a **top-test** loop. The continue-condition is in `acc` at
+the opener: `acc = 0` → exit (fall through to after the matching `BLOCK_END`);
+`acc ≠ 0` → enter the body. The body is closed by `BLOCK_END` as an
+**unconditional back-edge** to the opener (which re-tests). This is the
+`while`/`for` form — zero iterations is possible. The loop exit target is the
+instruction after `BLOCK_END`.
 
-Cursor IDs are small literals (like stream iterators, typically `< 4`).
-See §2.12 for rationale on sequential-only access.
+`do-while` (bottom-test) is **not expressible** and is banned at the DSL level
+(no `do` keyword). Its behavior is recoverable when needed by adjusting the
+loop variable's initial value (`±1`), or by duplicating the body before a
+`while` — but in practice every codec loop (iterate until stream/list exhausted)
+is naturally top-test.
 
-## 4. Worked example — struct `{x: u32, y: u16, flag: u8}` encoder
+`break` inside a loop body → the **`BREAK`** instruction (§3.4): structured jump
+to the exit target (after the matching `BLOCK_END`). `continue` → the
+**`CONTINUE`** instruction: structured jump to the `LOOP`'s matching
+`BLOCK_END` (the back-edge → opener re-test). For a `for` loop, the lowering
+pass places the increment just before `BLOCK_END`, so `continue` runs the
+increment then re-tests. Both always target the innermost enclosing `LOOP`
+(never a `BR_TABLE`, whose case-exit is implicit via `BLOCK_END`), so they
+carry no operand.
 
-Little-endian fixed-width wire format:
+> **One closer, two openers.** `BLOCK_END` is universal; `BR_TABLE` and `LOOP`
+> are the only block starts. This subsumes the earlier `LOOP_ITER`/`ELSE`
+> markers — both folded into `BLOCK_END` with start-declared semantics.
+
+## 4. Worked examples
+
+These examples stress the abstractions. The recurring lesson: **fused
+delegation (`CALL_CODEC`) is the dominant size win, not fused field access** —
+typical generic codecs delegate each child to its resolved sub-codec, so the
+struct/union cases (4.1, 4.2) collapse to a few `CALL_CODEC`s, far smaller
+than the unfused `ENTER`+`LOAD_VAL`+`WRITE` spelling.
+
+Notation in examples: `LOAD rN` / `STORE rN` are MOVE register-mode;
+`OP_IMM imm` is binary-ALU with `imm` mode (result → `acc`);
+`OP rN` annotated with its combo when the output isn't `acc`;
+`<LEB128>` is a stitching-layer inline macro (the IR of §4.3 spliced in —
+exactly the TS-metaprogramming fragment-stitching use case of §2.11).
+
+### 4.1 Generic struct encoder — delegates each field
+
+`{x: u32, y: u16, flag: u8}`, generic encoder. Each field delegates to the
+number codec its type resolves to — the *typical* form, and three instructions:
 
 ```
-LOAD_FIELD x          ; acc = obj.x
-WRITE i0, 4           ; emit 4 bytes LE
-LOAD_FIELD y
-WRITE i0, 2
-LOAD_FIELD flag
+CALL_CODEC codec_u32, o0, x
+CALL_CODEC codec_u16, o0, y
+CALL_CODEC codec_u8,  o0, flag
+RETURN
+```
+
+> Contrast: the unfused core spelling (`ENTER o1,o0,x` / `LOAD_VAL o1` /
+> `WRITE i0,4` ×3) is 9 instructions. So fused **delegation** is the win; fused
+> field-access (`LOAD_VAL o0,x`) is only an irregularization on top of an
+> atypical spelling, which is why it stays deferred (§2.9) while fused
+> delegation is core.
+
+### 4.2 Generic union encoder — delegates active variant
+
+Union of three number payloads. `TAG` reads the active variant index, then
+`BR_TABLE` dispatches; each case delegates to its variant's codec:
+
+```
+TAG                       ; acc = active variant index (src=o0)
+BR_TABLE 3
+  CALL_CODEC codec_a, o0, 0
+BLOCK_END
+  CALL_CODEC codec_b, o0, 1
+BLOCK_END
+  CALL_CODEC codec_c, o0, 2
+BLOCK_END
+RETURN
+```
+
+### 4.3 LEB128 encoder (u32 → LEB128 bytes) — stresses ALU, imm, loop
+
+Sub-codec for a primitive u32. `o0` is the primitive handle. A u32 always emits
+≥1 byte, so the loop must run at least once — recovered as pretest by
+initializing the condition to true (§3.8's do-while-recovery note). Bit
+manipulation via `AND_IMM`/`SHR_IMM`/`OR_IMM`; continuation-bit set is a
+2-case `BR_TABLE`:
+
+```
+LOAD_VAL              ; acc = value (src=o0)
+STORE r_val
+LOAD_IMM 1            ; cond = true (force first entry)
+LOOP
+  ; byte = r_val & 0x7F
+  LOAD r_val
+  AND_IMM 0x7F
+  STORE r_byte
+  ; r_val >>= 7
+  LOAD r_val
+  SHR_IMM 7
+  STORE r_val
+  ; if r_val != 0: set continuation bit
+  LOAD r_val
+  EQ_IMM 0            ; acc = (r_val == 0)
+  BR_TABLE 2          ; case 0 (more): set bit; case 1 (done): skip
+    LOAD r_byte
+    OR_IMM 0x80
+    STORE r_byte
+  BLOCK_END
+    ; case 1: no bit
+  BLOCK_END
+  ; emit byte
+  LOAD r_byte
+  WRITE i0, 1
+  ; re-test cond: continue while r_val != 0
+  LOAD r_val
+  NE_IMM 0
+BLOCK_END              ; back-edge → LOOP (re-test)
+RETURN
+```
+
+### 4.4 Checksum with fixup — stresses stream forks + `HAS_NEXT`
+
+The `<compute hasMore>` gap from earlier drafts is filled by `HAS_NEXT i`
+(§3.6). Note the **pretest cost**: the runtime condition must be computed once
+*before* `LOOP` (initial test, allows zero iterations) **and** once at the end
+of the body (so the back-edge re-tests a fresh value). Both occurrences are
+genuine — this is the standard price of pretest loops with a runtime condition,
+and the reason `do-while` was occasionally nicer before being banned.
+
+```
+CLONE_RD 0 1          ; reader fork at packet start (for checksumming)
+CLONE_WR 0 2          ; writer fork parked at checksum field
+WRITE i0, 1           ; placeholder byte via original writer
+; ...serialize rest of packet with original writer i0 (elided)...
+LOAD_IMM 0
+STORE r_sum           ; r_sum = checksum accumulator
+HAS_NEXT 1            ; cond: reader 1 has another byte
+LOOP
+  READ 1, 1           ; acc = next byte from reader
+  ADD r_sum           ; combo 2: r_sum = acc + r_sum  (i.e. r_sum += byte)
+  HAS_NEXT 1          ; re-evaluate cond for next test
+BLOCK_END             ; back-edge → LOOP (re-test)
+LOAD r_sum
+WRITE 2, 1            ; emit checksum via parked writer fork
+RETURN
+```
+
+### 4.5 Presence-bitmap struct — stresses `COUNT`-as-presence + conditional emit
+
+`{base: u8, opt1?: u8, opt2?: u8}`. The semantic model has all struct fields
+always present, so **optionality is modeled as `List<u8>` of length 0 or 1** —
+`COUNT` then reads as presence (0/1). Wire = `[bitmap][base][opt1?][opt2?]`.
+Bitmap built with `SHL_IMM`/`OR`; each optional emitted under a 2-case
+`BR_TABLE`, its sole element delegated via `CALL_CODEC_NEXT`:
+
+```
+; --- build bitmap ---
+LOAD_IMM 0
+STORE r_bmp
+; opt1 → bit 0
+ENTER o1, o0, opt1
+COUNT o1              ; acc = len(opt1)
+NE_IMM 0              ; acc = present ? 1 : 0
+STORE r_bit
+LOAD r_bmp
+OR r_bit              ; acc = r_bmp | r_bit
+STORE r_bmp
+; opt2 → bit 1
+ENTER o1, o0, opt2
+COUNT o1
+NE_IMM 0
+SHL_IMM 1
+STORE r_bit
+LOAD r_bmp
+OR r_bit
+STORE r_bmp
+; --- emit bitmap + base ---
+LOAD r_bmp
 WRITE i0, 1
+CALL_CODEC codec_u8, o0, base
+; --- emit opt1 if present ---
+ENTER o1, o0, opt1
+COUNT o1
+BR_TABLE 2            ; case 0 (absent): skip; case 1 (present): emit
+BLOCK_END
+  CALL_CODEC_NEXT codec_u8, o1
+BLOCK_END
+; --- emit opt2 if present ---
+ENTER o1, o0, opt2
+COUNT o1
+BR_TABLE 2
+BLOCK_END
+  CALL_CODEC_NEXT codec_u8, o1
+BLOCK_END
 RETURN
 ```
 
-## 5. Worked example — union with 3 variants
+> Surfaces a **modeling convention** (optional = 0/1-length List) rather than a
+> new op — `COUNT` already gives presence, `CALL_CODEC_NEXT` already consumes
+> the sole element. No `IS_PRESENT` opcode needed.
+
+### 4.6 Delta-encoded `List<u32>` — stresses iteration, `RSUB`, inline sub-codec
+
+First element encoded as-is; subsequent as delta from previous; all LEB128.
+`o0` is the list handle. The first element delegates cleanly
+(`CALL_CODEC_NEXT` would consume it — but we also need its value as the delta
+baseline, so it is read explicitly and `<LEB128>`-encoded inline). **Deltas are
+computed values in registers, not object handles, so they cannot be delegated**
+(`CALL_CODEC` takes a handle) — they are encoded by inlining the LEB128 IR via
+the stitching layer. `RSUB` (`r_cur − r_prev`) earns its keep here:
 
 ```
-LOAD_FIELD tag        ; acc = union tag (selector)
-BR_TABLE 3            ; 3 case-blocks follow
-  LOAD_FIELD a;  WRITE i0, 4
+COUNT                 ; acc = length (src=o0)
+STORE r_left          ; r_left = loop counter
+WRITE i0, 1           ; emit count byte (acc still holds count after STORE)
+; empty?
+EQ_IMM 0
+BR_TABLE 2
+BLOCK_END             ; case 0 (non-empty): continue
+  RETURN              ; case 1 (empty): done
 BLOCK_END
-  LOAD_FIELD b;  WRITE i0, 2
-BLOCK_END
-  LOAD_FIELD c;  WRITE i0, 1
+; first element: as-is, capture as baseline
+ENTER_NEXT o1, o0     ; o1 = first element
+LOAD_VAL o1
+STORE r_prev          ; r_prev = baseline
+LOAD r_prev
+<LEB128>              ; inline-encode (stitching macro from §4.3)
+LOAD r_left
+SUB_IMM 1
+STORE r_left
+; loop remaining as deltas
+LOAD r_left
+NE_IMM 0             ; cond: more?
+LOOP
+  ENTER_NEXT o1, o0   ; o1 = next element
+  LOAD_VAL o1
+  STORE r_cur
+  LOAD r_prev
+  RSUB r_cur          ; acc = r_cur − r_prev  (delta)
+  <LEB128>            ; inline-encode delta
+  LOAD r_cur
+  STORE r_prev        ; slide baseline
+  LOAD r_left
+  SUB_IMM 1
+  STORE r_left
+  NE_IMM 0           ; re-test cond
 BLOCK_END
 RETURN
 ```
 
-> Note: `CALL_CODEC` would replace the per-variant body if `a`, `b`, `c` are
-> themselves non-trivial types — each variant delegates to its own codec, and
-> field indices inside those codecs are relative to the variant's type.
-
-## 6. Worked example — checksum with fixup
-
-```
-CLONE_RD 0 1            ; reader fork at packet start
-CLONE_WR 0 2            ; writer fork parked at checksum field
-WRITE i0, 1             ; placeholder byte via original writer
-; ... serialize rest of packet with original writer i0 ...
-MOVE_IMM 0               ; acc = 0  (MOVE + imm, output→acc)
-LOOP                     ; checksum loop over reader fork
-  READ 1, 1              ; acc = next byte from reader
-  ADD chksum_reg         ; chksum_reg += acc  (combo 2: register, out=rN)
-  LOOP_ITER
-WRITE 2, 1               ; emit checksum via parked writer fork
-RETURN
-```
+> **Gap surfaced:** sub-codec delegation operates on object handles, not
+> register values, so a *computed* value (a delta, a checksum, a derived tag)
+> cannot be delegated — its encoding must be inlined by the stitching layer
+> (which is acceptable: that layer exists precisely to splice fragment IR).
+> If computed-value delegation turns out to be common, a register→handle
+> "box" op or a `CALL_CODEC_REG` form may be worth revisiting later.
 
 ## 7. Encoding strategy (deferred)
 
@@ -536,13 +856,14 @@ fixed**. Guiding principles gathered so far:
    code subspace via bounded joint table-lookup (§2.7) — the *only* mechanism
    for recovering fractional bits. A true arithmetic-coding outer layer is
    explicitly ruled out (complexity/testability).
-2. **No-operand instructions** (`NEG`, `NOT`, `RETURN`, `BLOCK_END`,
-   `LOOP_ITER`) can be a single byte. `DUP`/`SWAP` are no longer in this set
+2. **No-operand instructions** (`NEG`, `NOT`, `RETURN`, `BLOCK_END`) can be a
+   single byte. `LOOP_ITER` is folded into `BLOCK_END` (loop blocks: conditional
+   back-edge on `acc`, declared by the `LOOP` start marker — §3.8);
+   `DUP`/`SWAP` are absent (§2.6).
    (`DUP` is subsumed by MOVE push-mode; `SWAP` is dropped — §2.6).
 3. **Field references** use the segmentation scheme grounded in §2.9: a 3-bit
-   literal offset reaches the first 8 fields of the current codec's target
-   type. Larger offsets escape to an extended form. Must be measured against
-   real schemas.
+   literal offset reaches the first 8 fields of the referenced type. Larger
+   offsets escape to an extended form. Must be measured against real schemas.
 4. **Comparison-class** is 4 ops × 4 modes = 16 states = exactly 4 bits — a
    clean field, and a joint table-lookup candidate when paired with a neighbor.
 5. **Stream I/O** common case (`i < 4`, `w ∈ {1,2,4}`) packs opcode + iterator
@@ -556,21 +877,46 @@ fixed**. Guiding principles gathered so far:
    inline immediate packed with the opcode for the most frequent small
    constants, shared across MOVE/ALU/comparison; extended form escapes to
    trailing LEB128.
-9. **List cursor IDs** (§3.9) are small literals (`< 4`), packable with the
-   opcode like stream iterator IDs.
-10. **Multi-type field references** (§2.9): short form `(0, field_idx)` fits in
-    one byte with 3-bit field offset; extended form adds `type_ref_idx`.
+9. **Object handle IDs** (§2.9/§3.7) are small literals (`< 4`), packable with
+   the opcode like stream iterator IDs; the `(src, ref)` accessor shape defaults
+   `src` to `o0` (short form), so the common single-handle case costs no extra
+   bits.
+10. **Multi-type references** (§2.9): short form `(0, ref)` fits in one byte
+    with 3-bit field offset; extended form adds `type_ref_idx`.
+11. **Read/write opcode overlap**: because each procedure is statically encoder
+    or decoder (§2.9), value accessors (`LOAD_VAL`/`STORE_VAL`) share an opcode
+    slot — disambiguated by the procedure's direction bit. No counter-example
+    exists on the target side (encoder = read-only source, decoder = write-only
+    sink, transitive); the only bidirectional need lives on the stream side.
+12. **Fused LOAD_VAL/STORE_VAL** (deferred optimization, §2.9): collapse
+    `ENTER`+`LOAD_VAL` into one op for the struct-of-scalars hot path —
+    reconsider once opcode space is measured. Note from §4.1: this is an
+    irregularization on an *atypical* spelling (typical codecs delegate), so it
+    ranks strictly below fused delegation in priority. Fused `ENTER_ACTIVE`
+    similarly deferred.
+13. **`HAS_NEXT`** (§3.6, added): fills the stream-loop exhaustion gap surfaced
+    by §4.4. Like `COUNT`/`TAG`, it is a 1-operand metadata query; packs with
+    the iterator ID.
 
-### Open questions (encoding)
+### Open questions (encoding/target access)
 
-- **Deep navigation** (§2.9): how to encode object-tree paths for type_refs
-  that reach child types selected by runtime values (e.g. union variant by tag)?
-  Needs concrete codec examples.
-- **List cursor vs. indexed access**: is sequential-only truly sufficient for
-  all realistic codecs, or will some need random list access as a first-class
-  IR feature?
-- **Union variant initialization**: is implicit tag-write + type_ref access
-  sufficient, or does the target need an explicit "select variant" signal?
+- **Sequential-only list access** (§2.9): sufficient for now (multipass read
+  via re-entering). Random access and other target-specific capabilities are
+  deferred to a future **extension-point** mechanism (call-out ops + trait
+  processing bound by the type mapper at code-gen) — system-wide consequences,
+  out of scope for now.
+- **Fused value access** (§2.9/§3.7): measure whether `LOAD_VAL src, ref` /
+  `ENTER_ACTIVE` earn dedicated opcodes once real codecs are counted.
+- **Computed-value delegation** (§4.6): sub-codecs take object handles, so a
+  computed value (delta, checksum, derived tag) cannot be delegated and must be
+  inlined by the stitching layer. If this pattern is common enough, a
+  register→handle "box" op or a `CALL_CODEC_REG` form may be worth adding
+  later.
+- **Optional-field modeling** (§4.5): confirmed that optionality-as-0/1-list +
+  `COUNT` works without a dedicated `IS_PRESENT` op. Confirm this holds across
+  realistic schemas before locking it in as the convention.
 
 The concrete byte layout will be specified in a follow-up revision once the
 abstract operations are exercised against representative codecs.
+
+

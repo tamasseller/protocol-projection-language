@@ -29,7 +29,6 @@ Statement
   = _ s:(Block
   / IfStatement
   / WhileStatement
-  / DoWhileStatement
   / ForStatement
   / SwitchStatement
   / DeclarationStatement
@@ -52,11 +51,6 @@ IfStatement
 WhileStatement
   = "while" _ "(" _ test:Expression _ ")" _ body:Statement { 
       return { type: "WhileStatement", test, body }; 
-    }
-
-DoWhileStatement
-  = "do" _ body:Statement _ "while" _ "(" _ test:Expression _ ")" _ ";" { 
-      return { type: "DoWhileStatement", body, test }; 
     }
 
 ForStatement
@@ -235,7 +229,7 @@ Identifier
     }
 
 ReservedWord
-  = ( "if" / "else" / "while" / "do" / "for" / "switch" / "case" / "default" 
+  = ( "if" / "else" / "while" / "for" / "switch" / "case" / "default" 
     / "break" / "continue" / "return" / "u32" 
     ) !([a-zA-Z0-9_])
 

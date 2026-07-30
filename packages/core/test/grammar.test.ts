@@ -223,12 +223,6 @@ describe("Control Flow", () =>
         assert.equal(ast.body[0].type, "WhileStatement")
     })
 
-    test("do-while", () =>
-    {
-        const ast = p("do { x = x - 1; } while (x > 0);")
-        assert.equal(ast.body[0].type, "DoWhileStatement")
-    })
-
     test("for — classic", () =>
     {
         const ast = p("for (u32 i = 0; i < 10; i = i + 1) { foo(); }")
@@ -329,5 +323,11 @@ describe("Rejection", () =>
     test("rejects struct keyword", () =>
     {
         assert.throws(() => parse("struct x { };"), SyntaxError)
+    })
+
+    // Expected to throw — do-while is banned (top-test loops only)
+    test("rejects do-while", () =>
+    {
+        assert.throws(() => parse("do { x = x - 1; } while (x > 0);"), SyntaxError)
     })
 })

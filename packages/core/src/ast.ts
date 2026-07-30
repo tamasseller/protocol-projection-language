@@ -19,7 +19,6 @@ export type Statement =
     | BlockStatement
     | IfStatement
     | WhileStatement
-    | DoWhileStatement
     | ForStatement
     | SwitchStatement
     | VariableDeclaration
@@ -47,13 +46,6 @@ export interface WhileStatement
     type: "WhileStatement"
     test: Expression
     body: Statement
-}
-
-export interface DoWhileStatement
-{
-    type: "DoWhileStatement"
-    body: Statement
-    test: Expression
 }
 
 export interface ForStatement
