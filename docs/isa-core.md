@@ -1672,24 +1672,23 @@ caller's TOS at the `CALL`. On return, TOS is rewound (args discarded) and
 The lowerer can choose between a **stack (RPN)** strategy and a **register**
 strategy. Both produce the same result in `acc`.
 
-**Stack strategy** — 1 byte per ALU node, intermediate values on TOS:
+**Stack strategy** — leaf-leaf nodes use the leaf as operand directly (no
+push); push only for complex-complex nodes:
 
 ```
-LOAD r0               ; acc = a                             2 bytes
-PUSH                  ; stack: [a]                          1 byte
-LOAD r1               ; acc = b                             2 bytes
-ADD [--tos]           ; acc = a + b; stack: []              1 byte (combo 5)
-PUSH                  ; stack: [a+b]                        1 byte
-LOAD r2               ; acc = c                             2 bytes
-PUSH                  ; stack: [a+b, c]                     1 byte
-LOAD r3               ; acc = d                             2 bytes
-ADD [--tos]           ; acc = c + d; stack: [a+b]           1 byte
-MUL [--tos]           ; acc = (c+d) * (a+b); stack: []      3 bytes (escape)
+LOAD r0               ; acc = a                              2 bytes
+ADD r1                ; acc = a + b (b is leaf operand)      2 bytes (combo 1)
+PUSH                  ; stack: [a+b]                         1 byte
+LOAD r2               ; acc = c                              2 bytes
+ADD r3                ; acc = c + d (d is leaf operand)      2 bytes (combo 1)
+MUL [--tos]           ; acc = (c+d) * (a+b); stack: []       3 bytes (escape)
 ```
 
-**Total: 16 bytes.** The `MUL` is escape-tier (3 bytes); every other ALU
-op is 1 byte. The TOS-hybrid model lets the expression tree unfold in pure
-RPN — each binary node is one `OP [--tos]` (pop → acc, combo 5).
+**Total: 12 bytes.** The `MUL` is escape-tier (3 bytes); every other ALU
+op is 2 bytes (register operand). The lowerer folds leaf-leaf sub-expressions
+into a single ALU op — no push needed when the operand is directly
+addressable. The TOS is only used to bridge the two complex subtrees
+(`a+b` and `c+d`) into the final multiply.
 
 **Register strategy** — avoids push/pop, reuses a dead register slot:
 
@@ -1716,86 +1715,84 @@ gives the lowerer both options freely — they share the same opcode space
 ```c
 u32 leb128_encode(u32 value) {
     u32 byte;
-    while (1) {                    /* do-while recovery (§11.1): u32 ≥ 1 byte */
+    u32 more = 1;                  /* u32 always emits ≥ 1 byte */
+    while (more) {
         byte = value & 0xFF;
         value = value >> 7;
-        if (value != 0) {
+        more = value != 0;         /* combined: bit-set + loop-test share it */
+        if (more) {
             byte = byte | 0x80;
         }
         /* emit(byte); -- extension call */
-        if (value == 0) {
-            break;
-        }
     }
     return 0;
 }
 ```
 
-**Lowered IR** (`value = r0`, `byte = r1`):
+The lowerer hoists the `more = value != 0` assignment so the bit-set test and
+the loop-exit test read the same value, avoiding a duplicate comparison.
+
+**Lowered IR** (`value = r0`, `byte = r1`, `more = r2`):
 
 ```
-; --- while (1) ---
-MOVE #1               ; acc = 1 (force entry)                2 bytes (imm-ext)
+; more = 1 (init for first iteration)
+MOVE #1               ; acc = 1                               2 bytes (imm-ext)
+STORE r2              ; more = 1                              1 byte
+
+; --- while (more) ---
+LOAD r2               ; acc = more                            2 bytes
 LOOP
   ; byte = value & 0xFF
-  LOAD r0             ; acc = value                          2 bytes
-  AND #0xFF           ; acc = value & 0xFF                   1 byte (per-op inline!)
-  STORE r1            ; byte = acc                           1 byte (MOVE combo 2)
+  LOAD r0             ; acc = value                           2 bytes
+  AND #0xFF           ; acc = value & 0xFF                    1 byte (per-op inline!)
+  STORE r1            ; byte = acc                            1 byte
 
-  ; value = value >> 7
-  LOAD r0             ; acc = value                          2 bytes
-  SHR #7              ; acc >>= 7                            2 bytes (imm-ext)
-  STORE r0            ; value = acc                          1 byte
+  ; value >>= 7
+  LOAD r0             ; acc = value                           2 bytes
+  SHR #7              ; acc >>= 7                             2 bytes (imm-ext)
+  STORE r0            ; value = acc                           1 byte
 
-  ; if (value != 0) byte |= 0x80
-  LOAD r0             ; acc = value                          2 bytes
-  EQ #0               ; acc = (value==0). acc=0 ⟼ value≠0   1 byte (imm-zero!)
-  BR_TABLE 1          ; case 0 (value≠0, cond true): set bit 1 byte (inline N=1)
-    LOAD r1           ; acc = byte                           2 bytes
-    OR #0x80          ; acc = byte | 0x80                    1 byte (per-op inline!)
-    STORE r1          ; byte = acc                           1 byte
-  BLOCK_END           ; default (value==0): skip             1 byte
+  ; more = (value != 0)  — acc still holds shifted value, skip LOAD
+  NE #0               ; acc = (value≠0)                       1 byte (imm-zero!)
+  STORE r2            ; more = acc                            1 byte
+
+  ; if (more) byte |= 0x80
+  BR_TABLE 1          ; case 0 (more≠0): set bit              1 byte (inline N=1)
+    LOAD r1           ; acc = byte                            2 bytes
+    OR #0x80          ; acc |= 0x80                           1 byte (per-op inline!)
+    STORE r1          ; byte = acc                            1 byte
+  BLOCK_END           ; default (more==0): skip               1 byte
 
   ; /* emit(byte) */ -- extension call, elided
 
-  ; if (value == 0) break
-  LOAD r0             ; acc = value                          2 bytes
-  NE #0               ; acc = (value≠0). acc=0 ⟼ value==0   1 byte (imm-zero!)
-  BR_TABLE 1          ; case 0 (value==0, cond true): break  1 byte
-    BREAK             ; closes case + exits loop             1 byte
-  BLOCK_END           ; default (value≠0): continue          1 byte
+  ; re-evaluate while(more)
+  LOAD r2             ; acc = more                            2 bytes
+BLOCK_END             ; back-edge → LOOP                      1 byte
 
-  ; re-evaluate while(1) condition
-  MOVE #1             ; acc = 1 (always continue)            2 bytes (imm-ext)
-BLOCK_END             ; back-edge → LOOP re-test             1 byte
-
-RETURN                ; return 0 (acc happens to be 1 here;  1 byte
-                      ; the caller checks byte count, not acc)
+MOVE #0               ; acc = 0                               1 byte (per-op inline)
+RETURN                ; return 0                              1 byte
 ```
 
-**Total: ~35 bytes** for the entire procedure. Mechanisms exercised:
+**Total: ~30 bytes** for the entire procedure. Mechanisms exercised:
 
-- **Per-op inline literals are exactly right for LEB128.** `AND #0xFF` (extract
-  7 bits + mask to byte) and `OR #0x80` (set continuation bit) are each 1 byte
-  — the per-op table (§17.3) was designed around this codec. `SHR #7` is
-  imm-extended (2 bytes) because 7 is not in any inline set.
-- **Comparison imm-zero.** Both `EQ #0` and `NE #0` are 1 byte (§17.4).
-  Zero-tests dominate this loop — the loop condition and both `if` guards
-  compare against zero.
-- **Complementary comparison for `if`-without-`else`.** `if (value != 0)` emits
-  `EQ #0` (the complement) so that `acc=0` means "condition true" → `BR_TABLE 1`
-  dispatches to case 0 (the body). The complementary form is compact here
-  because `EQ` is in the compact comparison tier; the non-complementary `NE`
-  would also be compact, but the lowerer uses the complementary form per §22.2
-  to get `N=1` (1 byte) instead of `N=2`.
-- **Do-while recovery.** A u32 always emits ≥ 1 byte, so the loop must execute
-  at least once. The DSL uses `while (1)` with a `break` at the end (§11.1).
-  The cost: `MOVE #1` before `LOOP` and before `BLOCK_END` (2+2 bytes for the
-  constant condition). This is the standard pre-test tax for a must-run-once
-  loop.
-- **Terminator closes block.** `BREAK` closes the inner `BR_TABLE` case with no
-  `BLOCK_END` after it (§14.3); the following `BLOCK_END` closes the `BR_TABLE`
-  default, not the `BREAK`.
+- **Per-op inline literals are exactly right for LEB128.** `AND #0xFF` (mask
+  to byte) and `OR #0x80` (set continuation bit) are each 1 byte — the per-op
+  table (§17.3) was designed around this codec. `SHR #7` is imm-extended
+  (2 bytes) because 7 is not in any inline set.
+- **Comparison imm-zero.** `NE #0` is 1 byte (§17.4) — the dominant comparison
+  in this loop is zero-test.
+- **Hoisted shared subexpression.** `more = (value != 0)` is computed once per
+  iteration and stored in `r2`; the bit-set test (via `BR_TABLE` on acc
+  immediately after) and the loop-exit test (via `LOAD r2` at the back-edge)
+  both reuse it, avoiding a duplicate comparison.
+- **Acc survives STORE.** After `SHR #7; STORE r0`, `acc` still holds the
+  shifted value, so the following `NE #0` needs no `LOAD r0` — saving 2 bytes.
+- **Pre-test with runtime condition.** `while(more)` evaluates the condition
+  into `acc` before `LOOP` and re-evaluates (via `LOAD r2`) before `BLOCK_END`.
+  `more` is initialized to 1 (u32 always emits ≥1 byte), so the loop runs at
+  least once — recovered do-while behavior via the pre-test form.
+- **Terminator closes block.** `RETURN` closes the procedure; no trailing
+  `BLOCK_END` after it.
 
 ---
 
