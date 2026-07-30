@@ -1085,142 +1085,828 @@ responsibility — as in any general-purpose structured language.
 
 ## Part V — Encoding
 
-> **Status: Outline only.** Strategy is largely agreed (see
-> [ir-engine §2.7][ir-engine]); concrete byte layout is deferred pending
-> measurement against representative codecs.
+> **Status:** First draft, 128/128 revision. The byte layout below is a
+> concrete, decodable specification. The prefix-code structure (§18.1) is
+> stable; per-class field assignments are revision candidates (§17.7) once
+> measured against a representative codec corpus.
 
 ### 17. Encoding Strategy
 
-*To be drafted. Expected content:*
+#### 17.1 Core / Extension split (128 / 128)
 
-- **17.1 Prefix code.** Each instruction class occupies a fixed-width field
-  sized to `ceil(log₂(states))` over a static prior (representative corpus).
-  Rare opcodes consume code-space and may push a field wider; they are not
-  "free when unused."
-- **17.2 Bounded joint table-lookup.** Adjacent under-full fields may share a
-  code subspace: pack `(fieldA, fieldB) → flatIndex`, decode via one table,
-  store `ceil(log₂(|A|·|B|))` bits instead of `ceil(log₂|A|) + ceil(log₂|B|)`.
-  Bounded scope (a pair or small tuple), no state, no carry — fully testable.
-- **17.3 Opcode-space split.** The Generic Core occupies the bulk of opcode
-  space (lower portion) because its instructions are short and
-  high-variability. The codec extension occupies the top portion; its
-  instructions are mostly long anyway and tolerate extended encodings for rare
-  forms. Exact split ratio deferred.
-- **17.4 Tiered encoding.** Frequent ops (ADD, SUB, AND, OR, XOR, SHL, SHR,
-  MOVE, EQ, NE, LT_S/U, etc.) get compact first-byte encodings, jointly packed
-  with their most-common modes and small literals (0, 1). Rare ops (ASR, MUL,
-  CLZ, REVBITS, RSUB, GT/GE variants) escape to a longer encoding via a
-  reserved escape code in the first byte. Semantically first-class;
-  encoding-wise second-class.
-- **17.5 Explicitly ruled out.** A true arithmetic-coding layer as the
-  outermost encoding — adaptive, stateful, carry-across-opcodes — is ruled
-  out (complexity/testability).
-- **17.6 Effect declarations for extension ops.** Each extension opcode
-  publishes a declared-effect summary `{reads, writes, allocates:false}` so
-  core tooling (verifier, allocator, codegen) treats it as an
-  opaque-with-effects leaf.
+The single highest-confidence fact about codec byte distribution is that
+**domain-specific I/O and delegation ops dominate by emitted-byte count**:
+generic struct and union encoders are short sequences of `CALL_CODEC`, and
+these scale with the schema's type count. Arithmetic concentrates in a few
+reusable primitive codecs (LEB128, fixed-width, delta).
+
+The first byte is therefore split **evenly** at bit 7:
+
+| Bit 7 | Domain | Codes | § |
+|-------|--------|-------|---|
+| `0` | Generic Core | 128 | §18.1–§18.5 |
+| `1` | Extension (Codec Spec) | 128 | §18.6 |
+
+Both halves get first-class single-byte encoding capacity. This gives the
+Codec Specification's stream I/O, target access, and codec-invocation ops
+the same encoding density as core ALU — the struct/union delegation hot path
+stays in one byte.
+
+#### 17.2 Core sub-split: ALU 64 / non-ALU 64
+
+Within the core half, bit 6 splits again:
+
+| Bits 7:6 | Class | Codes | § |
+|----------|-------|-------|---|
+| `00` | ALU | 64 | §18.2 |
+| `01` | Comparison + Unary + Control | 64 | §18.3–§18.4 |
+
+ALU gets exactly 64 codes: 3 bits for 8 ops × 3 bits for 8 modes (6 register/
+stack combos + imm-extended + imm-inline). This is a zero-waste fit — every
+code in the sub-space is reachable.
+
+The non-ALU core half further splits at bit 5: comparison gets 32 codes
+(§18.3), unary + control get 32 codes (§18.4).
+
+#### 17.3 Per-op ALU inline literal
+
+The ALU has exactly **one** inline-literal mode code (not a field of values).
+The literal value it represents is **per-operator** — a small lookup table
+keyed on the op field selects the one constant each operation most frequently
+needs:
+
+| Op | Inline literal | Rationale |
+|----|---------------|-----------|
+| `ADD` | `1` | increment (loop counters, pointers) |
+| `SUB` | `1` | decrement |
+| `SHL` | `1` | shift-by-one (bit manipulation) |
+| `SHR` | `1` | shift-by-one |
+| `MOVE` | `0` | load zero (accumulator init, zero-compare) |
+| `AND` | `0xFF` | byte mask (LEB128, width truncation) |
+| `OR` | `0x80` | set continuation bit (LEB128) |
+| `XOR` | `0xFF` | toggle low byte (checksum complement) |
+
+The bitwise values (`0xFF`, `0x80`) are codec-domain defaults; they are the
+most tunable entry in this table (§17.7) and may be revised per corpus. The
+non-bitwise values (`0`, `1`) are high-confidence.
+
+All other literal values use the imm-extended mode (trailing LEB128).
+
+#### 17.4 Comparison: 6 compact ops, imm-zero only
+
+Comparison carries **6 compact ops** — `EQ`, `NE`, `LT_S`, `LT_U`, `LE_S`,
+`LE_U` — consistent with the branch-inversion principle (§2.8 of the Rationale,
+§14.1 of this spec): `GT ≡ !LE` and `GE ≡ !LT`, so both are derived by
+swapping then/else blocks rather than carried as dedicated ops.
+
+The inline literal for comparison is **zero only** (`#0`). This covers the
+single most common comparison pattern — zero-test (`EQ #0`, `NE #0`) and
+sign-test (`LT_S #0`, `LE_S #0`) — in one byte. All other comparison
+literals use imm-extended (trailing LEB128).
+
+State count: 6 ops × 5 modes (imm-zero, imm-ext, register, peek, pop) = 30
+codes in a 32-code sub-space. 2 reserved.
+
+#### 17.5 Rare ops via core escape
+
+Rare operations — `RSUB`, `MUL`, `ASR` (ALU); `GT_S`, `GT_U`, `GE_S`, `GE_U`
+(comparison); `CLZ`, `REVBITS` (unary) — are semantically first-class (§8–§10)
+but do not fit in the compact tier. They share a single **core escape** code
+in the unary+control sub-space; the byte following the escape code is a
+secondary opcode selecting the rare op and its mode. This costs 2 bytes
+minimum — the same as the extension escape — but keeps them within the core
+prefix so the Generic Core spec remains self-contained.
+
+#### 17.6 Extension encoding
+
+The upper 128 codes (bit 7 = `1`) are owned entirely by the active extension.
+The Codec Specification defines their layout; the Generic Core does not
+interpret them beyond noting the prefix bit. With 7 payload bits, the
+extension has ample room for single-byte encodings of its most common ops
+(stream `READ`/`WRITE` with small iterator IDs, `LOAD_VAL`/`STORE_VAL`,
+`CALL_CODEC` with small codec/ref indices).
+
+#### 17.7 Revision criteria
+
+The layout is sized for a static frequency prior. Once a corpus is available,
+the following may be revised without restructuring the prefix tree:
+
+- **Per-op ALU literal values** (§17.3): the bitwise defaults are the most
+  likely adjustment.
+- **Comparison compact tier**: promoting `GT`/`GE` back if branch-inversion
+  proves costly in practice.
+- **BR_TABLE inline range**: currently {1,2,3,4}; may widen or narrow.
+- **Register-index encoding**: currently a trailing byte; could be packed
+  inline for r0–r7 using reserved codes in the ALU mode field.
+
+The prefix structure (§18.1) is stable across such revisions.
+
+---
 
 ### 18. Byte Layout
 
-*To be drafted. Placeholder per the carry-forward-deferred decision. Expected
-content, per class:*
+#### 18.1 First-byte dispatch
 
-- **18.1 Binary-class** (11 ops × 7 combos = 77 states; compact tier + escape
-  tier for rare ops; small-literal sub-encoding for `imm` mode).
-- **18.2 Comparison-class** (10 ops × 4 modes = 40 states; compact tier + escape
-  tier).
-- **18.3 Unary-class** (4 ops; single-byte).
-- **18.4 Control-flow ops** (7 ops; immediate operands for `BR_TABLE N`,
-  `TRAP #code`; single-byte for no-operand forms).
-- **18.5 Procedure invocation** (`CALL proc_idx`; LEB128 procedure index).
-- **18.6 Immediate sub-encoding** (small inline 3–4 bits / extended LEB128;
-  shared across `imm` mode and immediate parameters).
-- **18.7 Reserved / escape region** (codec extension + future expansion).
+```
+Bits 7:5
+  00          → ALU                  (§18.2)   bits 5:0 payload (64 codes)
+  010         → Comparison           (§18.3)   bits 4:0 payload (32 codes)
+  011         → Unary + Control      (§18.4)   bits 4:0 payload (32 codes)
+  1           → Extension            (§18.6)   bits 6:0 payload (128 codes)
+```
+
+The decoder reads bit 7 (core vs extension), then bit 6 (ALU vs non-ALU
+core), then bit 5 (comparison vs unary+control). A valid prefix code — no
+ambiguity.
+
+Trailing bytes (register index, extended immediate, LEB128 parameters) follow
+the first byte as specified per format.
+
+---
+
+#### 18.2 ALU (prefix `00`)
+
+Bits 7:6 = `00`, leaving a **6-bit payload** (bits 5:0) split into a 3-bit op
+field and a 3-bit mode field.
+
+```
+ 7  6  5  4  3  2  1  0
+ 0  0 ──op── ──mode──
+       (3)    (3)
+```
+
+**Op field (3 bits):**
+
+| Code | Op |
+|------|----|
+| `000` | `ADD` |
+| `001` | `SUB` |
+| `010` | `AND` |
+| `011` | `OR` |
+| `100` | `XOR` |
+| `101` | `SHL` |
+| `110` | `SHR` |
+| `111` | `MOVE` |
+
+**Mode field (3 bits):**
+
+| Code | Mode | Combo | Size | Trailing |
+|------|------|-------|------|----------|
+| `000` | imm-inline | 7 | 1 byte | none (literal from per-op table, §17.3) |
+| `001` | imm-extended | 7 | 2+ bytes | LEB128 `u32` |
+| `010` | register → acc | 1 | 2 bytes | register index (`u8`) |
+| `011` | register → register | 2 | 2 bytes | register index (`u8`) |
+| `100` | peek → acc | 3 | 1 byte | none |
+| `101` | peek → peek | 4 | 1 byte | none |
+| `110` | pop → acc | 5 | 1 byte | none |
+| `111` | peek → push (RPN) | 6 | 1 byte | none |
+
+State count: 8 ops × 8 modes = **64 codes**, filling the ALU sub-space exactly.
+For `MOVE` (op `111`): mode `000` is load-zero, mode `111` is `DUP`, mode
+`110` is `POP` — all subsumed, no dedicated opcodes. Rare ALU ops (`RSUB`,
+`MUL`, `ASR`) use the core escape (§18.5).
+
+---
+
+#### 18.3 Comparison (prefix `010`)
+
+Bits 7:5 = `010`, leaving a **5-bit payload** (bits 4:0). The payload is a
+flat index: `flat = op × 5 + mode` (op 0–5, mode 0–4). 30 used, 2 reserved.
+
+**Op (flat / 5):** 0=`EQ`, 1=`NE`, 2=`LT_S`, 3=`LT_U`, 4=`LE_S`, 5=`LE_U`.
+**Mode (flat % 5):** 0=imm-zero, 1=imm-ext(+LEB128), 2=register(+u8),
+3=peek, 4=pop.
+
+All results → `acc` as boolean. `GT`/`GE` derived by branch inversion (§14.1)
+or core escape (§18.5).
+
+---
+
+#### 18.4 Unary + Control (prefix `011`)
+
+Bits 7:5 = `011`, **5-bit payload** (bits 4:0) as flat opcode:
+
+| Idx | Op | Trailing | Idx | Op | Trailing |
+|-----|----|----------|-----|----|----------|
+| 0 | `NEG` | — | 9 | `BR_TABLE #1` | — |
+| 1 | `NOT` | — | 10 | `BR_TABLE #2` | — |
+| 2 | `CLZ` | — | 11 | `BR_TABLE #3` | — |
+| 3 | `REVBITS` | — | 12 | `BR_TABLE #4` | — |
+| 4 | `RETURN` | — | 13 | `BR_TABLE` ext | LEB128 |
+| 5 | `BLOCK_END` | — | 14 | `TRAP #0` | — |
+| 6 | `BREAK` | — | 15 | `TRAP` ext | LEB128 |
+| 7 | `CONTINUE` | — | 16 | `CALL` | LEB128 |
+| 8 | `LOOP` | — | 17 | `CORE_ESCAPE` | §18.5 |
+
+Indices 18–31 reserved. `BR_TABLE` inline covers N ∈ {1,2,3,4}; `TRAP #0` is
+unreachable/panic.
+
+---
+
+#### 18.5 Core escape (opcode 17)
+
+Rare ops via `CORE_ESCAPE` + secondary `u8`:
+
+| Secondary range | Category |
+|-----------------|----------|
+| `0x00`–`0x17` | `RSUB`/`MUL`/`ASR` × 8 ALU modes each |
+| `0x18`–`0x27` | `GT_S`/`GT_U`/`GE_S`/`GE_U` × 4 CMP modes each |
+| `0x28`–`0xFF` | reserved (216) |
+
+Rare-ALU modes mirror §18.2's 3-bit mode encoding. Rare-CMP use 2-bit mode
+(reg, peek, pop, imm-ext). 40 of 256 secondary codes used.
+
+---
+
+#### 18.6 Extension (prefix `1`)
+
+Bit 7 = `1`, **7-bit payload** = 128 codes owned by the Codec Specification.
+Single-byte encodings for common domain ops; extended forms for rare combos.
+The Generic Core does not interpret these beyond the prefix bit.
+
+---
+
+#### 18.7 Immediate operand encoding
+
+Immediates appear in two roles: as the `imm`-mode operand (ALU mode 000/001,
+Comparison mode 0/1) and as instruction parameters (`BR_TABLE N`, `TRAP
+#code`, `CALL proc_idx`).
+
+**Inline immediate (0 bits, per-op or fixed):**
+- ALU mode `000`: literal value from per-op table (§17.3). Implicit in op.
+- Comparison mode `0`: always `#0`.
+- `BR_TABLE` indices 9–12: `N` ∈ {1,2,3,4}, implicit in opcode index.
+- `TRAP #0` (index 14): `code` = 0, implicit.
+
+**Extended immediate (trailing LEB128):** any `u32`, standard unsigned LEB128
+(1–5 bytes). Used by ALU mode `001`, Comparison mode `1`, `BR_TABLE` ext
+(index 13), `TRAP` ext (index 15), `CALL` (index 16).
+
+---
+
+#### 18.8 Register index encoding
+
+Register indices appear in ALU register modes (`010`, `011`) and Comparison
+register mode (mode 2). A **raw `u8` trailing byte**, covering `r0`–`r255`.
+A future revision may pack small indices (r0–r7) inline using reserved mode
+codes (§17.7).
 
 ---
 
 ## Part VI — Textual DSL
 
-> **Status: Outline only.** Covers the `ir\`...\`` authoring form and its
-> lowering to IR. Grammar to be normatively specified here.
+> **Status:** First draft. This Part specifies the authoring form. Rather than
+> normatively redefining a grammar from scratch, it specifies a **subset of
+> C99** plus the single extension hook (function-call resolution). A
+> conforming PEG parser exists at `packages/core/grammer.pegjs`; this Part
+> normatively defines what that parser must accept and reject, and how its
+> output lowers to IR.
 
 ### 19. DSL Overview
 
-*To be drafted. Expected content:*
+#### 19.1 A subset of C99
 
-- The `ir\`...\`` tagged-template form as one valid authoring path.
-- Relationship between DSL text, parsed AST fragments, stitched AST, and
-  lowered IR bytecode (pipeline diagram from [ir-engine §2.11][ir-engine]).
-- Statement/expression subset of pseudo-C supported inside `ir\`...\``.
+The DSL is a strict subset of C99. The DSL merely omits most of C's surface area.
+This Part does not re-specify C's expression grammar, statement grammar, or
+operator precedence — those are inherited unchanged. It specifies only:
 
-### 20. Lexical Structure
+- The **subset** (what is included and excluded) — §20.
+- The **single type rule** (`u32` everywhere) — §20.
+- The **extension hook**: function calls resolve through an injected table,
+  not through a fixed opcode set — §21.
+- The **lowering rules** to IR — §22.
 
-*To be drafted. Expected content:*
+This keeps the spec short for both author and reader: a competent programmer needs only the delta.
 
-- Character set, comments, identifiers, integer literals (decimal, hex, binary).
-- Reserved keywords (`if`, `else`, `while`, `for`, `break`, `continue`,
-  `return`, `trap`, etc.).
-- Punctuation and operators.
+#### 19.2 The `ir\`...\`` tagged-template form
 
-### 21. Grammar
+The authoring entry point is a TypeScript tagged-template literal:
 
-*To be drafted. Expected content:*
+```
+ir` <C-subset source> `
+```
 
-- Normative PEG grammar (reference `packages/core/grammer.pegjs`).
-- Production rules for statements, expressions, control-flow constructs,
-  procedure and codec declarations.
-- Lexical rules (tokens, whitespace, comments).
+The tag parses the string into an `IrFragment` (an AST node from
+`ast.ts`). No further interpretation happens at parse time. Subsequent
+layers (stitching, lowering) consume fragments and combine them; see the
+[IR Engine Rationale][ir-engine] §2.11 for the pipeline diagram.
 
-### 22. Lowering Rules
+A complete procedure is typically stitched from many small `ir\`...\``
+fragments, often generated inside `for`/`if` at the TS metaprogramming
+layer (field unrolling, conditional codec selection, etc.). The metaprogramming
+surface is kept minimal — see §21.4.
 
-*To be drafted. Expected content:*
+---
 
-- DSL statement → IR instruction mapping.
-- Expression evaluation order and TOS discipline (RPN lowering).
-- `if` / `if-else` / `switch` → `BR_TABLE` (complementary comparison for
-  if-without-else; implicit default for switch).
-- `while` / `for` → `LOOP` (pre-test; `for` increment placement).
-- `break` / `continue` → `BREAK` / `CONTINUE` (increment placement note).
-- `return` / `trap` → `RETURN` / `TRAP`.
-- Procedure calls → `CALL` / `CALL_CODEC` (codec form defined in Codec Spec).
+### 20. The C subset
+
+#### 20.1 Included
+
+The DSL includes the common heritage of C, C++, Java, JavaScript, C#, Rust,
+Go, and every other C-based language:
+
+- **Expressions**: all of C's unary, binary, and ternary operators with C's
+  precedence and associativity; assignment (`=`), compound assignment
+  (`+=` `-=` `*=` `/=` `%=` `<<=` `>>=` `&=` `|=` `^=`), prefix and postfix
+  `++`/`--`; integer literals (decimal, hex `0x…`, binary `0b…`); function
+  calls; parenthesization.
+- **Statements**: expression statements; block statements `{ … }`;
+  `if`/`else`; `while`; `for`; `switch`/`case`/`default`; `break`;
+  `continue`; `return` (see §20.2 for what is *not* included).
+- **Declarations**: `u32` local variables, optionally with an initializer.
+- **Comments**: `//` line and `/* … */` block comments.
+
+#### 20.2 Excluded
+
+The DSL omits:
+
+- **Pointers and arrays** — no `*`, no `&`, no `[]`, no pointer arithmetic.
+- **Compound types** — no `struct`, `union`, `enum`, `typedef`.
+- **Function definitions** — procedures are defined out-of-band; the DSL
+  body is one procedure's body (a statement sequence), not a function
+  definition. Function *calls* are allowed (§21).
+- **`goto` and labels** — replaced by structured control flow (§22.2).
+  (Excluded even though it's valid C; the DSL's structured-control model
+  has no target for a `goto`.)
+- **`do`/`while`** — banned (the IR's `LOOP` is pre-test only, §11.1).
+  A bottom-test loop is recovered by initializing the loop condition to
+  true.
+- **Comma operator**, **casts**, **`sizeof`**, **`?:` chained declarations**,
+  **designated initializers**, **function-pointer syntax**.
+- **Non-integer literals**: no `float`, `char`, or string literals. The
+  DSL operates on `u32` exclusively (§20.3).
+- **Storage qualifiers**: no `const`, `static`, `extern`, `volatile`,
+  `register`, `auto`.
+- **Preprocessor**: no `#include`, `#define`, etc. (the DSL is parsed as
+  a single source string; metaprogramming happens in the TS host, not in C
+  preprocessor form).
+
+#### 20.3 The single type rule
+
+All values are `u32`. A local declaration must use the type name `u32`:
+
+```
+u32 x;            // ok
+u32 y = 5;        // ok
+u32 a, b, c;      // ok (declarator list, all u32)
+u32 z = x + 1;    // ok
+int x;            // rejected — not u32
+x = 5;            // rejected if x is undeclared — no implicit decl
+```
+
+Requiring the explicit `u32` type name keeps DSL source files as valid C
+syntactically (any C syntax highlighter colors them correctly without
+configuration) and signals intent to the reader. There is exactly one
+type, but it is named.
+
+Function parameters are also `u32`, declared out-of-band in the procedure
+header (§5.2), not in the DSL body. The DSL body sees them as named locals
+visible from the first statement.
+
+---
+
+### 21. Function calls
+
+Function calls are parsed identically as `Identifier ( arglist )`. The
+Generic Core defines the lowering of exactly three **core built-in**
+functions (§21.1). The resolution of any other call — procedure-table
+entries, extension ops, codec invocations — is an **application-specific
+mechanism** handled by the integration layer (§21.2), not specified by this
+ISA.
+
+#### 21.1 Core built-in functions
+
+The Generic Core defines three built-in functions with fixed lowering:
+
+| Name | Lowers to | Notes |
+|------|-----------|-------|
+| `trap(code)` | `TRAP #code` (§11.3) | `code` is a constant expression |
+| `clz(x)` | escape-tier `CLZ` (§10.1, §18.5) | `acc = clz(acc)` |
+| `revbits(x)` | escape-tier `REVBITS` (§10.1, §18.5) | `acc = revbits(acc)` |
+
+`trap` is a function, not a keyword — this keeps the DSL a strict C subset
+(no new keywords) and lets `return` (a real C keyword) be the only
+procedure-exit keyword. `clz` and `revbits` have no C operator equivalents;
+keeping them as core built-ins lets a pure-core program be written without
+any extension.
+
+These three are the entirety of the core's call-lowering contract.
+
+#### 21.2 Application-specific call resolution (out of scope)
+
+Beyond the three core built-ins, call resolution is **out of scope** for the
+Generic Core. Specifically:
+
+- **Procedure definition** — how the `IrFragment`s produced by `ir\`...\``
+blocks are assembled into a procedure (stitching, scope merging, ABI
+selection) is domain-specific and handled by the integration layer. Different
+applications may use different ABIs and procedure-definition conventions.
+- **Extension ops** — an extension (e.g. the Codec Specification) registers
+its own call names (`read`, `write`, `call_codec`, …) and defines how each
+lowers. Arguments to such calls may be runtime expressions or compile-time
+constants (often injected via template interpolation `${…}` rather than
+literal source text); the contract is the extension's to define.
+- **Resolution mechanism** — the integration layer may expose a resolution
+table, a framework, or utilities for managing name-to-emitter bindings. The
+shape of that mechanism is an implementation detail, not a normative part
+of this ISA.
+
+The Generic Core's contract ends at: the three built-ins lower as specified
+in §21.1. Everything else is the integration layer's responsibility.
+
+---
+
+### 22. Lowering rules
+
+This section normatively specifies how a parsed DSL fragment lowers to IR
+instructions.
+
+#### 22.1 Expressions
+
+An expression lowers to a sequence of IR instructions that computes the
+value into `acc`, using the TOS for intermediate values when needed.
+Operator precedence and associativity follow C exactly; the lowerer emits
+instructions in evaluation order.
+
+Operand forms map to addressing modes: literal constants use `imm` mode;
+local variables use register mode; sub-expression results use the TOS
+(peek/pop/push per evaluation order). The lowerer may choose any valid
+addressing-mode combination (§6.3) for a given operand — the specific
+selection is an implementation detail, not normatively fixed.
+
+#### 22.2 Control flow
+
+| DSL construct | Lowers to |
+|---------------|-----------|
+| `if (c) T` | compute `c`; emit complementary comparison so `acc=0` means "true"; `BR_TABLE 1` with `T` as case 0; implicit default = skip (§14.1) |
+| `if (c) T else E` | compute `c` into `acc ∈ {0,1}`; `BR_TABLE 2` with `E` as case 0, `T` as case 1 |
+| `switch (v) { case k: … }` | `v` into `acc`; `BR_TABLE N` with N cases; out-of-range falls to implicit default (a following `trap()` if desired) |
+| `while (c) B` | compute `c` into `acc`; `LOOP`; `B`; re-compute `c` before `BLOCK_END` (back-edge) |
+| `for (init; c; inc) B` | `init`; compute `c`; `LOOP`; `B`; `inc`; re-compute `c`; `BLOCK_END` |
+| `break;` | `BREAK` |
+| `continue;` | (for loops) emit `inc` inline if the enclosing loop is a `for`; then `CONTINUE` |
+| `return e;` | compute `e` into `acc`; `RETURN` |
+| `return;` | `RETURN` (acc value unspecified) |
+| `trap(c);` | `TRAP #c` |
+
+**Complementary comparison for `if`-without-`else`.** When the DSL writes
+`if (a < b) body`, the lowerer emits the *complementary* comparison (`GE`)
+so that `acc = 0` selects the body. The full table is in §14.1. This
+exploits the implicit-default semantics of `BR_TABLE` (§11.1): no separate
+"skip" branch is emitted.
+
+**`for`-increment placement.** `CONTINUE` jumps to the `BLOCK_END`
+back-edge. For a `for` loop, the increment must run on every iteration,
+including after a `continue`. The lowerer emits the increment inline at each
+`continue` site *before* the `CONTINUE` instruction (or equivalently,
+restructures the body so the increment is reachable from both the body
+fall-through and the `continue` path).
+
+#### 22.3 Declarations
+
+A `u32` local declaration allocates a slot in the procedure's frame
+(register file, §4.4). The lowerer assigns register indices; DSL source
+does not name indices. An initializer `u32 x = e;` lowers to: evaluate `e`
+into `acc`, then `MOVE acc → rX` (store to the allocated slot).
+
+A declarator list `u32 a, b, c;` allocates three slots in order. Initializers
+apply per-declarator: `u32 a = 1, b = 2;` is two separate allocate-and-init.
+
+#### 22.4 Function calls
+
+The three core built-in functions lower as specified in §21.1 (`trap` →
+`TRAP`; `clz`/`revbits` → escape-tier unary). The lowering of any other call
+is defined by the integration layer (§21.2) — the Generic Core does not
+normatively specify it.
 
 ---
 
 ## Appendices
 
-> **Status: Outline only.** Non-normative.
-
 ### Appendix A — Worked Examples
 
-*To be drafted. Expected content (Generic-Core-only):*
+> Non-normative. These examples show the DSL → IR lowering and annotate the
+> efficiency mechanisms each exercises. Codec-domain examples (struct/union
+> encoders, stream I/O, checksum, presence bitmap) live in the Codec
+> Specification.
 
-- A.1 Arithmetic helper procedures (min, max, abs).
-- A.2 LEB128 encode/decode (exercises ALU, imm, loop, CALL).
-- A.3 Bit-packed field extraction (exercises CLZ, REVBITS, shifts).
-- A.4 Search-and-return loop (exercises RETURN-closes-loop).
-- A.5 Validate-and-trap loop (exercises TRAP-closes-loop).
+**Notation.** IR listings use these shorthand mnemonics for readability:
 
-Codec-domain examples (struct encoder, union encoder, checksum, presence
-bitmap, delta-encoded list) live in the Codec Specification.
+| Shorthand | Meaning | ISA form |
+|-----------|---------|----------|
+| `LOAD rN` | acc ← rN | MOVE, register→acc (combo 1) |
+| `STORE rN` | rN ← acc | MOVE, acc→register (combo 2) |
+| `PUSH` | push acc | MOVE, peek→push (combo 6, ≡ DUP) |
+| `OP rN` | acc = acc OP rN | ALU, register→acc (combo 1) |
+| `OP rN → rN` | rN = acc OP rN | ALU, register→register (combo 2) |
+| `OP #k` | acc = acc OP k | ALU, imm-inline (per-op literal) or imm-extended |
+| `OP [--tos]` | acc = acc OP pop | ALU, pop→acc (combo 5) |
 
-### Appendix B — Open Questions
-
-*To be drafted. Carries forward open questions from [ir-engine §7][ir-engine]
-relevant to the Generic Core:*
-
-- Concrete byte-layout decisions (Part V).
-- Whether the small-literal inline range is 0–7 or 0–15.
-- Exact opcode-space split ratio between Generic Core and codec extension.
-- Whether the effect-declaration interface gains a normative shape.
-
-### Appendix C — Change Log
-
-*To be drafted. Expected content:*
-
-- Revision history of this document.
-- Cross-references to [ir-engine.md][ir-engine] evolution.
+Byte counts in comments assume the encoding of Part V: ALU stack/imm-inline
+ops are 1 byte; register ops are 2 bytes (opcode + reg); imm-extended ops
+are 2+ bytes (opcode + LEB128). Comparisons are 1 byte (peek/pop/imm-zero)
+or 2 bytes (register/imm-ext). `BR_TABLE #N` for N ∈ {1,2,3,4} is 1 byte;
+extended N is 2+. `RETURN`, `BREAK`, `BLOCK_END`, `TRAP #0` are 1 byte each.
 
 ---
 
-*Document status: Parts I–IV drafted (normative). Parts V, VI, Appendices
-retained as permanent outlines for future drafting.*
+### A.1 `min(a, b)` — comparison, BR_TABLE, CALL convention
+
+**DSL source:**
+
+```c
+u32 min(u32 a, u32 b) {
+    if (a < b) {
+        return a;
+    } else {
+        return b;
+    }
+}
+```
+
+**Lowered IR** (`a = r0`, `b = r1`):
+
+```
+LOAD r0               ; acc = a                              2 bytes
+LT_U r1               ; acc = (a < b)                        2 bytes (cmp+reg)
+BR_TABLE 2            ; case 0 = else, case 1 = then         1 byte (inline N=2)
+  LOAD r1             ; case 0 (a ≥ b): acc = b              2 bytes
+  RETURN              ; return b; closes case 0              1 byte
+  LOAD r0             ; case 1 (a < b): acc = a              2 bytes
+  RETURN              ; return a; closes case 1              1 byte
+TRAP 0                ; implicit-default home; unreachable   1 byte (inline)
+```
+
+**Total: 12 bytes.** Mechanisms exercised:
+
+- **Compact unsigned comparison** `LT_U` (2 bytes with register operand). Since
+  this is `if-else` (both branches present), the comparison is used directly
+  — no complementary form is needed (that's only for `if`-without-`else`).
+  `LT_U` happens to be in the compact tier; `GE_U` would have been escape-tier
+  (3 bytes).
+- **Terminator closes block** (§14.3): both cases end in `RETURN`; no
+  `BLOCK_END` is emitted.
+- **`TRAP 0`** as the unreachable implicit-default terminator (1 byte inline).
+
+**Caller side** — calling `min(x, y)` from another procedure:
+
+```
+LOAD r_x              ; acc = x                             2 bytes
+PUSH                  ; push arg0                           1 byte (MOVE combo 6)
+LOAD r_y              ; acc = y                             2 bytes
+PUSH                  ; push arg1                           1 byte
+CALL <proc_min>       ; invoke; callee sees r0=x, r1=y      2 bytes (ext LEB128)
+                      ; acc = result on return; args popped
+```
+
+Arguments are pushed in order (§13.2); the callee's frame base is the
+caller's TOS at the `CALL`. On return, TOS is rewound (args discarded) and
+`acc` holds the result.
+
+---
+
+### A.2 Expression evaluation — TOS-hybrid stack vs register
+
+**DSL expression** `(a + b) * (c + d)` where `a = r0, b = r1, c = r2, d = r3`.
+
+The lowerer can choose between a **stack (RPN)** strategy and a **register**
+strategy. Both produce the same result in `acc`.
+
+**Stack strategy** — 1 byte per ALU node, intermediate values on TOS:
+
+```
+LOAD r0               ; acc = a                             2 bytes
+PUSH                  ; stack: [a]                          1 byte
+LOAD r1               ; acc = b                             2 bytes
+ADD [--tos]           ; acc = a + b; stack: []              1 byte (combo 5)
+PUSH                  ; stack: [a+b]                        1 byte
+LOAD r2               ; acc = c                             2 bytes
+PUSH                  ; stack: [a+b, c]                     1 byte
+LOAD r3               ; acc = d                             2 bytes
+ADD [--tos]           ; acc = c + d; stack: [a+b]           1 byte
+MUL [--tos]           ; acc = (c+d) * (a+b); stack: []      3 bytes (escape)
+```
+
+**Total: 16 bytes.** The `MUL` is escape-tier (3 bytes); every other ALU
+op is 1 byte. The TOS-hybrid model lets the expression tree unfold in pure
+RPN — each binary node is one `OP [--tos]` (pop → acc, combo 5).
+
+**Register strategy** — avoids push/pop, reuses a dead register slot:
+
+```
+LOAD r0               ; acc = a                             2 bytes
+ADD r1 → r1           ; r1 = a + b (r1 held b, now dead)    2 bytes (combo 2)
+LOAD r2               ; acc = c                             2 bytes
+ADD r3                ; acc = c + d                         2 bytes (combo 1)
+MUL r1                ; acc = (c+d) * r1                    3 bytes (escape)
+```
+
+**Total: 11 bytes.** Fewer instructions, no stack manipulation. The temp
+reuses `r1` (the slot that held `b`) once `b` is consumed by the add — the
+backend's register allocator does this automatically. The TOS-hybrid model
+gives the lowerer both options freely — they share the same opcode space
+(§18.2).
+
+---
+
+### A.3 LEB128 encode — the flagship example
+
+**DSL source** (pure core; the `emit` call is an extension op, elided):
+
+```c
+u32 leb128_encode(u32 value) {
+    u32 byte;
+    while (1) {                    /* do-while recovery (§11.1): u32 ≥ 1 byte */
+        byte = value & 0xFF;
+        value = value >> 7;
+        if (value != 0) {
+            byte = byte | 0x80;
+        }
+        /* emit(byte); -- extension call */
+        if (value == 0) {
+            break;
+        }
+    }
+    return 0;
+}
+```
+
+**Lowered IR** (`value = r0`, `byte = r1`):
+
+```
+; --- while (1) ---
+MOVE #1               ; acc = 1 (force entry)                2 bytes (imm-ext)
+LOOP
+  ; byte = value & 0xFF
+  LOAD r0             ; acc = value                          2 bytes
+  AND #0xFF           ; acc = value & 0xFF                   1 byte (per-op inline!)
+  STORE r1            ; byte = acc                           1 byte (MOVE combo 2)
+
+  ; value = value >> 7
+  LOAD r0             ; acc = value                          2 bytes
+  SHR #7              ; acc >>= 7                            2 bytes (imm-ext)
+  STORE r0            ; value = acc                          1 byte
+
+  ; if (value != 0) byte |= 0x80
+  LOAD r0             ; acc = value                          2 bytes
+  EQ #0               ; acc = (value==0). acc=0 ⟼ value≠0   1 byte (imm-zero!)
+  BR_TABLE 1          ; case 0 (value≠0, cond true): set bit 1 byte (inline N=1)
+    LOAD r1           ; acc = byte                           2 bytes
+    OR #0x80          ; acc = byte | 0x80                    1 byte (per-op inline!)
+    STORE r1          ; byte = acc                           1 byte
+  BLOCK_END           ; default (value==0): skip             1 byte
+
+  ; /* emit(byte) */ -- extension call, elided
+
+  ; if (value == 0) break
+  LOAD r0             ; acc = value                          2 bytes
+  NE #0               ; acc = (value≠0). acc=0 ⟼ value==0   1 byte (imm-zero!)
+  BR_TABLE 1          ; case 0 (value==0, cond true): break  1 byte
+    BREAK             ; closes case + exits loop             1 byte
+  BLOCK_END           ; default (value≠0): continue          1 byte
+
+  ; re-evaluate while(1) condition
+  MOVE #1             ; acc = 1 (always continue)            2 bytes (imm-ext)
+BLOCK_END             ; back-edge → LOOP re-test             1 byte
+
+RETURN                ; return 0 (acc happens to be 1 here;  1 byte
+                      ; the caller checks byte count, not acc)
+```
+
+**Total: ~35 bytes** for the entire procedure. Mechanisms exercised:
+
+- **Per-op inline literals are exactly right for LEB128.** `AND #0xFF` (extract
+  7 bits + mask to byte) and `OR #0x80` (set continuation bit) are each 1 byte
+  — the per-op table (§17.3) was designed around this codec. `SHR #7` is
+  imm-extended (2 bytes) because 7 is not in any inline set.
+- **Comparison imm-zero.** Both `EQ #0` and `NE #0` are 1 byte (§17.4).
+  Zero-tests dominate this loop — the loop condition and both `if` guards
+  compare against zero.
+- **Complementary comparison for `if`-without-`else`.** `if (value != 0)` emits
+  `EQ #0` (the complement) so that `acc=0` means "condition true" → `BR_TABLE 1`
+  dispatches to case 0 (the body). The complementary form is compact here
+  because `EQ` is in the compact comparison tier; the non-complementary `NE`
+  would also be compact, but the lowerer uses the complementary form per §22.2
+  to get `N=1` (1 byte) instead of `N=2`.
+- **Do-while recovery.** A u32 always emits ≥ 1 byte, so the loop must execute
+  at least once. The DSL uses `while (1)` with a `break` at the end (§11.1).
+  The cost: `MOVE #1` before `LOOP` and before `BLOCK_END` (2+2 bytes for the
+  constant condition). This is the standard pre-test tax for a must-run-once
+  loop.
+- **Terminator closes block.** `BREAK` closes the inner `BR_TABLE` case with no
+  `BLOCK_END` after it (§14.3); the following `BLOCK_END` closes the `BR_TABLE`
+  default, not the `BREAK`.
+
+---
+
+### A.4 Popcount — loop with bit manipulation
+
+**DSL source:**
+
+```c
+u32 popcount(u32 x) {
+    u32 count = 0;
+    while (x != 0) {
+        count = count + (x & 1);
+        x = x >> 1;
+    }
+    return count;
+}
+```
+
+**Lowered IR** (`x = r0`, `count = r1`):
+
+```
+; count = 0
+MOVE #0               ; acc = 0                              1 byte (per-op inline)
+STORE r1              ; count = 0                            1 byte
+
+; while (x != 0)  — condition is a zero-test, no complementary needed
+LOAD r0               ; acc = x                              2 bytes
+NE #0                 ; acc = (x ≠ 0)                        1 byte (imm-zero!)
+LOOP
+  ; count += x & 1
+  LOAD r0             ; acc = x                              2 bytes
+  AND #1              ; acc = x & 1                          2 bytes (imm-ext: 1 ∉ AND's inline set)
+  ADD r1 → r1         ; count += acc                         2 bytes (combo 2)
+
+  ; x >>= 1
+  LOAD r0             ; acc = x                              2 bytes
+  SHR #1              ; acc >>= 1                            1 byte (per-op inline!)
+  STORE r0            ; x = acc                              1 byte
+
+  ; re-evaluate condition
+  LOAD r0             ; acc = x                              2 bytes
+  NE #0               ; acc = (x ≠ 0)                        1 byte
+BLOCK_END             ; back-edge → LOOP                     1 byte
+
+LOAD r1               ; acc = count                          2 bytes
+RETURN                ; return count                         1 byte
+```
+
+**Total: ~24 bytes.** Mechanisms exercised:
+
+- **`MOVE #0`** (1 byte) for the counter init — zero is MOVE's per-op inline
+  literal, the most common constant in codec code.
+- **`SHR #1`** (1 byte) — one is SHR's per-op inline literal. The loop's
+  dominant shift is by exactly one.
+- **`AND #1`** (2 bytes, imm-extended) — one is NOT AND's inline literal
+  (that's `0xFF`); the lowerer falls back to imm-extended. This is the
+  trade-off of a single inline value per op: it can't cover every case.
+- **Register write-back** (`ADD r1 → r1`, combo 2) for the running count — no
+  separate load/add/store; the ALU op writes directly to the register.
+- **Comparison imm-zero** (`NE #0`) for both the loop test and the pre-loop
+  evaluation (required by the pre-test model).
+
+---
+
+### A.5 `ceil_pow2(x)` — CLZ escape, single-shot shift
+
+**DSL source:**
+
+```c
+u32 ceil_pow2(u32 x) {
+    if (x == 0) {
+        return 1;
+    }
+    u32 shift = 31 - clz(x - 1);
+    return 1 << shift;
+}
+```
+
+**Lowered IR** (`x = r0`, `shift = r1`):
+
+```
+; if (x == 0) return 1
+LOAD r0               ; acc = x                              2 bytes
+EQ #0                 ; acc = (x == 0). acc=0 ⟼ x≠0         1 byte
+BR_TABLE 1            ; case 0 (x==0, cond true): return 1  1 byte
+  MOVE #1             ; acc = 1                              2 bytes (imm-ext)
+  RETURN              ; return 1; closes case                1 byte
+BLOCK_END             ; default (x≠0): continue              1 byte
+
+; shift = 31 - clz(x - 1)
+LOAD r0               ; acc = x                              2 bytes
+SUB #1                ; acc = x - 1                          1 byte (per-op inline!)
+clz()                 ; acc = clz(x-1)                       3 bytes (core escape)
+RSUB #31              ; acc = 31 − acc = 31 − clz(x-1)       3 bytes (escape + imm-ext)
+STORE r1              ; shift = acc                          1 byte
+
+; return 1 << shift
+MOVE #1               ; acc = 1                              2 bytes (imm-ext)
+SHL r1                ; acc = 1 << shift                     2 bytes (combo 1)
+RETURN                ; return acc                           1 byte
+```
+
+**Total: ~27 bytes.** Mechanisms exercised:
+
+- **Core escape for `clz()`** (§21.1) — `CLZ` has no C operator and no compact
+  encoding; it costs 3 bytes (escape prefix + secondary opcode). This is the
+  price of a rare op in the tiered encoding (§17.5).
+- **`RSUB #31`** (escape-tier + imm-extended) — `31 − acc` needs reversed
+  subtraction. The escape form supports all ALU modes including imm-extended,
+  so the entire expression `31 − clz(x−1)` is two ops after the `SUB #1`.
+- **`SUB #1`** (1 byte) — one is SUB's per-op inline literal, used here for the
+  `x − 1` canonical power-of-two trick.
+- **`SHL r1`** (2 bytes, register mode) — shift by a runtime value (not an
+  inline constant). The shift amount comes from `r1`, masked to 5 bits (§8.3).
