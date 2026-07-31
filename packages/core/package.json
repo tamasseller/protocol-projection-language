@@ -5,7 +5,7 @@
   "main": "src/index.ts",
   "types": "src/index.ts",
   "scripts": {
-    "build:grammar": "peggy --format es -c pegconfig.json -o src/parser.js grammer.pegjs",
+    "build:grammar": "peggy --format es -c pegconfig.json -o src/machine/parser.js grammer.pegjs",
     "build": "npm run build:grammar && tsc",
     "test": "ts-node --project tsconfig.test.json test/run.ts",
     "test:types": "tsc --project tsconfig.test.json --noEmit"
