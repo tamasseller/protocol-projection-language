@@ -235,7 +235,7 @@ describe("Control Flow", () =>
 
     test("for — empty clauses", () =>
     {
-        const ast = p("for (;;) { break; }")
+        const ast = p("for (;;) { return 0; }")
         const f = ast.body[0]
         assert.equal(f.init, null)
         assert.equal(f.test, null)
@@ -246,8 +246,8 @@ describe("Control Flow", () =>
     {
         const ast = p(`
             switch (x) {
-                case 1: foo(); break;
-                case 2: bar(); break;
+                case 1: foo();
+                case 2: bar();
                 default: baz();
             }
         `)
@@ -255,7 +255,7 @@ describe("Control Flow", () =>
         assert.equal(s.type, "SwitchStatement")
         assert.equal(s.cases.length, 3)
         assert.equal(s.cases[0].test.value, 1)
-        assert.equal(s.cases[0].consequent.length, 2) // foo(); break;
+        assert.equal(s.cases[0].consequent.length, 1) // foo();
         assert.equal(s.cases[1].test.value, 2)
         assert.equal(s.cases[2].test, null) // default
     })
@@ -329,5 +329,31 @@ describe("Rejection", () =>
     test("rejects do-while", () =>
     {
         assert.throws(() => parse("do { x = x - 1; } while (x > 0);"), SyntaxError)
+    })
+
+    // Expected to throw — break/continue are banned (no intra-loop jumps)
+    test("rejects break", () =>
+    {
+        assert.throws(() => parse("while (x) { break; }"), SyntaxError)
+    })
+
+    test("rejects continue", () =>
+    {
+        assert.throws(() => parse("while (x) { continue; }"), SyntaxError)
+    })
+
+    // Expected to throw — a bare `{ ... }` is not a standalone statement: a
+    // Block is only reachable as the direct body of if/else/while/for
+    // (ControlBody in grammer.pegjs), because only those positions have a
+    // real RTL block construct to reclaim the block's locals at BLOCK_END
+    // (see docs/isa-core.md §20.2, §15.1).
+    test("rejects bare block statement at top level", () =>
+    {
+        assert.throws(() => parse("u32 x = 1; { u32 y = 2; } return x;"), SyntaxError)
+    })
+
+    test("rejects bare block statement nested in a loop body", () =>
+    {
+        assert.throws(() => parse("while (x) { { u32 y = 1; } }"), SyntaxError)
     })
 })

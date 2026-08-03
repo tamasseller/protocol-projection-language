@@ -64,9 +64,12 @@ pointer** that indirects into the register file to provide push/pop/peek
 access. All storage is statically bounded per procedure; the worst-case stack
 depth across a call graph is computable at compile time.
 
-Control flow is **structured**: there are no arbitrary jumps. Two block
-constructs (`BR_TABLE`, `LOOP`) and four terminators (`RETURN`, `TRAP`,
-`BREAK`, `CONTINUE`) cover all control flow expressible in the source DSL.
+Control flow is **structured**: there are no arbitrary jumps, and no
+irregular exit from a block or loop. Two block constructs (`BR_TABLE`,
+`LOOP`) and two terminators (`RETURN`, `TRAP`) cover all control flow
+expressible in the source DSL. `LOOP` opens two nested sub-blocks in fixed
+order — a condition block, whose result in `acc` decides whether to
+continue, and a body block — rather than a single body (§11.1, §14.2).
 
 ---
 
@@ -78,14 +81,16 @@ A procedure executes sequentially from its first instruction. The only
 deviations from sequential flow are:
 
 - **Block constructs** (`BR_TABLE`, `LOOP`) conditionally dispatch or iterate
-  over a body of nested instructions (§14).
+  over nested instructions (§14).
 - **Procedure invocation** (`CALL`) transfers control to another procedure and
   resumes the caller when the callee returns (§13).
-- **Terminators** (`RETURN`, `TRAP`) end the procedure; `BREAK`/`CONTINUE`
-  re-target control within the enclosing `LOOP` (§11, §14).
+- **Terminators** (`RETURN`, `TRAP`) end the procedure (§11, §14).
 
 There is no instruction pointer exposed to programs; branch targets are
-determined statically by block nesting.
+determined statically by block nesting. There is no `break`, `continue`, or
+any other irregular exit from an open block — the only ways out of a
+running `LOOP` are its condition block testing false on some iteration, or
+a procedure-exiting terminator reached from within it.
 
 #### 2.2 Storage
 
@@ -619,49 +624,60 @@ Lowering forms:
 | `if` (no else) | 1 | body at `case[0]`, reached when `acc = 0` (complementary comparison — see §14.1); default = skip |
 | `switch` | variant count | each variant a case; default = trap home for out-of-range selectors |
 
-**`LOOP`** — open a pre-test loop block. The continue-condition is in `acc` at
-the opener:
+**`LOOP`** — open a pre-test loop construct. Unlike `BR_TABLE`, `LOOP` opens
+**two** nested sub-blocks in fixed order, each closed by its own
+`BLOCK_END`:
 
-- `acc = 0` → exit (fall through to after the matching closer).
-- `acc ≠ 0` → enter the body.
+1. **The condition block** — arbitrary instructions that leave a
+   continue/exit decision in `acc`. Its `BLOCK_END` is conditional:
+   `acc = 0` → exit (skip the body block, falling through to after *its*
+   `BLOCK_END`); `acc ≠ 0` → fall into the body block.
+2. **The body block** — the loop's payload. Its `BLOCK_END` is an
+   **unconditional back-edge** to the `LOOP` opener, which re-enters the
+   condition block.
 
-The body is closed by `BLOCK_END` as an **unconditional back-edge** to the
-opener, which then re-tests `acc`. The loop exit target is the instruction
-after the closer. This is the `while` / `for` form: zero iterations is
-possible.
+```
+LOOP
+  <condition block>    ; leaves acc = continue/exit decision
+BLOCK_END               ; acc=0 → exit past the next BLOCK_END; acc≠0 → body
+  <body block>
+BLOCK_END               ; unconditional back-edge → LOOP
+```
+
+The loop exit target is the instruction after the body block's `BLOCK_END`.
+This is the `while` / `for` form: zero iterations of the body is possible
+(the condition block itself always runs at least once).
 
 There is **no bottom-test (`do-while`) form**. Codecs requiring bottom-test
-behavior (e.g. a loop that must execute at least once) recover it by
-initializing the loop condition to true.
+behavior (e.g. a loop that must execute its body at least once even when the
+natural condition is initially false) recover it with an explicit
+first-iteration flag: a register initialized to true before the `LOOP`, OR'd
+into the condition block's result, and cleared inside the body block once
+consumed (§14.2 shows the idiom in full). This costs one register and a
+couple of bytes per iteration; a lowering pass may instead peel the first
+iteration (emit the body once, unconditionally, ahead of the `LOOP`) when
+that is cheaper.
 
-#### 11.2 Control re-targeting
+#### 11.2 No control re-targeting
 
-Two instructions re-target control within the innermost enclosing `LOOP`. They
-have no operand; the target is determined statically by the enclosing loop
-scope.
+The Generic Core has no `break`, `continue`, or any other instruction that
+re-targets control within an open block from the inside. The only way to
+leave a `LOOP` early, or to skip the remainder of an iteration, is a
+procedure-exiting terminator (`RETURN`/`TRAP`) reached from within it —
+there is no structured-jump equivalent that stays inside the procedure.
 
-**`BREAK`** — exit the innermost enclosing `LOOP`. Control transfers to the
-instruction after that loop's matching closer.
-
-**`CONTINUE`** — re-test the innermost enclosing `LOOP`. Control transfers to
-that loop's matching closer (the back-edge), which returns to the opener for
-re-testing.
-
-`BREAK` and `CONTINUE` never target a `BR_TABLE`; they resolve only against
-`LOOP` scope. (A `BR_TABLE` case has no `break` analogue because its
-case-exit is implicit via `BLOCK_END` or a terminator.)
-
-> **`for`-loop increment placement.** `CONTINUE` jumps to the back-edge
-> (`BLOCK_END`). For a `for`-lowered loop where an increment must run on
-> every iteration (including after a `continue`), the lowering layer is
-> responsible for making the increment reachable from both the body
-> fall-through and the `CONTINUE` path. Inline the increment
-> at each `CONTINUE` site before the `CONTINUE` instruction.
+This is a deliberate simplification relative to an earlier draft that
+carried dedicated `BREAK`/`CONTINUE` opcodes: the source DSL exposes no
+`break` or `continue` keyword (§20.2), so no lowering ever produced them,
+and carrying two opcodes with no producer only added encoding cost and
+validation surface for no benefit. A codec loop that would otherwise
+`break` early folds the early-exit test into its condition block instead of
+jumping out of the body mid-way.
 
 #### 11.3 Terminators
 
-Terminators end control flow at the current point. Two are procedure-exiting;
-two re-target within a loop.
+Terminators end control flow at the current point. There are exactly two,
+and both are procedure-exiting.
 
 **`RETURN`** — end the procedure. The return value is the current `acc`. The
 frame is popped (TOS rewound to the frame entry point; see §13).
@@ -684,16 +700,23 @@ reported to the host, which owns resource cleanup and decides the response.
 
 #### 11.4 Block closer
 
-**`BLOCK_END`** — close the enclosing block construct. Its semantics are
-determined by the construct's opener (§11.1):
+**`BLOCK_END`** — close the enclosing block. Its semantics are determined by
+which block it closes (§11.1, §14.2):
 
 - Closing a `BR_TABLE` case → unconditional fall-through to after the
   construct.
-- Closing a `LOOP` body → unconditional back-edge to the `LOOP` opener, which
-  re-tests `acc`.
+- Closing a `LOOP`'s **condition block** (the first of its two sub-blocks)
+  → conditional: `acc = 0` → exit past the body block's `BLOCK_END`;
+  `acc ≠ 0` → fall into the body block.
+- Closing a `LOOP`'s **body block** (the second of its two sub-blocks) →
+  unconditional back-edge to the `LOOP` opener, which re-enters the
+  condition block.
 
-`BLOCK_END` is the universal closer: there is one closer for every block
-shape.
+`BLOCK_END` is the universal closer: every block construct — `BR_TABLE`
+cases and both of `LOOP`'s sub-blocks — closes with the same opcode. A
+decoder tracks which opener, and which of `LOOP`'s two slots, each
+`BLOCK_END` belongs to purely from block nesting — exactly as it already
+tracks `BR_TABLE` case counts.
 
 ---
 
@@ -868,36 +891,71 @@ The complementary-comparison table for `if`-without-`else` lowering:
 
 ```
 LOOP
-  <body>
+  <condition block>
+BLOCK_END
+  <body block>
 BLOCK_END
 ```
 
 **Semantics:**
 
-1. Read the continue-condition from `acc` (lenient test: `acc ≠ 0` →
-   continue, `acc = 0` → exit).
-2. If exiting, fall through to the instruction after `BLOCK_END`.
-3. If continuing, execute the body.
-4. `BLOCK_END` is an **unconditional back-edge**: control returns to the
-   `LOOP` opener, which re-tests `acc`.
+1. Control enters the `LOOP` opener and falls unconditionally into the
+   condition block.
+2. The condition block executes, leaving a continue/exit decision in `acc`
+   (lenient test: `acc ≠ 0` → continue, `acc = 0` → exit).
+3. The condition block's `BLOCK_END` reads that decision:
+   - `acc = 0` → exit: fall through to the instruction after the body
+     block's `BLOCK_END`.
+   - `acc ≠ 0` → continue: fall into the body block.
+4. The body block executes.
+5. The body block's `BLOCK_END` is an **unconditional back-edge**: control
+   returns to the `LOOP` opener (step 1), re-entering the condition block.
 
-The loop is pre-test: zero iterations is possible. There is no bottom-test
+The loop is pre-test: zero iterations of the body is possible (the
+condition block itself always runs at least once). There is no bottom-test
 (`do-while`) form.
 
-`BREAK` inside the body transfers control to the instruction after the
-matching `BLOCK_END`. `CONTINUE` transfers control to the matching
-`BLOCK_END` (which is the back-edge to the opener for re-testing). Both target
-the innermost enclosing `LOOP` only; they never target a `BR_TABLE`.
+There is no `BREAK` or `CONTINUE` (§11.2): the only way to leave a running
+loop is the condition block testing false on some later iteration, or a
+procedure-exiting terminator reached from within either sub-block.
+
+**Recovering do-while behavior.** Because the condition block is shared
+between the initial entry and every back-edge re-entry, a bottom-test loop
+(body must run at least once, even when the natural condition is initially
+false) cannot be recovered by simply forcing the *first* evaluation, the
+way a single-block loop could — the condition block has no notion of
+"first" on its own. The idiom is an explicit first-iteration flag, cleared
+inside the body:
+
+```
+MOVE #1
+STORE r_first          ; r_first = 1 — forces the first pass
+LOOP
+  LOAD r0               ; condition block: acc = value != 0
+  NE #0
+  OR r_first            ; acc |= r_first — forced true on the first pass
+BLOCK_END               ; acc=0 → exit; acc≠0 → body
+  MOVE #0
+  STORE r_first          ; clear the flag; harmless if repeated
+  ; ...body...
+BLOCK_END                ; back-edge → LOOP
+```
+
+This costs one register and roughly two bytes per iteration (the flag
+clear). A lowering pass may instead **peel** the first iteration — emitting
+the body once, unconditionally, ahead of the `LOOP`, then looping normally
+for the rest — trading code size for a simpler condition block; either
+recovery is a lowering-layer choice, not an ISA-level construct.
 
 #### 14.3 Block termination rules
 
-A case-block (inside a `BR_TABLE`) or a loop body (inside a `LOOP`) is closed
-by either:
+A `BR_TABLE` case-block, a `LOOP` condition block, or a `LOOP` body block is
+closed by either:
 
 - **`BLOCK_END`** — the universal closer. Always valid as a closer for the
   innermost open block.
-- **Any terminator** (`RETURN`, `TRAP`, `BREAK`, `CONTINUE`) — closes the
-  enclosing block as a side effect of ending or re-targeting control.
+- **A procedure-exiting terminator** (`RETURN`, `TRAP`) — closes the
+  enclosing block as a side effect of ending the procedure.
 
 When a terminator closes a block, no separate `BLOCK_END` is required after
 it. **Dead code following a terminator is a validation error** (§15.4): the
@@ -906,54 +964,54 @@ validator rejects any instruction that cannot be reached.
 This means a `BR_TABLE` case that ends in `RETURN` or `TRAP` needs no
 `BLOCK_END`, and a `TRAP` at the implicit-default position needs no following
 `RETURN`. Cases that fall through to a shared post-construct instruction
-(e.g. a single trailing `RETURN`) still use `BLOCK_END`.
+(e.g. a single trailing `RETURN`) still use `BLOCK_END`. A `LOOP`'s
+condition block always closes with `BLOCK_END` in practice — its purpose is
+to leave a decision in `acc` for that `BLOCK_END` to test (§14.2), so a
+terminator closing it in place of `BLOCK_END` would produce a loop that can
+never iterate, which is a degenerate case that gains nothing over closing
+the *body* block with a terminator instead (§14.4, where it is meaningful).
 
-#### 14.4 `LOOP` closed by a terminator (no `BLOCK_END`)
+#### 14.4 `LOOP` body closed by a terminator (no `BLOCK_END`)
 
-A `LOOP` body is normally closed by `BLOCK_END` (the back-edge, §14.2). But a
-loop body may also be closed by any terminator — `RETURN`, `TRAP`, `BREAK`, or
-`CONTINUE` — with **no `BLOCK_END`**. This is the loop analogue of a
+A `LOOP`'s body block is normally closed by `BLOCK_END` (the back-edge,
+§14.2). But it may also be closed by a procedure-exiting terminator —
+`RETURN` or `TRAP` — with **no `BLOCK_END`**. This is the loop analogue of a
 `BR_TABLE` case closed by a terminator (§14.3).
 
-The non-obvious case is when the loop body's terminator is **`RETURN` or
-`TRAP`** — a procedure-exiting terminator. Such a loop is **non-cyclic**: it
-executes its body once, then exits the procedure directly. The back-edge is
-never taken, because control never reaches a `BLOCK_END`. This is a legitimate
-and useful shape — it expresses "do something conditionally, then either
+Such a loop is **non-cyclic**: the condition block runs once, the body runs
+at most once, and then the procedure exits directly — the back-edge is
+never taken, because control never reaches the body block's `BLOCK_END`.
+This is a legitimate and useful shape — it expresses "test once, then either
 return or trap, never iterate":
 
 ```
 ; decode exactly one element, then either return the result or trap on error
-HAS_NEXT 1
-LOOP                      ; pre-test (acc = has_next)
+LOOP
+  HAS_NEXT 1              ; condition block: acc = has_next
+BLOCK_END                 ; acc=0 → exit past next BLOCK_END; acc≠0 → body
   READ 1, 1
   LT_U_IMM 0x80           ; valid range?
   BR_TABLE 1              ; acc=0 (invalid): trap; default (valid): fall through
     TRAP ERR_BAD_BYTE     ; closes BR_TABLE case 0
   LOAD_IMM 1              ; signal "decoded ok"
-  RETURN                  ; <- closes the LOOP body; no BLOCK_END follows
-; <- after the (terminator-closed) loop: unreachable, since RETURN exits
+  RETURN                  ; <- closes the body block; no BLOCK_END follows
+; <- after the (terminator-closed) body: unreachable, since RETURN exits
 LOAD_IMM 0                ; would be "no element" — dead, validator-rejected
 RETURN
 ```
 
 Here the `LOOP` exists only to host the `HAS_NEXT` pre-test (so an empty
-stream traps cleanly via the implicit fall-through below), but the body never
-iterates — it either traps or returns on the first pass. The `RETURN` closes
-both the `BR_TABLE` case (if it falls through) *and* the `LOOP` body, and
-exits the procedure.
+stream falls through cleanly to the loop's exit target below), but the body
+never iterates — it either traps or returns on its first and only pass. The
+`RETURN` closes both the `BR_TABLE` case (if it falls through) *and* the
+body block, and exits the procedure.
 
-**Parsing implication.** The decoder parses a `LOOP` body as a statement
-list ending at the first `BLOCK_END` *or* terminator at the loop's nesting
-level. If a terminator closes the loop, no `BLOCK_END` is emitted; the
+**Parsing implication.** The decoder parses a `LOOP` as its condition block
+(ending at `BLOCK_END` — §14.3) followed by its body block, the latter
+ending at the first `BLOCK_END` *or* terminator at the loop's nesting level.
+If a terminator closes the body block, no `BLOCK_END` is emitted; the
 instruction following the loop is the loop's exit target (which, for
 `RETURN`/`TRAP`, is unreachable — see §15.4).
-
-For `BREAK` and `CONTINUE`, the situation differs: they close the loop body
-but do **not** exit the procedure, so they are cyclic (the loop may execute
-the `BREAK`/`CONTINUE` path, then either exit via `BREAK` or re-test via
-`CONTINUE`). The body still needs no trailing `BLOCK_END` if every path
-terminates with `BREAK` or `CONTINUE`.
 
 ---
 
@@ -966,19 +1024,20 @@ failure.
 #### 15.1 TOS balance and auto-cleanup
 
 **Block boundaries restore TOS to the block's entry depth.** At every
-`BLOCK_END`, `BREAK`, `CONTINUE`, and `RETURN`, any TOS surplus above the
-enclosing block's entry depth is **implicitly dropped**. The producer never
-needs to emit explicit cleanup pops before a block exit; the block boundary
-handles it.
+`BLOCK_END` and `RETURN`, any TOS surplus above the enclosing block's entry
+depth is **implicitly dropped**. The producer never needs to emit explicit
+cleanup pops before a block exit; the block boundary handles it.
 
 This means the TOS-balance invariant arises from the block structure itself,
 not from explicit cleanup ops:
 
 - At `BLOCK_END` closing a `BR_TABLE` case: TOS is restored to the depth at
   the `BR_TABLE` opener.
-- At `BLOCK_END` closing a `LOOP` body: TOS is restored to the depth at the
-  `LOOP` opener.
-- At `BREAK` / `CONTINUE`: TOS is restored to the `LOOP` opener's depth.
+- At `BLOCK_END` closing either of a `LOOP`'s two sub-blocks (the condition
+  block or the body block): TOS is restored to the depth at the `LOOP`
+  opener. Both sub-blocks share that same entry depth — the condition block
+  computes into `acc` without leaving anything on the stack, and the body
+  block's own pushes/pops must net back to zero by its own `BLOCK_END`.
 - At `RETURN`: TOS is restored to the procedure's entry depth (the frame is
   discarded anyway, but the invariant is stated for uniformity).
 
@@ -1014,9 +1073,9 @@ implementation-defined limits).
 Any instruction that cannot be reached on any control-flow path is a
 validation error. In particular:
 
-- An instruction immediately following a terminator (`RETURN`, `TRAP`,
-  `BREAK`, `CONTINUE`) within the same block, without an intervening control
-  target, is dead and must be rejected.
+- An instruction immediately following a terminator (`RETURN`, `TRAP`)
+  within the same block, without an intervening control target, is dead and
+  must be rejected.
 - An instruction after a `BR_TABLE` construct that is unreachable (because
   every case and the implicit default transfer control elsewhere) is dead.
 
@@ -1033,13 +1092,15 @@ A mismatch is a validation error.
 
 #### 15.6 Block well-formedness
 
-Every `BR_TABLE` and `LOOP` opener must have a matching closer (a `BLOCK_END`
-or a terminator that closes it). Every `BLOCK_END` must close some open
-block. Every `BREAK` and `CONTINUE` must be within at least one enclosing
-`LOOP`.
+Every `BR_TABLE` opener must have exactly `N` matching case-closers (each a
+`BLOCK_END` or a terminator that closes it). Every `LOOP` opener must have
+exactly two matching sub-block closers, in order: the condition block's
+closer must be a `BLOCK_END` (§14.3), and the body block's closer may be a
+`BLOCK_END` or a procedure-exiting terminator (§14.4). Every `BLOCK_END`
+must close some open block.
 
-Mismatches (unclosed openers, dangling closers, `BREAK`/`CONTINUE` outside a
-loop) are validation errors.
+Mismatches (unclosed openers, dangling closers, a `LOOP` missing its second
+sub-block) are validation errors.
 
 ---
 
@@ -1288,17 +1349,20 @@ Bits 7:5 = `011`, **5-bit payload** (bits 4:0) as flat opcode:
 
 | Idx | Op | Trailing | Idx | Op | Trailing |
 |-----|----|----------|-----|----|----------|
-| 0 | `NEG` | — | 9 | `BR_TABLE #1` | — |
-| 1 | `NOT` | — | 10 | `BR_TABLE #2` | — |
-| 2 | `CLZ` | — | 11 | `BR_TABLE #3` | — |
-| 3 | `REVBITS` | — | 12 | `BR_TABLE #4` | — |
-| 4 | `RETURN` | — | 13 | `BR_TABLE` ext | LEB128 |
-| 5 | `BLOCK_END` | — | 14 | `TRAP #0` | — |
-| 6 | `BREAK` | — | 15 | `TRAP` ext | LEB128 |
-| 7 | `CONTINUE` | — | 16 | `CALL` | LEB128 |
-| 8 | `LOOP` | — | 17 | `CORE_ESCAPE` | §18.5 |
+| 0 | `NEG` | — | 8 | `BR_TABLE #1` | — |
+| 1 | `NOT` | — | 9 | `BR_TABLE #2` | — |
+| 2 | `CLZ` | — | 10 | `BR_TABLE #3` | — |
+| 3 | `REVBITS` | — | 11 | `BR_TABLE #4` | — |
+| 4 | `RETURN` | — | 12 | `BR_TABLE` ext | LEB128 |
+| 5 | `BLOCK_END` | — | 13 | `TRAP #0` | — |
+| 6 | `LOOP` | — | 14 | `TRAP` ext | LEB128 |
+| 7 | reserved | — | 15 | `CALL` | LEB128 |
+|   |   |   | 16 | `CORE_ESCAPE` | §18.5 |
 
-Indices 18–31 reserved. `BR_TABLE` inline covers N ∈ {1,2,3,4}; `TRAP #0` is
+Indices 7, 17–31 reserved. (Indices 6–7 formerly carried `BREAK`/`CONTINUE`;
+dropped along with structured re-targeting, §11.2 — index 7 stays reserved
+rather than being reused immediately, since a corpus may yet want it for
+something else.) `BR_TABLE` inline covers N ∈ {1,2,3,4}; `TRAP #0` is
 unreachable/panic.
 
 ---
@@ -1410,9 +1474,10 @@ Go, and every other C-based language:
   (`+=` `-=` `*=` `/=` `%=` `<<=` `>>=` `&=` `|=` `^=`), prefix and postfix
   `++`/`--`; integer literals (decimal, hex `0x…`, binary `0b…`); function
   calls; parenthesization.
-- **Statements**: expression statements; block statements `{ … }`;
-  `if`/`else`; `while`; `for`; `switch`/`case`/`default`; `break`;
-  `continue`; `return` (see §20.2 for what is *not* included).
+- **Statements**: expression statements; block statements `{ … }` as the
+  body of `if`/`else`/`while`/`for` (not standalone — see §20.2); `if`/`else`;
+  `while`; `for`; `switch`/`case`/`default`; `return` (see §20.2 for what is
+  *not* included).
 - **Declarations**: `u32` local variables, optionally with an initializer.
 - **Comments**: `//` line and `/* … */` block comments.
 
@@ -1428,9 +1493,27 @@ The DSL omits:
 - **`goto` and labels** — replaced by structured control flow (§22.2).
   (Excluded even though it's valid C; the DSL's structured-control model
   has no target for a `goto`.)
+- **`break` and `continue`** — omitted alongside `goto`: both are
+  irregular jumps out of structured nesting, and the Generic Core carries
+  no opcode for either (§11.2). A loop that would `break` early instead
+  folds the early-exit test into its condition; there is no `continue`
+  equivalent to recover since the DSL never had the keyword to begin with.
 - **`do`/`while`** — banned (the IR's `LOOP` is pre-test only, §11.1).
-  A bottom-test loop is recovered by initializing the loop condition to
-  true.
+  A bottom-test loop is recovered with an explicit first-iteration flag, or
+  by peeling the first iteration (§14.2).
+- **Bare block statements** — a brace-delimited `{ ... }` is not a
+  standalone statement; it is reachable only as the direct body of
+  `if`/`else`/`while`/`for` (the grammar's `ControlBody` production). Every
+  block a program can write is therefore the immediate body of a branch or
+  loop, and always has a real `BR_TABLE` case or `LOOP` body block backing
+  it. This matters because `BLOCK_END` resets TOS to the block's entry
+  depth (§15.1): a `{ ... }` with no such construct behind it would have no
+  `BLOCK_END` to perform that reset, so a local declared inside it would
+  never be reclaimed at the RTL level even though the DSL considers it out
+  of scope — silently aliasing whatever register a later declaration is
+  given. Disallowing bare blocks entirely, rather than special-casing them
+  in the lowerer, keeps "every DSL scope closes via a real `BLOCK_END`" an
+  invariant instead of a case-by-case check.
 - **Comma operator**, **casts**, **`sizeof`**, **`?:` chained declarations**,
   **designated initializers**, **function-pointer syntax**.
 - **Non-integer literals**: no `float`, `char`, or string literals. The
@@ -1541,10 +1624,8 @@ selection is an implementation detail, not normatively fixed.
 | `if (c) T` | compute `c`; emit complementary comparison so `acc=0` means "true"; `BR_TABLE 1` with `T` as case 0; implicit default = skip (§14.1) |
 | `if (c) T else E` | compute `c` into `acc ∈ {0,1}`; `BR_TABLE 2` with `E` as case 0, `T` as case 1 |
 | `switch (v) { case k: … }` | `v` into `acc`; `BR_TABLE N` with N cases; out-of-range falls to implicit default (a following `trap()` if desired) |
-| `while (c) B` | compute `c` into `acc`; `LOOP`; `B`; re-compute `c` before `BLOCK_END` (back-edge) |
-| `for (init; c; inc) B` | `init`; compute `c`; `LOOP`; `B`; `inc`; re-compute `c`; `BLOCK_END` |
-| `break;` | `BREAK` |
-| `continue;` | (for loops) emit `inc` inline if the enclosing loop is a `for`; then `CONTINUE` |
+| `while (c) B` | `LOOP`; condition block = compute `c` into `acc`; `BLOCK_END`; body block = `B`; `BLOCK_END` (back-edge) |
+| `for (init; c; inc) B` | `init`; `LOOP`; condition block = compute `c` into `acc`; `BLOCK_END`; body block = `B` then `inc`; `BLOCK_END` (back-edge) |
 | `return e;` | compute `e` into `acc`; `RETURN` |
 | `return;` | `RETURN` (acc value unspecified) |
 | `trap(c);` | `TRAP #c` |
@@ -1555,12 +1636,10 @@ so that `acc = 0` selects the body. The full table is in §14.1. This
 exploits the implicit-default semantics of `BR_TABLE` (§11.1): no separate
 "skip" branch is emitted.
 
-**`for`-increment placement.** `CONTINUE` jumps to the `BLOCK_END`
-back-edge. For a `for` loop, the increment must run on every iteration,
-including after a `continue`. The lowerer emits the increment inline at each
-`continue` site *before* the `CONTINUE` instruction (or equivalently,
-restructures the body so the increment is reachable from both the body
-fall-through and the `continue` path).
+**`for`-increment placement.** There being no `continue` to jump around it
+(§20.2), the increment always lowers to a single copy placed at the end of
+the body block, immediately before its `BLOCK_END` — every path through the
+body reaches it exactly once per iteration, with no duplication needed.
 
 #### 22.3 Declarations
 
@@ -1606,7 +1685,7 @@ Byte counts in comments assume the encoding of Part V: ALU stack/imm-inline
 ops are 1 byte; register ops are 2 bytes (opcode + reg); imm-extended ops
 are 2+ bytes (opcode + LEB128). Comparisons are 1 byte (peek/pop/imm-zero)
 or 2 bytes (register/imm-ext). `BR_TABLE #N` for N ∈ {1,2,3,4} is 1 byte;
-extended N is 2+. `RETURN`, `BREAK`, `BLOCK_END`, `TRAP #0` are 1 byte each.
+extended N is 2+. `RETURN`, `BLOCK_END`, `TRAP #0` are 1 byte each.
 
 ---
 
@@ -1715,12 +1794,12 @@ gives the lowerer both options freely — they share the same opcode space
 ```c
 u32 leb128_encode(u32 value) {
     u32 byte;
-    u32 more = 1;                  /* u32 always emits ≥ 1 byte */
-    while (more) {
+    u32 cont = 1;                  /* u32 always emits ≥ 1 byte */
+    while (cont) {
         byte = value & 0xFF;
         value = value >> 7;
-        more = value != 0;         /* combined: bit-set + loop-test share it */
-        if (more) {
+        cont = value != 0;
+        if (cont) {
             byte = byte | 0x80;
         }
         /* emit(byte); -- extension call */
@@ -1729,19 +1808,32 @@ u32 leb128_encode(u32 value) {
 }
 ```
 
-The lowerer hoists the `more = value != 0` assignment so the bit-set test and
-the loop-exit test read the same value, avoiding a duplicate comparison.
+The lowerer eliminates `cont` as a plain variable: it is always
+`(value != 0)` once the forced first pass is consumed, so the condition
+block recomputes it from r0 rather than reloading a stored flag. Because
+`LOOP`'s condition block is shared between the initial entry and every
+back-edge re-entry (§14.2), the `cont`-forcing behavior can't be "the first
+evaluation only" the way a single-block loop could special-case it — it
+needs an explicit first-iteration flag (`r_first`), OR'd into the real test
+and cleared once consumed in the body.
 
-**Lowered IR** (`value = r0`, `byte = r1`, `more = r2`):
+**Lowered IR** (`value = r0`, `byte = r1`, `r_first` = do-while flag):
 
 ```
-; more = 1 (init for first iteration)
-MOVE #1               ; acc = 1                               2 bytes (imm-ext)
-STORE r2              ; more = 1                              1 byte
+MOVE #1
+STORE r_first          ; r_first = 1 — forces the first pass    3 bytes total
 
-; --- while (more) ---
-LOAD r2               ; acc = more                            2 bytes
 LOOP
+  ; --- condition block: cont = r_first | (value != 0) ---
+  LOAD r0             ; acc = value                           2 bytes
+  NE #0               ; acc = (value≠0)                       1 byte (imm-zero!)
+  OR r_first          ; acc |= r_first (forced true on pass 1) 2 bytes
+BLOCK_END             ; acc=0 → exit past next BLOCK_END       1 byte
+
+  ; --- body block ---
+  MOVE #0
+  STORE r_first        ; clear the flag; harmless if repeated  2 bytes
+
   ; byte = value & 0xFF
   LOAD r0             ; acc = value                           2 bytes
   AND #0xFF           ; acc = value & 0xFF                    1 byte (per-op inline!)
@@ -1752,47 +1844,41 @@ LOOP
   SHR #7              ; acc >>= 7                             2 bytes (imm-ext)
   STORE r0            ; value = acc                           1 byte
 
-  ; more = (value != 0)  — acc still holds shifted value, skip LOAD
+  ; if (value != 0) byte |= 0x80  — acc still holds shifted value
   NE #0               ; acc = (value≠0)                       1 byte (imm-zero!)
-  STORE r2            ; more = acc                            1 byte
-
-  ; if (more) byte |= 0x80
-  BR_TABLE 1          ; case 0 (more≠0): set bit              1 byte (inline N=1)
+  BR_TABLE 1          ; case 0 (value≠0): set bit             1 byte (inline N=1)
     LOAD r1           ; acc = byte                            2 bytes
     OR #0x80          ; acc |= 0x80                           1 byte (per-op inline!)
     STORE r1          ; byte = acc                            1 byte
-  BLOCK_END           ; default (more==0): skip               1 byte
+  BLOCK_END           ; default (value==0): skip              1 byte
 
-  ; /* emit(byte) */ -- extension call, elided
-
-  ; re-evaluate while(more)
-  LOAD r2             ; acc = more                            2 bytes
-BLOCK_END             ; back-edge → LOOP                      1 byte
+  ; /* emit(byte) */ -- extension call, elided (does not clobber r0)
+BLOCK_END             ; back-edge → LOOP (re-enters condition block)  1 byte
 
 MOVE #0               ; acc = 0                               1 byte (per-op inline)
 RETURN                ; return 0                              1 byte
 ```
 
-**Total: ~30 bytes** for the entire procedure. Mechanisms exercised:
+**Total: ~33 bytes** for the entire procedure. Mechanisms exercised:
 
 - **Per-op inline literals are exactly right for LEB128.** `AND #0xFF` (mask
   to byte) and `OR #0x80` (set continuation bit) are each 1 byte — the per-op
   table (§17.3) was designed around this codec. `SHR #7` is imm-extended
   (2 bytes) because 7 is not in any inline set.
-- **Comparison imm-zero.** `NE #0` is 1 byte (§17.4) — the dominant comparison
-  in this loop is zero-test.
-- **Hoisted shared subexpression.** `more = (value != 0)` is computed once per
-  iteration and stored in `r2`; the bit-set test (via `BR_TABLE` on acc
-  immediately after) and the loop-exit test (via `LOAD r2` at the back-edge)
-  both reuse it, avoiding a duplicate comparison.
+- **Comparison imm-zero.** Both `NE #0` instances are 1 byte (§17.4) — the
+  dominant comparison in this loop is zero-test.
+- **Single condition site.** Unlike a single-block loop (which needs the
+  condition computed once before the loop *and* again at the tail), the
+  two-block `LOOP` (§14.2) has exactly one condition block, executed both on
+  entry and via the back-edge — no duplicate evaluation.
+- **Do-while recovery costs a register and ~4 bytes/iteration.** The
+  first-iteration flag (`r_first`) is the price of a bottom-test loop under
+  the two-block model (§14.2): `OR r_first` in the condition block plus
+  `MOVE #0; STORE r_first` at the top of the body, repeated (harmlessly)
+  every pass. A lowering pass that can prove the natural condition is
+  already true up front would skip the flag entirely.
 - **Acc survives STORE.** After `SHR #7; STORE r0`, `acc` still holds the
   shifted value, so the following `NE #0` needs no `LOAD r0` — saving 2 bytes.
-- **Pre-test with runtime condition.** `while(more)` evaluates the condition
-  into `acc` before `LOOP` and re-evaluates (via `LOAD r2`) before `BLOCK_END`.
-  `more` is initialized to 1 (u32 always emits ≥1 byte), so the loop runs at
-  least once — recovered do-while behavior via the pre-test form.
-- **Terminator closes block.** `RETURN` closes the procedure; no trailing
-  `BLOCK_END` after it.
 
 ---
 
@@ -1818,10 +1904,13 @@ u32 popcount(u32 x) {
 MOVE #0               ; acc = 0                              1 byte (per-op inline)
 STORE r1              ; count = 0                            1 byte
 
-; while (x != 0)  — condition is a zero-test, no complementary needed
-LOAD r0               ; acc = x                              2 bytes
-NE #0                 ; acc = (x ≠ 0)                        1 byte (imm-zero!)
 LOOP
+  ; --- condition block: x != 0 --- no complementary needed
+  LOAD r0             ; acc = x                              2 bytes
+  NE #0               ; acc = (x ≠ 0)                        1 byte (imm-zero!)
+BLOCK_END             ; acc=0 → exit past next BLOCK_END      1 byte
+
+  ; --- body block ---
   ; count += x & 1
   LOAD r0             ; acc = x                              2 bytes
   AND #1              ; acc = x & 1                          2 bytes (imm-ext: 1 ∉ AND's inline set)
@@ -1831,17 +1920,13 @@ LOOP
   LOAD r0             ; acc = x                              2 bytes
   SHR #1              ; acc >>= 1                            1 byte (per-op inline!)
   STORE r0            ; x = acc                              1 byte
-
-  ; re-evaluate condition
-  LOAD r0             ; acc = x                              2 bytes
-  NE #0               ; acc = (x ≠ 0)                        1 byte
-BLOCK_END             ; back-edge → LOOP                     1 byte
+BLOCK_END             ; back-edge → LOOP (re-enters condition) 1 byte
 
 LOAD r1               ; acc = count                          2 bytes
 RETURN                ; return count                         1 byte
 ```
 
-**Total: ~24 bytes.** Mechanisms exercised:
+**Total: ~21 bytes.** Mechanisms exercised:
 
 - **`MOVE #0`** (1 byte) for the counter init — zero is MOVE's per-op inline
   literal, the most common constant in codec code.
@@ -1852,8 +1937,10 @@ RETURN                ; return count                         1 byte
   trade-off of a single inline value per op: it can't cover every case.
 - **Register write-back** (`ADD r1 → r1`, combo 2) for the running count — no
   separate load/add/store; the ALU op writes directly to the register.
-- **Comparison imm-zero** (`NE #0`) for both the loop test and the pre-loop
-  evaluation (required by the pre-test model).
+- **Single condition site.** The two-block `LOOP` (§14.2) needs the `x != 0`
+  test written once — it runs both on entry and via the back-edge. A
+  single-block loop would need it computed twice (once before the loop,
+  once again at the tail); this form saves that duplicate 3 bytes.
 
 ---
 

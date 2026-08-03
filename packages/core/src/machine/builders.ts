@@ -8,12 +8,17 @@
  * the pattern matched and writing it inline documents the rule.
  */
 
-import { COMBO } from "./combo-meta"
-import type { ComboName, OutputLocation, Resource, RtlNode } from "./east"
+import { COMBO } from "./rtl"
+import type { ComboName, OutputLocation, Resource } from "./rtl"
+import type { RtlNode } from "./east"
 
 // ——————————————————————————————————————————————
 // Viability — does this ordering avoid clobber conflicts?
 // ——————————————————————————————————————————————
+
+/** Does `loc` name a register slot (`{reg: number}`) rather than `acc`/`tos`? */
+const isRegLocation = (loc: OutputLocation): loc is { reg: number } =>
+    typeof loc === "object"
 
 /**
  * Does executing `later`'s fragment destroy the value at `loc` produced by
@@ -25,7 +30,7 @@ import type { ComboName, OutputLocation, Resource, RtlNode } from "./east"
  * tos delta (pops), destroys the value.
  */
 export const destroys = (later: RtlNode, loc: OutputLocation): boolean =>
-    loc !== "reg" &&
+    !isRegLocation(loc) &&
     (later.clobbers.includes(loc) || (loc === "tos" && later.tosDelta < 0))
 
 /** Does `later` destroy any of `earlier`'s declared outputs? */
@@ -93,7 +98,7 @@ export function nodeInvariants(args: {
     for (const r of meta.clobbers) clobbers.add(r)
     for (const loc of outLocs)
     {
-        if (loc !== "reg") clobbers.delete(loc)
+        if (!isRegLocation(loc)) clobbers.delete(loc)
     }
 
     // tosDelta: children + op + optional extra.

@@ -55,8 +55,8 @@ and the semantics are **lenient with an implicit default**:
 - `acc ≥ N` → skip all cases (the **implicit default**), falling through to
   after the construct.
 
-Each case-block is closed by `BLOCK_END` **or** by an unconditional terminator
-(`RETURN`/`TRAP`/`BREAK`/`CONTINUE` — see §3.4), whichever comes first:
+Each case-block is closed by `BLOCK_END` **or** by a procedure-exiting
+terminator (`RETURN`/`TRAP` — see §3.4), whichever comes first:
 
 ```
 BR_TABLE N            ; case[acc] for acc<N; acc≥N → fall through (implicit default)
@@ -664,37 +664,32 @@ Single-byte encodable.
 ### 3.4 No-operand (and terminator) class
 
 **`RETURN`** — end procedure; return value is whatever is in `acc`.
-**`BLOCK_END`** — close the enclosing block. Its semantics are determined by the
-block's **start marker** (§3.8):
-  - closes a `BR_TABLE` case → unconditional fall-through to after the construct
-    (subsumes `ELSE`, §2.3);
-  - closes a `LOOP` → **unconditional back-edge** to the `LOOP` opener, which
-    then re-evaluates the continue-condition.
+**`BLOCK_END`** — close the enclosing block. Its semantics are determined by
+the block's **start marker** (§3.8):
+  - closes a `BR_TABLE` case → unconditional fall-through to after the
+    construct (subsumes `ELSE`, §2.3);
+  - closes a `LOOP`'s **condition block** (the first of `LOOP`'s two
+    sub-blocks) → conditional: `acc=0` → exit past the body block's
+    `BLOCK_END`; `acc≠0` → fall into the body block;
+  - closes a `LOOP`'s **body block** (the second sub-block) →
+    **unconditional back-edge** to the `LOOP` opener, which re-enters the
+    condition block.
 
-`LOOP_ITER` is therefore **folded into `BLOCK_END`** — there is one closer for
-all block shapes; the start marker declares the end semantics. Note the
-uniformity this produces: **the test always lives at the opener, and the closer
-is always unconditional** (`BR_TABLE` cases fall through; `LOOP` body
-back-edges). `DUP`/`SWAP` are also absent (`DUP` is MOVE push-mode, `SWAP` is
-dropped — §2.6).
+`LOOP_ITER` is therefore **folded into `BLOCK_END`** — there is one closer
+for every block shape; the start marker (plus, for `LOOP`, which of its two
+sub-blocks is being closed) declares the end semantics. `DUP`/`SWAP` are
+also absent (`DUP` is MOVE push-mode, `SWAP` is dropped — §2.6).
 
-**`BREAK`** — structured exit from the innermost enclosing `LOOP`: jump to the
-instruction after its matching `BLOCK_END`. **`CONTINUE`** — structured
-re-test: jump to the innermost `LOOP`'s matching `BLOCK_END` (the back-edge,
-which returns to the opener for re-testing). Both are no-operand — the target
-is determined statically by the enclosing `LOOP` scope.
-
-> **Why these can't be avoided by nesting.** `continue` could *almost* be
-> expressed by putting the rest of the body inside the `else` of a `BR_TABLE`,
-> but only when the `continue` is the last statement; in general it must skip
-> forward over trailing code = a jump. `break` is worse: no amount of nesting
-> can exit an enclosing loop, so it is an irreducible structured jump. Both
-> therefore earn their own opcodes.
->
-> **No switch-`break` ambiguity.** Because each `BR_TABLE` case is inherently
-> break-terminated by its `BLOCK_END` (fall-through), a DSL-level `break` never
-> targets a switch — it always unambiguously targets the innermost loop. So
-> `BREAK`/`CONTINUE` only ever resolve against a `LOOP`, never a `BR_TABLE`.
+There is no `BREAK` or `CONTINUE`, and no other instruction that re-targets
+control from inside an open block. An earlier draft carried both as
+dedicated no-operand opcodes; they were dropped once the source DSL turned
+out to expose no `break`/`continue` keyword (§2.1's structured-control-flow
+line already forbids `goto`, and the same reasoning extends to any other
+irregular jump), so no lowering ever produced them. The only way to leave a
+`LOOP` early is a procedure-exiting terminator reached from within it; the
+only way to skip to the next iteration is for the current pass to simply
+run to the end of the body block. A codec loop that would otherwise
+`break` early folds the early-exit test into the condition block instead.
 
 **`TRAP imm`** — **abnormal procedure termination** with error code `imm`. A
 control-flow terminator like `RETURN` (no fall-through; the verifier treats it
@@ -715,20 +710,19 @@ domain-neutral. See §2.12 for the error-code partitioning convention.
 | `1 .. K` | reserved generic codes (overflow, bounds, stack-depth). |
 | `K+1 .. 255` | codec/wire-domain codes (checksum mismatch, invalid tag, malformed length, …). Defined by the codec author; reported to the host, which owns stream/handle teardown and decides the response. |
 
-All no-operand instructions (`RETURN`, `BLOCK_END`, `BREAK`, `CONTINUE`) are
-single-byte encodable. `TRAP imm` shares the `imm` sub-encoding so its common
-form (`TRAP 0`) is also single-byte. `BREAK`/`CONTINUE`/`TRAP` are relatively
-rare in generated codec code, so whether the rarer forms get dedicated
-single-byte opcodes or ride the extended/escape mechanism (§7) is a
-layout-time decision.
+All no-operand instructions (`RETURN`, `BLOCK_END`) are single-byte
+encodable. `TRAP imm` shares the `imm` sub-encoding so its common form
+(`TRAP 0`) is also single-byte. `TRAP` is relatively rare in generated codec
+code, so whether its rarer forms get a dedicated single-byte opcode or ride
+the extended/escape mechanism (§7) is a layout-time decision.
 
-> **Terminators close blocks.** Any unconditional control-flow terminator —
-> `RETURN`, `TRAP`, `BREAK`, `CONTINUE` — also **closes the enclosing
-> `BR_TABLE` case-block** (and, for `RETURN`/`TRAP`, ends the procedure). No
-> separate `BLOCK_END` is required after a terminator, and dead code following
-> one is rejected. This is the Wasm stack-polymorphic-terminator model. It
-> saves one `BLOCK_END` byte per terminal case and lets switch-cases that
-> `RETURN` or `TRAP` read naturally (see §4.7). Cases that fall through to a
+> **Terminators close blocks.** A procedure-exiting terminator — `RETURN` or
+> `TRAP` — also **closes the enclosing block** (a `BR_TABLE` case-block, or
+> either of a `LOOP`'s two sub-blocks) as a side effect of ending the
+> procedure. No separate `BLOCK_END` is required after a terminator, and dead
+> code following one is rejected. This is the Wasm stack-polymorphic-terminator
+> model. It saves one `BLOCK_END` byte per terminal case and lets switch-cases
+> that `RETURN` or `TRAP` read naturally (see §4.7). Cases that fall through to a
 > shared post-construct instruction (e.g. a single trailing `RETURN`, as in
 > §4.2) still use `BLOCK_END` — it is optional, not banned.
 
@@ -825,31 +819,44 @@ path, so no empty trailing block); N=2 for `if`/`if-else`; N>2 for `switch`
 selector is in `acc`. Each case-block is closed by `BLOCK_END` or an
 unconditional terminator (§3.4); no offsets or `ELSE` markers (§2.3).
 
-**`LOOP`** — opens a **top-test** loop. The continue-condition is in `acc` at
-the opener: `acc = 0` → exit (fall through to after the matching `BLOCK_END`);
-`acc ≠ 0` → enter the body. The body is closed by `BLOCK_END` as an
-**unconditional back-edge** to the opener (which re-tests). This is the
-`while`/`for` form — zero iterations is possible. The loop exit target is the
-instruction after `BLOCK_END`.
+**`LOOP`** — opens a **top-test** loop, as **two** nested sub-blocks in fixed
+order rather than one:
 
-`do-while` (bottom-test) is **not expressible** and is banned at the DSL level
-(no `do` keyword). Its behavior is recoverable when needed by adjusting the
-loop variable's initial value (`±1`), or by duplicating the body before a
-`while` — but in practice every codec loop (iterate until stream/list exhausted)
-is naturally top-test.
+1. **Condition block** — leaves a continue/exit decision in `acc`. Its
+   `BLOCK_END` reads it: `acc = 0` → exit (fall through to after the body
+   block's `BLOCK_END`); `acc ≠ 0` → fall into the body block.
+2. **Body block** — closed by `BLOCK_END` as an **unconditional back-edge**
+   to the `LOOP` opener, which re-enters the condition block.
 
-`break` inside a loop body → the **`BREAK`** instruction (§3.4): structured jump
-to the exit target (after the matching `BLOCK_END`). `continue` → the
-**`CONTINUE`** instruction: structured jump to the `LOOP`'s matching
-`BLOCK_END` (the back-edge → opener re-test). For a `for` loop, the lowering
-pass places the increment just before `BLOCK_END`, so `continue` runs the
-increment then re-tests. Both always target the innermost enclosing `LOOP`
-(never a `BR_TABLE`, whose case-exit is implicit via `BLOCK_END`), so they
-carry no operand.
+This is the `while`/`for` form — zero iterations of the body is possible
+(the condition block itself always runs at least once). The loop exit
+target is the instruction after the body block's `BLOCK_END`. Splitting the
+condition into its own sub-block (rather than testing at the opener, as an
+earlier draft did) means the test is written **once** and executed on both
+the initial entry and every back-edge — a single-block loop needs the
+condition computed once before the loop and again at the tail, since the
+opener itself can't hold instructions ahead of the test.
 
-> **One closer, two openers.** `BLOCK_END` is universal; `BR_TABLE` and `LOOP`
-> are the only block starts. This subsumes the earlier `LOOP_ITER`/`ELSE`
-> markers — both folded into `BLOCK_END` with start-declared semantics.
+`do-while` (bottom-test) is **not expressible** and is banned at the DSL
+level (no `do` keyword). Because the condition block is shared between
+initial entry and back-edge re-entry, it has no notion of "first" to
+special-case, so recovering bottom-test behavior needs an explicit
+first-iteration flag (initialized true before the `LOOP`, OR'd into the
+condition, cleared once consumed in the body — §4.3 shows the idiom) or
+peeling the first iteration ahead of the loop. In practice every codec loop
+(iterate until stream/list exhausted) is naturally top-test, so this is a
+rare need.
+
+There is no `break`/`continue` (§3.4): the only way to leave a running loop
+is the condition block testing false on a later iteration, or a
+procedure-exiting terminator reached from within either sub-block.
+
+> **One closer, two openers, three closer meanings.** `BLOCK_END` is
+> universal; `BR_TABLE` and `LOOP` are the only block starts. This subsumes
+> the earlier `LOOP_ITER`/`ELSE` markers — both folded into `BLOCK_END` with
+> start-declared semantics. `LOOP` contributes two of the three meanings
+> (condition-block test, body-block back-edge) since it is the only
+> construct with two sub-blocks.
 
 **Procedure invocation (generic core):**
 **`CALL proc_idx, arg_count`** — invoke `procedure[proc_idx]`. Args have been
@@ -913,17 +920,30 @@ RETURN
 
 ### 4.3 LEB128 encoder (u32 → LEB128 bytes) — stresses ALU, imm, loop
 
-Sub-codec for a primitive u32. `o0` is the primitive handle. A u32 always emits
-≥1 byte, so the loop must run at least once — recovered as pretest by
-initializing the condition to true (§3.8's do-while-recovery note). Bit
-manipulation via `AND_IMM`/`SHR_IMM`/`OR_IMM`; continuation-bit set is a
-2-case `BR_TABLE`:
+Sub-codec for a primitive u32. `o0` is the primitive handle. A u32 always
+emits ≥1 byte, so the loop must run at least once even when `r_val` starts
+at zero — recovered with the first-iteration-flag idiom (§3.8's
+do-while-recovery note), since the two-block `LOOP`'s single condition block
+can't special-case "first entry" on its own. Bit manipulation via
+`AND_IMM`/`SHR_IMM`/`OR_IMM`; continuation-bit set is a 2-case `BR_TABLE`:
 
 ```
 LOAD_VAL              ; acc = value (src=o0)
 STORE r_val
-LOAD_IMM 1            ; cond = true (force first entry)
+LOAD_IMM 1
+STORE r_first          ; r_first = 1 (force first entry)
+
 LOOP
+  ; --- condition block: r_first | (r_val != 0) ---
+  LOAD r_val
+  NE_IMM 0            ; acc = (r_val != 0)
+  OR r_first          ; acc |= r_first (forced true on pass 1)
+BLOCK_END              ; acc=0 → exit past next BLOCK_END; acc≠0 → body
+
+  ; --- body block ---
+  LOAD_IMM 0
+  STORE r_first        ; clear the flag; harmless if repeated
+
   ; byte = r_val & 0x7F
   LOAD r_val
   AND_IMM 0x7F
@@ -945,21 +965,17 @@ LOOP
   ; emit byte
   LOAD r_byte
   WRITE i0, 1
-  ; re-test cond: continue while r_val != 0
-  LOAD r_val
-  NE_IMM 0
-BLOCK_END              ; back-edge → LOOP (re-test)
+BLOCK_END              ; back-edge → LOOP (re-enters condition block)
 RETURN
 ```
 
 ### 4.4 Checksum with fixup — stresses stream forks + `HAS_NEXT`
 
 The `<compute hasMore>` gap from earlier drafts is filled by `HAS_NEXT i`
-(§3.6). Note the **pretest cost**: the runtime condition must be computed once
-*before* `LOOP` (initial test, allows zero iterations) **and** once at the end
-of the body (so the back-edge re-tests a fresh value). Both occurrences are
-genuine — this is the standard price of pretest loops with a runtime condition,
-and the reason `do-while` was occasionally nicer before being banned.
+(§3.6). Under the two-block `LOOP` (§3.8), the runtime condition is written
+**once**, as the condition block — it runs both on initial entry (allowing
+zero iterations) and, via the back-edge, before every subsequent pass. No
+separate pre-loop and tail computation is needed.
 
 ```
 CLONE_RD 0 1          ; reader fork at packet start (for checksumming)
@@ -968,12 +984,12 @@ WRITE i0, 1           ; placeholder byte via original writer
 ; ...serialize rest of packet with original writer i0 (elided)...
 LOAD_IMM 0
 STORE r_sum           ; r_sum = checksum accumulator
-HAS_NEXT 1            ; cond: reader 1 has another byte
 LOOP
+  HAS_NEXT 1          ; condition block: cond = reader 1 has another byte
+BLOCK_END             ; acc=0 → exit past next BLOCK_END; acc≠0 → body
   READ 1, 1           ; acc = next byte from reader
   ADD r_sum           ; combo 2: r_sum = acc + r_sum  (i.e. r_sum += byte)
-  HAS_NEXT 1          ; re-evaluate cond for next test
-BLOCK_END             ; back-edge → LOOP (re-test)
+BLOCK_END             ; back-edge → LOOP (re-enters condition block)
 LOAD r_sum
 WRITE 2, 1            ; emit checksum via parked writer fork
 RETURN
@@ -1068,9 +1084,10 @@ LOAD r_left
 SUB_IMM 1
 STORE r_left
 ; loop remaining as deltas
-LOAD r_left
-NE_IMM 0             ; cond: more?
 LOOP
+  LOAD r_left
+  NE_IMM 0            ; condition block: more?
+BLOCK_END              ; acc=0 → exit past next BLOCK_END; acc≠0 → body
   ENTER_NEXT o1, o0   ; o1 = next element
   LOAD_VAL o1
   STORE r_cur
@@ -1083,8 +1100,7 @@ LOOP
   LOAD r_left
   SUB_IMM 1
   STORE r_left
-  NE_IMM 0           ; re-test cond
-BLOCK_END
+BLOCK_END              ; back-edge → LOOP (re-enters condition block)
 RETURN
 ```
 
@@ -1164,10 +1180,12 @@ fixed**. Guiding principles gathered so far:
    table-lookup (§2.7) — the *only* mechanism for recovering fractional bits.
    A true arithmetic-coding outer layer is explicitly ruled out
    (complexity/testability).
-2. **No-operand instructions** (`NEG`, `NOT`, `RETURN`, `BLOCK_END`,
-   `BREAK`, `CONTINUE`) can be a single byte. `LOOP_ITER` is folded into
-   `BLOCK_END` (loop blocks: conditional back-edge on `acc`, declared by the
-   `LOOP` start marker — §3.8); `DUP`/`SWAP` are absent (§2.6).
+2. **No-operand instructions** (`NEG`, `NOT`, `RETURN`, `BLOCK_END`) can be a
+   single byte. `LOOP_ITER` is folded into `BLOCK_END`, which takes on one of
+   three meanings depending on the block it closes: `BR_TABLE` case
+   fall-through, `LOOP` condition-block test, or `LOOP` body-block back-edge
+   (§3.8). There is no `BREAK`/`CONTINUE` — the DSL has no keyword that would
+   lower to either (§3.4). `DUP`/`SWAP` are also absent (§2.6).
    **`TRAP imm`** (§3.4, generic abnormal termination) shares the `imm`
    sub-encoding, so its common form (`TRAP 0` = unreachable/panic) is also
    single-byte; rare error codes escape to trailing LEB128. Error-code

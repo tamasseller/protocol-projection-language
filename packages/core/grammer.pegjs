@@ -26,41 +26,53 @@ Program
 // 2. Statements
 // ---------------------------------------------------------------------
 Statement
-  = _ s:(Block
-  / IfStatement
+  = _ s:(IfStatement
   / WhileStatement
   / ForStatement
   / SwitchStatement
   / DeclarationStatement
   / ReturnStatement
-  / BreakStatement
-  / ContinueStatement
   / ExpressionStatement) { return s; }
 
+// The single construct directly governed by if/else/while/for: either a
+// brace-delimited block or one bare statement. A `Block` is reachable only
+// here — it is deliberately not a `Statement` in its own right, so a bare
+// `{ ... }` cannot appear as a standalone statement (e.g. nested inside
+// another block, or at the top level of a procedure body). Every `Block`
+// reached via `ControlBody` is the immediate body of a branch or loop, so it
+// always has a real RTL block construct (a `BR_TABLE` case or a `LOOP` body
+// block) backing it — see docs/isa-core.md §20.2 and §15.1. A `Block` with
+// no such construct behind it would have no `BLOCK_END` to reclaim its
+// locals' TOS depth at, silently corrupting register allocation for any
+// declaration that follows it.
+ControlBody
+  = Block
+  / Statement
+
 Block
-  = "{" _ body:Statement* _ "}" { 
-      return { type: "BlockStatement", body }; 
+  = "{" _ body:Statement* _ "}" {
+      return { type: "BlockStatement", body };
     }
 
 IfStatement
-  = "if" _ "(" _ test:Expression _ ")" _ consequent:Statement 
-    alternate:(_ "else" _ alt:Statement { return alt; })? { 
-      return { type: "IfStatement", test, consequent, alternate }; 
+  = "if" _ "(" _ test:Expression _ ")" _ consequent:ControlBody
+    alternate:(_ "else" _ alt:ControlBody { return alt; })? {
+      return { type: "IfStatement", test, consequent, alternate };
     }
 
 WhileStatement
-  = "while" _ "(" _ test:Expression _ ")" _ body:Statement { 
-      return { type: "WhileStatement", test, body }; 
+  = "while" _ "(" _ test:Expression _ ")" _ body:ControlBody {
+      return { type: "WhileStatement", test, body };
     }
 
 ForStatement
-  = "for" _ "(" _ 
-    init:(DeclarationStatement / ExpressionStatement / ";" { return null; }) _ 
-    test:Expression? _ ";" _ 
-    update:Expression? _ ")" _ body:Statement { 
+  = "for" _ "(" _
+    init:(DeclarationStatement / ExpressionStatement / ";" { return null; }) _
+    test:Expression? _ ";" _
+    update:Expression? _ ")" _ body:ControlBody {
       // Clean up the init statement to unpack if it's an ExpressionStatement
       const initNode = init?.type === "ExpressionStatement" ? init.expression : init;
-      return { type: "ForStatement", init: initNode, test, update, body }; 
+      return { type: "ForStatement", init: initNode, test, update, body };
     }
 
 SwitchStatement
@@ -91,11 +103,7 @@ ReturnStatement
       return { type: "ReturnStatement", argument }; 
     }
 
-BreakStatement
-  = "break" _ ";" { return { type: "BreakStatement" }; }
 
-ContinueStatement
-  = "continue" _ ";" { return { type: "ContinueStatement" }; }
 
 ExpressionStatement
   = expression:Expression _ ";" { 
@@ -229,8 +237,8 @@ Identifier
     }
 
 ReservedWord
-  = ( "if" / "else" / "while" / "for" / "switch" / "case" / "default" 
-    / "break" / "continue" / "return" / "u32" 
+  = ( "if" / "else" / "while" / "for" / "switch" / "case" / "default"
+    / "break" / "continue" / "return" / "u32"
     ) !([a-zA-Z0-9_])
 
 // ---------------------------------------------------------------------

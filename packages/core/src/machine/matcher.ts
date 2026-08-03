@@ -21,9 +21,9 @@ import {
     isIdentifier,
     isLiteral,
     isRtlNode,
-    OutputLocation,
     RtlNode,
 } from "./east"
+import type { OutputLocation } from "./rtl"
 
 // 1. Pattern interfaces
 

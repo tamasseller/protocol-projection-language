@@ -16,28 +16,9 @@ import type {
     UnaryOperator,
 } from "./ast"
 
-export type OutputLocation = "acc" | "tos" | "reg"
-export type Resource = "acc" | "tos"
+import type { OutputLocation, Resource, RtlInstr } from "./rtl"
 
-/** Symbolic combo names — `<INPUT_MODE>_<OUTPUT_MODE>` per isa-core.md §6.3. */
-export type ComboName =
-    | "REG_ACC"    // register  → acc       (acc = acc OP rN)
-    | "REG_REG"    // register  → register  (rN  = acc OP rN, write-back)
-    | "PEEK_ACC"   // peek      → acc       (acc = acc OP [tos-1])
-    | "PEEK_PEEK"  // peek      → peek      ([tos-1] = acc OP [tos-1], write-back)
-    | "POP_ACC"    // pop       → acc       (acc = acc OP pop)
-    | "PEEK_PUSH"  // peek      → push      ([tos++] = acc OP [tos-1], RPN)
-    | "IMM_ACC"    // immediate → acc       (acc = acc OP #imm)
-
-export interface RtlInstr
-{
-    op: string
-    combo?: ComboName
-    target?: string
-    imm?: number
-    writeback?: boolean
-    callee?: string
-}
+export type { OutputLocation, Resource, ComboName } from "./rtl"
 
 export interface RtlNode
 {

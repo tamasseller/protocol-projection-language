@@ -312,18 +312,47 @@ For each completed EAST (root is RTL-AST):
   This lookup is the only place the inline-vs-extended distinction enters the
   lowerer.
 - Minimal-cost tiling wins.
-- Emit the linearized instruction sequence (locals still symbolic at this
-  point — concrete register indices assigned in a later pass).
+- Emit the linearized instruction sequence. Locals resolve to concrete
+  register indices during this same pass (see Local resolution, below) —
+  there is no separate later renumbering pass.
 
 ### After expression lowering
 
 - **Control flow** — trivial generators: `If(cond) ...` → tile `cond` to acc,
-  emit `BR_TABLE N`. `While(cond) ...` → tile `cond` to acc, emit `LOOP`.
-  `For`, `Break`, `Continue`, `Return`, `Trap` — direct. CFG transformations
-  to enable simpler expression lowerings (e.g., complementary-comparison
+  emit `BR_TABLE N`. `While(cond) ...` → emit `LOOP`, tile `cond` to acc as
+  the condition block, `BLOCK_END`, then the body as the second block,
+  `BLOCK_END`. `For` places the increment at the end of the body block,
+  before its `BLOCK_END`, so it runs once per iteration with no special
+  casing. `Return`, `Trap` — direct. There is no `Break`/`Continue`: the
+  source DSL has no such keywords, and the ISA carries no opcode for
+  either — see [isa-core.md §11.2](./isa-core.md). CFG transformations to
+  enable simpler expression lowerings (e.g., complementary-comparison
   selection for if-without-else) are handled as a separate concern.
-- **Local resolution** — at this point locals are symbolic. A separate pass
-  assigns concrete register indices, respecting liveness.
+  A branch/case/loop-body's closing `BLOCK_END` is emitted only when that
+  branch doesn't already end control flow unconditionally — an `alwaysTerminates`
+  check over the *statement* list (not the compiled instruction tail: an
+  `if` without `else` can end its fragment with a `RETURN` that only fires
+  along one path, so the instruction tail alone doesn't tell you whether
+  the branch truly always terminates). A `for` loop's increment is omitted
+  entirely, along with its `BLOCK_END`, when the body always terminates
+  first (it would be unreachable otherwise). See `alwaysTerminates` /
+  `closeBlock` / `closeControlBody` in `packages/core/src/machine/lower.ts`.
+- **Local resolution** — registers are allocated in the same pass as
+  control-flow lowering, not a separate discovery-then-allocate phase: each
+  scope carries a small allocator that assigns the next free index the
+  first time a name is declared, and a nested scope's allocator falls back
+  to its parent's map to resolve names it doesn't own itself (see the
+  current implementation in `packages/core/src/machine/lower.ts`). A nested
+  scope's own numbering is seeded from its parent's current count (rather
+  than restarting at 0), so a local declared inside an `if`/`while`/`for`
+  body continues the parent's numbering instead of reusing an index the
+  parent (or an argument) already holds. This relies on every scope that
+  can declare a local closing via a real `BLOCK_END` that resets TOS back
+  to the parent's depth (§15.1) — which is exactly why bare block
+  statements (a `{ ... }` not attached to a branch or loop) are excluded
+  from the grammar entirely (§20.2): a bare block's scope would be
+  discarded by the allocator with no `BLOCK_END` ever performing the
+  matching runtime reclaim, aliasing a later declaration's register.
 - **Function calls** — handled uniformly by a rule that creates an RTL node
   with strictly ordered children (the argument expressions' RTL nodes),
   requires each to output at `tos`, and produces the result in `acc` per the
@@ -367,6 +396,13 @@ lowerer/
 
 Matcher, rule table, and orchestrator are separate; new operator classes add
 a rule file without touching the matcher or orchestrator.
+
+> The actual implementation flattened this tree under
+> `packages/core/src/machine/` (`orchestrator.ts`, `matcher.ts`, `rules.ts`,
+> `rtl.ts`, `east.ts`, `lower.ts`) rather than nesting `lowerer/rules/rtl/emit`
+> directories, and there is no standalone `emit/locals.ts` — local register
+> allocation happens inline in `lower.ts` as statements are lowered (see
+> Local resolution, above), not as a separate emit-time step.
 
 ### Memoization (deferred)
 

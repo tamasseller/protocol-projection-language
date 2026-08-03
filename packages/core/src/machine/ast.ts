@@ -16,16 +16,24 @@ export interface Program
 }
 
 export type Statement =
-    | BlockStatement
     | IfStatement
     | WhileStatement
     | ForStatement
     | SwitchStatement
     | VariableDeclaration
     | ReturnStatement
-    | BreakStatement
-    | ContinueStatement
     | ExpressionStatement
+
+/**
+ * The single construct directly governed by if/else/while/for: either a
+ * brace-delimited block or one bare statement. `BlockStatement` is reachable
+ * only here — it is deliberately not a member of `Statement`, so a bare
+ * `{ ... }` cannot appear as a standalone statement. Every `BlockStatement`
+ * reached through a `ControlBody` position is the immediate body of a branch
+ * or loop, so it always has a real RTL block construct backing it (see
+ * grammer.pegjs's `ControlBody` rule and docs/isa-core.md §20.2, §15.1).
+ */
+export type ControlBody = BlockStatement | Statement
 
 export interface BlockStatement
 {
@@ -37,15 +45,15 @@ export interface IfStatement
 {
     type: "IfStatement"
     test: Expression
-    consequent: Statement
-    alternate: Statement | null
+    consequent: ControlBody
+    alternate: ControlBody | null
 }
 
 export interface WhileStatement
 {
     type: "WhileStatement"
     test: Expression
-    body: Statement
+    body: ControlBody
 }
 
 export interface ForStatement
@@ -54,7 +62,7 @@ export interface ForStatement
     init: Expression | VariableDeclaration | null
     test: Expression | null
     update: Expression | null
-    body: Statement
+    body: ControlBody
 }
 
 export interface SwitchStatement
@@ -90,15 +98,7 @@ export interface ReturnStatement
     argument: Expression | null
 }
 
-export interface BreakStatement
-{
-    type: "BreakStatement"
-}
 
-export interface ContinueStatement
-{
-    type: "ContinueStatement"
-}
 
 export interface ExpressionStatement
 {
