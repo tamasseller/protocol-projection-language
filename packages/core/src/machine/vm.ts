@@ -1,175 +1,39 @@
 /**
  * @ppl/core/machine — Minimal Core VM
  *
- * Interprets a ResolvedProgram with structured control flow. Uses a two-pass
- * pre-scan to resolve all jump targets so the main interpreter loop is a
- * simple switch with direct PC assignments.
+ * A single-pass, structured-control-flow interpreter — no pre-scan, no
+ * precomputed jump table. A live control stack of "open blocks" tells
+ * `BLOCK_END` what it's closing; branch targets it can't reach by falling
+ * through (an untaken `BR_TABLE` case, a loop's exit) are found by scanning
+ * forward from where we are, on demand.
  *
- * Designed as an oracle for testing — correctness over performance.
+ * One call to `runProc` executes exactly one procedure: all its state (pc,
+ * acc, registers, TOS, the control stack) is local to that call. A nested
+ * `CALL` is therefore just a nested recursive call — not implemented yet
+ * (needs a name → procedure resolution step this layer doesn't have), but
+ * the shape is ready for it. `RETURN` and `TRAP` need no bookkeeping beyond
+ * a plain `return`/`throw`: unwinding the JS call stack unwinds the control
+ * stack with it, which is exactly the ISA's "a terminator closes its block
+ * on its own" rule (isa-core.md §14.3/§14.4) for free.
+ *
+ * Designed as an oracle for testing — correctness and clarity over
+ * performance. Malformed IR (a stray `BLOCK_END`, an unknown opcode) throws
+ * a plain `Error`, not a magic trap code — that's a bug in whatever
+ * produced the IR, not a program-level trap.
  */
 
 import assert from "assert"
-import type {RtlProgram as ResolvedProgram, RtlInstr as ResolvedInstr} from "./rtl"
-
-// NOTE: this VM has not yet been updated for the two-block `LOOP` construct
-// (isa-core.md §14.2 — a LOOP now opens a condition sub-block and a body
-// sub-block, each with its own BLOCK_END, rather than testing `acc` at the
-// opener) or for CALL's name-based callee (RtlInstr's `callee` is a
-// procedure name, not a resolved table index). Both are known-stale;
-// fixing them is tracked as separate follow-up work, not done here.
+import type {RtlProgram, RtlProc, RtlInstr} from "./rtl"
 
 const MAX_STEPS = 10_000_000
 
-interface BlockMap
+/** Thrown by `TRAP`, caught once at the top of `run`. */
+class Trap
 {
-    loopEnds: Map<number, number>
-    brEnds: Map<number, number>
-    blockOwners: Map<number, {kind: "loop" | "br"; openerPc: number}>
+    constructor(readonly code: number, readonly steps: number) {}
 }
 
-function buildBlockMap(body: ResolvedInstr[]): BlockMap
-{
-    const bm: BlockMap = {
-        loopEnds: new Map(),
-        brEnds: new Map(),
-        blockOwners: new Map(),
-    }
-
-    type SE = {kind: "loop"; openerPc: number} | {kind: "br"; openerPc: number; remaining: number}
-    const stack: SE[] = []
-
-    for(let pc = 0; pc < body.length; pc++)
-    {
-        const i = body[pc]
-        if(i.op === "LOOP") {stack.push({kind: "loop", openerPc: pc})}
-        else if(i.op === "BR_TABLE")
-        {
-            const N = (i as {imm: number}).imm
-            stack.push({kind: "br", openerPc: pc, remaining: N})
-        }
-        else if(i.op === "BLOCK_END")
-        {
-            if(stack.length === 0) throw new Error(`BLOCK_END at ${pc}: empty stack`)
-            const top = stack[stack.length - 1]
-            if(top.kind === "br")
-            {
-                bm.blockOwners.set(pc, {kind: "br", openerPc: top.openerPc})
-                top.remaining--
-                if(top.remaining === 0) stack.pop()
-            }
-            else
-            {
-                bm.blockOwners.set(pc, {kind: "loop", openerPc: top.openerPc})
-                bm.loopEnds.set(top.openerPc, pc)
-                stack.pop()
-            }
-        }
-        else if(i.op === "RETURN" || i.op === "TRAP")
-        {
-            // Terminators close the innermost BR_TABLE case (if any).
-            if(stack.length > 0 && stack[stack.length - 1]!.kind === "br")
-            {
-                const top = stack[stack.length - 1]!
-                if(top.kind === "br")
-                {
-                    top.remaining--
-                    if(top.remaining === 0) stack.pop()
-                }
-            }
-        }
-    }
-
-    // BR_TABLE construct ends
-    for(let pc = 0; pc < body.length; pc++)
-    {
-        if(body[pc].op === "BR_TABLE")
-        {
-            const N = (body[pc] as {imm: number}).imm
-            let endPc = pc + 1, found = 0, nest = 0
-            while(found < N && endPc < body.length)
-            {
-                const i = body[endPc]
-                if(i.op === "LOOP" || i.op === "BR_TABLE") nest++
-                else if(i.op === "BLOCK_END") {if(nest === 0) found++; else nest--}
-                else if(i.op === "RETURN" || i.op === "TRAP")
-                {if(nest === 0) found++}
-                endPc++
-            }
-            bm.brEnds.set(pc, endPc)
-        }
-    }
-
-    return bm
-}
-
-// ── VM ──────────────────────────────────────────────────────────────────────
-
-class VmState
-{
-    prog!: ResolvedProgram
-    body!: ResolvedInstr[]
-    jumps!: BlockMap
-
-    regs: number[] = [];
-    acc = 0;
-    tos = 0;
-    pc = 0;
-    stepCount = 0
-
-    callStack: {retPc: number; retProc: number; savedTos: number; savedRegs: number[]}[] = []
-
-    halted = false;
-    trapCode: number | null = null
-
-    ensureRegs(n: number): void 
-    {
-        while(this.regs.length < n) this.regs.push(0)
-    }
-}
-
-function oVal(vm: VmState, i: ResolvedInstr): number
-{
-    if(!("combo" in i)) return 0
-    switch(i.combo)
-    {
-        case "REG_ACC":
-        case "REG_REG":
-            return vm.regs[i.target] ?? 0
-        case "IMM_ACC":
-            return i.imm
-        case "PEEK_ACC":
-        case "PEEK_PEEK":
-        case "PEEK_PUSH":
-            assert.ok(vm.tos > 0, `PEEK/POP with empty stack`)
-            return vm.regs[vm.tos - 1] ?? 0
-        case "POP_ACC":
-            assert.ok(vm.tos > 0, `POP with empty stack`)
-            return vm.regs[--vm.tos] ?? 0
-        default: return 0
-    }
-}
-
-function wRes(vm: VmState, i: ResolvedInstr, value: number): void
-{
-    const v = value >>> 0
-    if(!("combo" in i)) {vm.acc = v; return }
-    switch(i.combo)
-    {
-        case "REG_ACC":
-        case "IMM_ACC":
-        case "POP_ACC":
-        case "PEEK_ACC":
-            vm.acc = v; break
-        case "REG_REG":
-            vm.ensureRegs(i.target + 1); vm.regs[i.target] = v; break
-        case "PEEK_PEEK":
-            vm.regs[vm.tos - 1] = v; break
-        case "PEEK_PUSH":
-            vm.ensureRegs(vm.tos + 1); vm.regs[vm.tos++] = v; break
-    }
-}
-
-function evalBinary(L: number, R: number, op: ResolvedInstr["op"]): number
+function evalBinary(L: number, R: number, op: RtlInstr["op"]): number
 {
     switch(op)
     {
@@ -197,7 +61,7 @@ function evalBinary(L: number, R: number, op: ResolvedInstr["op"]): number
     }
 }
 
-function evalUnary(V: number, op: ResolvedInstr["op"]): number
+function evalUnary(V: number, op: RtlInstr["op"]): number
 {
     switch(op)
     {
@@ -205,178 +69,201 @@ function evalUnary(V: number, op: ResolvedInstr["op"]): number
         case "NOT": return (~V) >>> 0
         case "CLZ": return Math.clz32(V)
         case "REVBITS":
-            {
-                let x = V
-                x = ((x & 0x55555555) << 1) | ((x >>> 1) & 0x55555555)
-                x = ((x & 0x33333333) << 2) | ((x >>> 2) & 0x33333333)
-                x = ((x & 0x0F0F0F0F) << 4) | ((x >>> 4) & 0x0F0F0F0F)
-                x = ((x & 0x00FF00FF) << 8) | ((x >>> 8) & 0x00FF00FF)
-                return ((x << 16) | (x >>> 16)) >>> 0
-            }
+        {
+            let x = V
+            x = ((x & 0x55555555) << 1) | ((x >>> 1) & 0x55555555)
+            x = ((x & 0x33333333) << 2) | ((x >>> 2) & 0x33333333)
+            x = ((x & 0x0F0F0F0F) << 4) | ((x >>> 4) & 0x0F0F0F0F)
+            x = ((x & 0x00FF00FF) << 8) | ((x >>> 8) & 0x00FF00FF)
+            return ((x << 16) | (x >>> 16)) >>> 0
+        }
         default: return 0
     }
 }
 
-function step(vm: VmState): boolean
+// ── Skipping over not-taken blocks ──────────────────────────────────────────
+//
+// A "block" is one BR_TABLE case-body or one LOOP sub-block: a run of
+// instructions ending at its own BLOCK_END or terminator. Skipping a nested
+// BR_TABLE/LOOP requires skipping *all* of its own sub-blocks first — a flat
+// nesting counter gets this wrong for a BR_TABLE with more than one case, so
+// this is real (if shallow) recursive descent, mirroring the grammar
+// directly: "skip a construct" = skip its N case-blocks or its 2 loop
+// sub-blocks; "skip a block" = advance until a BLOCK_END/terminator at this
+// level, skipping any nested construct whole along the way.
+
+function skipConstruct(body: RtlInstr[], pc: number): number
 {
-    if(vm.pc >= vm.body.length) 
+    const opener = body[pc]
+    if(opener.op === "BR_TABLE") return skipBlocks(body, pc + 1, opener.imm)
+    return skipBlocks(body, pc + 1, 2) // LOOP: condition block + body block
+}
+
+/** Skip over `count` sibling blocks starting at `pc`; return the pc just
+ *  past the last one. `count === 0` is a no-op (already past the last). */
+function skipBlocks(body: RtlInstr[], pc: number, count: number): number
+{
+    let p = pc
+    for(let k = 0; k < count; k++)
     {
-        vm.trapCode = -1; return false
+        for(;;)
+        {
+            if(p >= body.length) throw new Error(`ran off the end of the procedure body while skipping`)
+            const i = body[p]
+            if(i.op === "BR_TABLE" || i.op === "LOOP") { p = skipConstruct(body, p); continue }
+            p++
+            if(i.op === "BLOCK_END" || i.op === "RETURN" || i.op === "TRAP") break
+        }
+    }
+    return p
+}
+
+// ── The control stack ───────────────────────────────────────────────────────
+//
+// What BLOCK_END does depends on what's on top: closing a BR_TABLE case
+// falls through past the remaining sibling cases; closing a LOOP's
+// condition block either exits (skip the body block) or enters it;
+// closing a LOOP's body block is an unconditional back-edge to the opener.
+
+type BlockFrame =
+    | {kind: "case"; remaining: number}
+    | {kind: "loopCond"; loopPc: number}
+    | {kind: "loopBody"; loopPc: number}
+
+/** Run one procedure to completion. All VM state is local to this call —
+ *  a nested CALL would just be a nested call to this function. */
+function runProc(proc: RtlProc, args: readonly number[]): {acc: number; steps: number}
+{
+    const body = proc.body
+    const regs: number[] = [...args]
+    let tos = args.length
+    let acc = 0
+    let pc = 0
+    let steps = 0
+    const ctrl: BlockFrame[] = []
+
+    function operand(i: RtlInstr): number
+    {
+        if(!("combo" in i)) return 0
+        switch(i.combo)
+        {
+            case "REG_ACC":
+            case "REG_REG":
+                return regs[i.target] ?? 0
+            case "IMM_ACC":
+                return i.imm
+            case "PEEK_ACC":
+            case "PEEK_PEEK":
+            case "PEEK_PUSH":
+                assert.ok(tos > 0, `peek/pop with empty stack`)
+                return regs[tos - 1] ?? 0
+            case "POP_ACC":
+                assert.ok(tos > 0, `pop with empty stack`)
+                return regs[--tos] ?? 0
+        }
     }
 
-    const i = vm.body[vm.pc]
-
-    if(MAX_STEPS < ++vm.stepCount)
+    function writeResult(i: RtlInstr, value: number): void
     {
-        vm.trapCode = -2
-        return false
+        const v = value >>> 0
+        if(!("combo" in i)) { acc = v; return }
+        switch(i.combo)
+        {
+            case "REG_ACC": case "IMM_ACC": case "POP_ACC": case "PEEK_ACC":
+                acc = v; break
+            case "REG_REG":
+                regs[i.target] = v; break
+            case "PEEK_PEEK":
+                regs[tos - 1] = v; break
+            case "PEEK_PUSH":
+                regs[tos++] = v; break
+        }
     }
 
-    switch(i.op)
+    for(;;)
     {
-        case "MOVE": {
-            const rd = i.combo === "REG_ACC" || i.combo === "IMM_ACC" || i.combo === "PEEK_ACC" || i.combo === "POP_ACC"
-            wRes(vm, i, rd ? oVal(vm, i) : vm.acc)
-            vm.pc++
-            return true
-        }
-        case "ADD":
-        case "SUB":
-        case "RSUB":
-        case "MUL":
-        case "AND":
-        case "OR":
-        case "XOR":
-        case "SHL":
-        case "SHR":
-        case "ASR":
-        case "EQ":
-        case "NE":
-        case "LT_S":
-        case "LE_S":
-        case "GT_S":
-        case "GE_S":
-        case "LT_U":
-        case "LE_U":
-        case "GT_U":
-        case "GE_U": {
-            wRes(vm, i, evalBinary(vm.acc, oVal(vm, i), i.op))
-            vm.pc++
-            return true
-        }
-        case "NEG":
-            vm.acc = evalUnary(vm.acc, i.op)
-            vm.pc++
-            return true
-        case "NOT":
-            vm.acc = evalUnary(vm.acc, i.op)
-            vm.pc++
-            return true
-        case "CLZ":
-            vm.acc = evalUnary(vm.acc, i.op)
-            vm.pc++
-            return true
-        case "REVBITS":
-            vm.acc = evalUnary(vm.acc, i.op)
-            vm.pc++
-            return true
-        case "RETURN":
-            if(vm.callStack.length === 0)
-            {
-                vm.halted = true
-                return false
+        if(++steps > MAX_STEPS) throw new Error(`exceeded ${MAX_STEPS} steps — likely an infinite loop`)
+        if(pc >= body.length) throw new Error(`fell off the end of the procedure body with no RETURN`)
+
+        const i = body[pc]
+
+        switch(i.op)
+        {
+            case "MOVE": {
+                const reads = i.combo === "REG_ACC" || i.combo === "IMM_ACC"
+                    || i.combo === "PEEK_ACC" || i.combo === "POP_ACC"
+                writeResult(i, reads ? operand(i) : acc)
+                pc++
+                break
+            }
+            case "ADD": case "SUB": case "RSUB": case "MUL":
+            case "AND": case "OR": case "XOR": case "SHL": case "SHR": case "ASR":
+            case "EQ": case "NE":
+            case "LT_S": case "LE_S": case "GT_S": case "GE_S":
+            case "LT_U": case "LE_U": case "GT_U": case "GE_U":
+                writeResult(i, evalBinary(acc, operand(i), i.op))
+                pc++
+                break
+
+            case "NEG": case "NOT": case "CLZ": case "REVBITS":
+                acc = evalUnary(acc, i.op)
+                pc++
+                break
+
+            case "RETURN":
+                return {acc, steps}
+
+            case "TRAP":
+                throw new Trap(i.imm, steps)
+
+            case "BR_TABLE": {
+                const N = i.imm
+                if(acc >= N) { pc = skipBlocks(body, pc + 1, N); break } // implicit default
+                pc = skipBlocks(body, pc + 1, acc) // skip cases before the selected one
+                ctrl.push({kind: "case", remaining: N - acc - 1})
+                break
             }
 
-            const f = vm.callStack.pop()!
-            vm.pc = f.retPc
-            vm.tos = f.savedTos
-            vm.regs = f.savedRegs
-            vm.body = vm.prog.procedures[f.retProc].body
-            vm.jumps = buildBlockMap(vm.body)
-            return true
+            case "LOOP":
+                ctrl.push({kind: "loopCond", loopPc: pc})
+                pc++
+                break
 
-        case "TRAP": vm.trapCode = i.imm
-            return false
-        case "LOOP":
-            if(vm.acc === 0) 
-            {
-                vm.pc = vm.jumps.loopEnds.get(vm.pc)! + 1
-                return true
-            } vm.pc++
+            case "BLOCK_END": {
+                const top = ctrl.pop()
+                if(!top) throw new Error(`BLOCK_END at ${pc}: no open block`)
 
-            return true
-        case "BLOCK_END": {
-            const o = vm.jumps.blockOwners.get(vm.pc)
-            if(!o)
-            {
-                vm.trapCode = -5
-                return false
-            }
-            if(o.kind === "loop")
-            {
-                vm.pc = o.openerPc
-                return true
-            }
-            const ep = vm.jumps.brEnds.get(o.openerPc)
-            if(ep === undefined) 
-            {
-                vm.trapCode = -10
-                return false
-            }
-            vm.pc = ep
-            return true
-        }
-        case "BR_TABLE": {
-            const N = i.imm
-            const ep = vm.jumps.brEnds.get(vm.pc)
-            if(ep === undefined) 
-            {
-                vm.trapCode = -6
-                return false
-            }
-
-            if(vm.acc >= N)
-            {
-                vm.pc = ep; return true
-            }
-
-            let t = vm.pc + 1, nd = 0, ix = 0
-
-            while(t < vm.body.length && ix < vm.acc) 
-            {
-                const bi = vm.body[t]
-                if(bi.op === "LOOP" || bi.op === "BR_TABLE") nd++
-                else if(bi.op === "BLOCK_END")
+                if(top.kind === "case")
                 {
-                    if(nd === 0)
-                        ix++
-                    else
-                        nd--
+                    pc = skipBlocks(body, pc + 1, top.remaining) // past any sibling cases
+                    break
                 }
-                else if(bi.op === "RETURN" || bi.op === "TRAP")
+                if(top.kind === "loopCond")
                 {
-                    if(nd === 0) ix++
-                } t++
+                    if(acc === 0) { pc = skipBlocks(body, pc + 1, 1); break } // exit: skip the body block
+                    ctrl.push({kind: "loopBody", loopPc: top.loopPc})
+                    pc++
+                    break
+                }
+                // loopBody: unconditional back-edge to the opener, which
+                // re-enters the condition block.
+                pc = top.loopPc
+                break
             }
 
-            vm.pc = t
-            return true
+            case "CALL":
+                // `i.callee` is a procedure name — there is no name →
+                // procedure resolution step yet, so a real recursive call
+                // can't be made here. Follow-up work, not this rewrite.
+                throw new Error(`CALL not implemented yet (needs procedure resolution)`)
+
+            default:
+                throw new Error(`unhandled opcode ${(i as {op: string}).op} at pc ${pc}`)
         }
-        case "CALL": {
-            // `i.callee` is a procedure *name* (RtlInstr, rtl.ts), and there
-            // is no name→index resolution step yet (see file-level note
-            // above) — trap rather than comparing a string against
-            // `procedures.length` as if it were an already-resolved index.
-            vm.trapCode = -8
-            return false
-        }
-        default:
-            vm.trapCode = -3
-            return false
     }
 }
 
-export interface VmResult 
+export interface VmResult
 {
     acc: number
     ok: boolean
@@ -384,28 +271,18 @@ export interface VmResult
     steps: number
 }
 
-export function run(prog: ResolvedProgram): VmResult
+export function run(prog: RtlProgram): VmResult
 {
-    if(prog.procedures.length === 0) 
+    if(prog.procedures.length === 0) throw new Error(`empty program`)
+
+    try
     {
-        return {acc: 0, ok: false, trapCode: -9, steps: 0}
+        const {acc, steps} = runProc(prog.procedures[0], [])
+        return {acc, ok: true, trapCode: null, steps}
     }
-
-    const e = prog.procedures[0]
-    const vm = new VmState()
-
-    vm.prog = prog
-    vm.body = e.body
-    vm.jumps = buildBlockMap(vm.body)
-
-    // Locals are no longer pre-sized: single-pass allocation (lower.ts)
-    // pushes each local's initializer onto TOS as its declaration executes,
-    // growing the register file lazily via `ensureRegs` — there is no
-    // upfront local count to reserve.
-    vm.ensureRegs(e.argCount)
-    vm.tos = e.argCount
-
-    while(step(vm)) {}
-
-    return {acc: vm.acc, ok: vm.halted, trapCode: vm.trapCode, steps: vm.stepCount}
+    catch(e)
+    {
+        if(e instanceof Trap) return {acc: 0, ok: false, trapCode: e.code, steps: e.steps}
+        throw e
+    }
 }
