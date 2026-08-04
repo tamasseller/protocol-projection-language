@@ -23,6 +23,7 @@ import {
     isRtlNode,
     RtlNode,
 } from "./east"
+import { outputHas } from "./rtl"
 import type { OutputLocation } from "./rtl"
 
 // 1. Pattern interfaces
@@ -164,7 +165,7 @@ export function matchEast<P extends EastPattern>(
         case "Rtl":
             if (!isRtlNode(N)) return undefined
             // Output is always an array; demand check is `.includes` uniformly.
-            if (P.output !== undefined && !N.output.includes(P.output)) return undefined
+            if (P.output !== undefined && !outputHas(N.output, P.output)) return undefined
             return { kind: "Rtl", node: N } as MatchOf<P>
 
         case "Binary":

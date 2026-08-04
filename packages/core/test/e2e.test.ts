@@ -287,3 +287,201 @@ describe("Complex expressions", () =>
         `, 18) // (3 + 6) * 2 = 18
     })
 })
+
+describe("Unary operators", () =>
+{
+    // Rule-coverage note: unary:-/unary:~ have no competing rule (there's
+    // only ever one tiling for a bare UnaryExpression), so these just need
+    // to appear as the root of a returned expression to win via lowerExpr
+    // — see test/rule-coverage.test.ts.
+
+    test("negation", () =>
+    {
+        assertReturn(`
+            u32 x = 5;
+            return -x;
+        `, -5)
+    })
+
+    test("bitwise not", () =>
+    {
+        assertReturn(`
+            u32 x = 5;
+            return ~x;
+        `, ~5)
+    })
+})
+
+describe("Stack-bridging compound expressions", () =>
+{
+    // Rule-coverage note: whenever *both* operands of a binary op are
+    // themselves complex sub-expressions (not a bare identifier/literal),
+    // no register/immediate two-level pattern can consume them directly —
+    // the only viable tiling bridges through the stack (stackOperandRules'
+    // PEEK_ACC/PEEK_PEEK/POP_ACC/PEEK_PUSH combos, rules.ts). These put
+    // that path through lowerExpr's actual winner selection (not just
+    // tileExpr's candidate search — see test/rule-coverage.test.ts),
+    // across a few operator classes and both an acc-demand (`return`) and
+    // a tos-demand (declaration initializer) context, since only one of
+    // {PEEK_ACC, POP_ACC} survives an acc demand and only one of
+    // {PEEK_PEEK, PEEK_PUSH} survives a tos demand (isa-core.md §6.2).
+
+    test("add: both sides complex, acc demand", () =>
+    {
+        assertReturn(`
+            u32 a = 1;
+            u32 b = 2;
+            u32 c = 3;
+            u32 d = 4;
+            return (a + b) + (c + d);
+        `, 10)
+    })
+
+    test("add: both sides complex, tos demand (via declaration)", () =>
+    {
+        assertReturn(`
+            u32 a = 1;
+            u32 b = 2;
+            u32 c = 3;
+            u32 d = 4;
+            u32 r = (a + b) + (c + d);
+            return r;
+        `, 10)
+    })
+
+    test("sub (paired/RSUB): both sides complex, acc demand", () =>
+    {
+        assertReturn(`
+            u32 a = 10;
+            u32 b = 2;
+            u32 c = 3;
+            u32 d = 1;
+            return (a - b) - (c - d);
+        `, 6)
+    })
+
+    test("sub (paired/RSUB): both sides complex, tos demand", () =>
+    {
+        assertReturn(`
+            u32 a = 10;
+            u32 b = 2;
+            u32 c = 3;
+            u32 d = 1;
+            u32 r = (a - b) - (c - d);
+            return r;
+        `, 6)
+    })
+
+    test("mul: both sides complex, acc demand", () =>
+    {
+        assertReturn(`
+            u32 a = 1;
+            u32 b = 2;
+            u32 c = 3;
+            u32 d = 4;
+            return (a + b) * (c + d);
+        `, 21)
+    })
+
+    test("mul: both sides complex, tos demand", () =>
+    {
+        assertReturn(`
+            u32 a = 1;
+            u32 b = 2;
+            u32 c = 3;
+            u32 d = 4;
+            u32 r = (a + b) * (c + d);
+            return r;
+        `, 21)
+    })
+
+    // Deliberately not 0xF0|0x0F=0xFF for (a|b): that's AND's identity
+    // element, so the final result would always equal the (c^d)
+    // intermediate regardless of whether the compiler reads the correct
+    // final slot or a stale one below it — exactly the bug these tests
+    // exist to catch (see the tosDelta note above the describe block).
+    test("bitwise: both sides complex, acc demand", () =>
+    {
+        assertReturn(`
+            u32 a = 0x0F;
+            u32 b = 0x30;
+            u32 c = 0xFF;
+            u32 d = 0x00;
+            return (a | b) & (c ^ d);
+        `, 0x3F)
+    })
+
+    test("bitwise: both sides complex, tos demand", () =>
+    {
+        assertReturn(`
+            u32 a = 0x0F;
+            u32 b = 0x30;
+            u32 c = 0xFF;
+            u32 d = 0x00;
+            u32 r = (a | b) & (c ^ d);
+            return r;
+        `, 0x3F)
+    })
+
+    test("comparison: both sides complex, acc demand", () =>
+    {
+        assertReturn(`
+            u32 a = 1;
+            u32 b = 2;
+            u32 c = 3;
+            u32 d = 4;
+            return (a + b) < (c * d);
+        `, 1)
+    })
+
+    test("comparison: both sides complex, tos demand", () =>
+    {
+        assertReturn(`
+            u32 a = 1;
+            u32 b = 2;
+            u32 c = 3;
+            u32 d = 4;
+            u32 r = (a + b) < (c * d);
+            return r;
+        `, 1)
+    })
+
+    test("shift: both sides complex, acc demand", () =>
+    {
+        assertReturn(`
+            u32 a = 1;
+            u32 b = 2;
+            u32 c = 3;
+            u32 d = 1;
+            return (a << b) >> (c - d);
+        `, 1)
+    })
+
+    test("shift: both sides complex, tos demand", () =>
+    {
+        assertReturn(`
+            u32 a = 1;
+            u32 b = 2;
+            u32 c = 3;
+            u32 d = 1;
+            u32 r = (a << b) >> (c - d);
+            return r;
+        `, 1)
+    })
+})
+
+describe("Rule-coverage gap fill: identifier:tos", () =>
+{
+    // identifier:tos (a bare identifier used where the ISA demands a tos
+    // output — e.g. a declaration initializer) never showed up in any
+    // existing e2e case; all decl initializers were literals or compound
+    // expressions.
+    test("declare from a bare identifier", () =>
+    {
+        assertReturn(`
+            u32 x = 5;
+            u32 y = x;
+            return y;
+        `, 5)
+    })
+})

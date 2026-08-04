@@ -441,13 +441,81 @@ identity) enable both memoization and copy-on-write wandering trees.
 - **Memoization trigger**: when does the naive worklist become too slow?
   Measure on representative codec bodies; add the
   `(subtree, demanded_output) → tiling_set` cache only if needed.
-- **Deduplication**: equivalent tilings (e.g., the two operand-swaps of a
-  commutative op) should be structurally hashed. Deferred to after the
-  prototype is correct; immutable EAST nodes make this a bolt-on.
+- **Deduplication** (partially implemented): `tileExpr`'s worklist
+  (`orchestrator.ts`) now hashes each partially-tiled tree structurally
+  (`hashTree`) and skips re-pushing a tree already reached via a different
+  rewrite order — turns tree search into graph search, since independent
+  sites can be tiled in either order and previously each order re-explored
+  its own copy of the remaining work. This fixed the specific timeout
+  observed on a 4-leaf balanced sum (`(a+b)+(c+d)`, `"tos"` demand): >120s
+  before, ~24ms after. It is **not** a full fix — the state-space size
+  itself (product of per-site output-variant counts) still grows with tree
+  width regardless of ordering-duplicate removal: measured ~512ms at 6
+  leaves, ~22.5s at 8 leaves, and 10 leaves did not finish in 120s. The
+  `(subtree, demanded_output) → tiling_set` memoization described below is
+  still needed for wider expressions; the hash-dedup work already provides
+  the structural-hashing infrastructure that memoization would reuse for its
+  cache key.
+- **Known bug — `tosDelta === 1` is not a true invariant for wide trees**
+  (found while measuring the dedup fix above, not yet fixed): `lowerVarDecl`
+  (`lower.ts`) asserts that a `"tos"`-demand winning tiling always nets
+  exactly one push, on the empirically-observed basis that every stack-combo
+  rule offers a net-neutral write-back alternative (`PEEK_PEEK`/`POP_ACC`)
+  alongside the wasteful RPN one (`PEEK_PUSH`, isa-core.md §6.3 combo 6), and
+  the cost model prefers the neutral one. That holds for every shape tested
+  up through 7 leaves, but **breaks at 8**: lowering a balanced sum of 8
+  identifiers (`((a+b)+(c+d))+((e+f)+(g+h))`) against a `"tos"` demand
+  produces a winner with `tosDelta === 2`, ending in
+  `ADD [tos-1] → [tos++]` (`PEEK_PUSH`) instead of `POP_ACC` +
+  write-back-in-place. Repro (paste into a throwaway `.ts` and run with
+  `ts-node` from `packages/core/`):
+  ```ts
+  import { lowerExpr } from "./src/machine/orchestrator"
+  import { DEFAULT_RULESET } from "./src/machine/rules"
+  // balanced binary "+" tree over identifiers v0..v7, e.g. via a small
+  // recursive helper building EastBinary/Identifier nodes — see chat history
+  // for the exact helper used. lowerExpr(tree, DEFAULT_RULESET, "tos").tosDelta === 2
+  ```
+  This is a real correctness/completeness gap, not a search artifact: dedup
+  cannot have caused it (pruning duplicate *paths* to an already-reached
+  state never removes a reachable *state*, and the observed instruction
+  sequence is legal, just suboptimal). The likely cause is that combining two
+  children that are *both* already independently tiled to `"tos"` (each
+  contributing one pushed slot) has no competitive rule producing
+  `pop-top-into-acc, then write-back-into-new-top` (net `tosDelta = -1 + 0`
+  relative to the two pushes) — only the RPN `PEEK_PUSH` finisher
+  (`tosDelta = +1`) gets constructed for that combination, so it wins by
+  default despite being worse. Needs a new/fixed rule (or cost-model
+  adjustment) for the "both operands already stack-resident" case. Until
+  fixed, the `assert.equal(node.tosDelta, 1, ...)` in `lowerVarDecl` **will
+  throw on real DSL source** containing a sufficiently wide expression in a
+  `let` initializer (empirically, 8+ leaves in a balanced binary-op tree;
+  narrower or more skewed trees may have a different threshold — not yet
+  characterized). The "Peek-addressed last-declared local" optimization idea
+  below is built on this same invariant and is unsound as stated until this
+  is fixed.
 - **Common-subexpression elimination**: not in scope for v1, but the
   multi-location assignment output (`{acc, reg(y)}`) interacts with it — a
   value already in a register can be the operand of multiple consumers
   without re-evaluation.
+- **Peek-addressed last-declared local** (optimization opportunity, not yet
+  implemented): a `let` declaration's initializer, when lowered against a
+  `"tos"` demand, always nets exactly `tosDelta === 1` (enforced as an
+  assertion in `lowerVarDecl` — see the tiling-invariant comment there). That
+  means the just-declared local always ends up sitting at register index
+  `alloc.next - 1`, i.e. exactly one slot below TOS *at the point evaluation
+  of the next expression begins*. If that local is referenced before any
+  further declaration in the same scope, it could be addressed via
+  `PEEK_ACC`/`PEEK_PEEK` (relative to the running `tosDelta` tracked through
+  `nodeInvariants` during that expression's lowering) instead of resolving an
+  absolute register number — reusing existing accounting rather than adding a
+  new one. The one piece of bookkeeping this needs that expression lowering
+  doesn't otherwise carry is the frame-absolute base to translate a relative
+  peek back to a concrete register (`alloc.next` at the call site) — already
+  available wherever `lowerExpr` is invoked from `lower.ts`, so no new
+  plumbing through the tiling search itself. Narrow win: only applies to the
+  single most-recently-declared local, only before the next declaration
+  shadows it by pushing another slot on top.
 
 ### From the integration layer
 

@@ -10,7 +10,7 @@
  *   3. Expression sub-trees lowered via lowerExpr + register resolution.
  */
 
-import {lowerExpr} from "./orchestrator"
+import {lowerExpr, lowerStatementExpr} from "./orchestrator"
 import type {EastExpression} from "./east"
 import type {
     Statement, ControlBody, IfStatement, WhileStatement,
@@ -66,9 +66,9 @@ class RegAlloc
         return this._parent?.resolve(name)
     }
 
-    rules(reg?: number): Rule[]
+    rules(): Rule[]
     {
-        return ruleset(name => this.resolve(name) ?? (() => {throw new Error(`Unresolved variable: ${name}`)})(), reg)
+        return ruleset(name => this.resolve(name) ?? (() => {throw new Error(`Unresolved variable: ${name}`)})())
     }
 }
 
@@ -142,22 +142,37 @@ function lowerControlBody(body: ControlBody, alloc: RegAlloc): RtlInstr[]
         : lowerStmt(body, alloc)
 }
 
-function lowerExprStmt(s: ExpressionStatement, alloc: RegAlloc): RtlInstr[] 
+function lowerExprStmt(s: ExpressionStatement, alloc: RegAlloc): RtlInstr[]
 {
-    const e = lowerExpr(s.expression as EastExpression, alloc.rules(), "acc")
+    // The statement's value is discarded, so demand "acc" specifically
+    // would be needlessly strict — it would exclude a cheaper tiling whose
+    // result lands directly in a register write-back (e.g. `x = x op e`,
+    // rules.ts). lowerStatementExpr allows any TOS-neutral output instead.
+    const e = lowerStatementExpr(s.expression as EastExpression, alloc.rules())
     assert.ok(e, `Failed to lower expression statement`)
 
     return e.fragment
 }
 
-function lowerVarDecl(s: VariableDeclaration, alloc: RegAlloc): RtlInstr[] 
+function lowerVarDecl(s: VariableDeclaration, alloc: RegAlloc): RtlInstr[]
 {
     return s.declarations.map(d =>
     {
         const node = lowerExpr(d.init as EastExpression, alloc.rules(), "tos")
-        alloc.alloc(d.id.name)
-
         assert.ok(node, `Failed to lower variable initializer for ${d.id.name}`)
+
+        // A "tos"-demand tiling's cheapest winner always nets exactly one
+        // push: every stack-combining rule offers a net-neutral write-back
+        // combo (PEEK_PEEK/POP_ACC) alongside the RPN one that doesn't
+        // reclaim its operand (PEEK_PUSH, isa-core.md §6.3 combo 6), the
+        // neutral ones are never pricier in bytes, and nodeInvariants'
+        // maxStack now correctly makes the cost model prefer them
+        // (builders.ts). A different value here means that invariant broke
+        // somewhere — a real lowerer bug, not a shape to accommodate.
+        assert.equal(node.tosDelta, 1,
+            `"tos"-demand initializer for ${d.id.name} nets tosDelta=${node.tosDelta}, expected exactly 1 — ` +
+            `the winning tiling should always be a single net push; this indicates a lowerer bug, not a case to handle`)
+        alloc.alloc(d.id.name)
 
         return node.fragment
     }).flat()
@@ -328,7 +343,16 @@ function lowerFor(s: ForStatement, alloc: RegAlloc): RtlInstr[]
             : lowerExprStmt({type: "ExpressionStatement", expression: s.init}, alloc)
         : []
 
-    const test = s.test ? lowerExprStmt({type: "ExpressionStatement", expression: s.test}, alloc) : []
+    // Unlike init/update (discarded), the condition's value feeds the
+    // LOOP's condition-block test directly — it must land in acc, same as
+    // lowerWhile's test. Demanding acc specifically (not lowerExprStmt's
+    // relaxed "any TOS-neutral output") is required here, not optional.
+    const test = s.test ? (() =>
+    {
+        const node = lowerExpr(s.test as EastExpression, alloc.rules(), "acc")
+        assert.ok(node, `Failed to lower for-loop test expression`)
+        return node.fragment
+    })() : []
     const update = s.update ? lowerExprStmt({type: "ExpressionStatement", expression: s.update}, alloc) : []
 
     const body = lowerControlBody(s.body, new RegAlloc(alloc))

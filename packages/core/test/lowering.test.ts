@@ -644,4 +644,25 @@ describe("Root output demand (tileExpr with demand parameter)", () =>
         assert.ok(node.fragment.length <= 3,
             `expected ≤3 instrs for optimal acc tiling, got ${node.fragment.length}: ${node.fragment.map(format).join(", ")}`)
     })
+
+    // ── Winning-rule coverage: `call` and `identifier:tos` ──────────────────
+    //
+    // The real pipeline never lowers a CALL through the VM yet (vm.ts's
+    // CALL case is a deliberate stub — see its file header), so there's no
+    // e2e-executable way to make the `call` rule win. These call
+    // `lowerExpr` directly instead, exactly like the acc-demand smoke test
+    // above, just to put `call` and `identifier:tos` through the rule that
+    // `lowerExpr` actually *selects* (test/rule-coverage.test.ts only
+    // counts winners, not mere tileExpr candidates — see "Call" above,
+    // which already covers these structurally via checkVariants/tileExpr
+    // but never calls lowerExpr).
+
+    test("lowerExpr on foo(x) selects the call rule (and identifier:tos for the arg)", () =>
+    {
+        const { lowerExpr } = require("../src/machine/orchestrator") as typeof import("../src/machine/orchestrator")
+        const expr = exprOf("return foo(x);")
+        const node = lowerExpr(expr, DEFAULT_RULESET, "acc")
+        assert.ok(node, "must find a call lowering")
+        assert.deepStrictEqual(node.fragment.map(format), ["LOAD x", "PUSH", "CALL foo"])
+    })
 })

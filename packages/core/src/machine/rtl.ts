@@ -19,6 +19,22 @@
 
 export type OutputLocation = "acc" | "tos" | {"reg": number}
 
+/**
+ * Structural membership test for an `OutputLocation[]` array. Needed
+ * because the `{reg: N}` case is an object — plain `Array.includes` is
+ * reference equality, which two independently-constructed `{reg: N}`
+ * literals (the common case: one built when a node was tiled, another
+ * built later when checking a demand against it) will never satisfy even
+ * when `N` matches. `"acc"`/`"tos"` are plain strings, so `===` (and hence
+ * `includes`) already works correctly for them.
+ */
+export function outputHas(output: readonly OutputLocation[], want: OutputLocation): boolean
+{
+    if(typeof want === "object")
+        return output.some(loc => typeof loc === "object" && loc.reg === want.reg)
+    return output.includes(want)
+}
+
 export type Resource = "acc" | "tos"
 
 /** Register addressing combos — carry a `target` register name. */
@@ -143,6 +159,13 @@ export const CONST = (imm: number): RtlInstr =>
 /** `acc = acc ⟨op⟩ rN` — binary op with register operand, result → acc. */
 export const opReg = (op: BinaryOpcode, target: number): RtlInstr =>
     ({ op, combo: "REG_ACC", target })
+
+/** `rN = acc ⟨op⟩ rN` — binary op with register operand, write-back to that
+ *  same register (ISA combo 2). The single-instruction form of "compute
+ *  into a register and store back into it" — e.g. `x += 1` reformulated as
+ *  `1 + x` (commutative) folds to `MOVE #1; ADD x → x`, no separate STORE. */
+export const opRegWriteback = (op: BinaryOpcode, target: number): RtlInstr =>
+    ({ op, combo: "REG_REG", target })
 
 /** `acc = acc ⟨op⟩ #imm` — binary op with immediate operand, result → acc. */
 export const opImm = (op: BinaryOpcode, imm: number): RtlInstr =>
