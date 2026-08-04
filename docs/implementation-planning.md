@@ -479,21 +479,44 @@ identity) enable both memoization and copy-on-write wandering trees.
   This is a real correctness/completeness gap, not a search artifact: dedup
   cannot have caused it (pruning duplicate *paths* to an already-reached
   state never removes a reachable *state*, and the observed instruction
-  sequence is legal, just suboptimal). The likely cause is that combining two
-  children that are *both* already independently tiled to `"tos"` (each
-  contributing one pushed slot) has no competitive rule producing
-  `pop-top-into-acc, then write-back-into-new-top` (net `tosDelta = -1 + 0`
-  relative to the two pushes) — only the RPN `PEEK_PUSH` finisher
-  (`tosDelta = +1`) gets constructed for that combination, so it wins by
-  default despite being worse. Needs a new/fixed rule (or cost-model
-  adjustment) for the "both operands already stack-resident" case. Until
-  fixed, the `assert.equal(node.tosDelta, 1, ...)` in `lowerVarDecl` **will
-  throw on real DSL source** containing a sufficiently wide expression in a
-  `let` initializer (empirically, 8+ leaves in a balanced binary-op tree;
-  narrower or more skewed trees may have a different threshold — not yet
-  characterized). The "Peek-addressed last-declared local" optimization idea
-  below is built on this same invariant and is unsound as stated until this
-  is fixed.
+  sequence is legal, just suboptimal).
+
+  **Root cause, verified (not just hypothesized) by dumping every candidate
+  `tileExpr` produces for the 8-leaf shape**: the top-level combine here is
+  `(tos, acc)` — a completely ordinary, legitimate match (`stackOperandRules`
+  requires exactly one `"acc"`-output child and one `"tos"`-output child;
+  there is no pattern for two `"tos"` children at all — confirmed by reading
+  every rule's pattern in `rules.ts`, a `Binary(tos, tos)` tree is a genuine
+  dead end with zero matches and silently drops out of the worklist, which is
+  fine and by design). A `tosDelta === 1` candidate for the same site *does*
+  exist (same site, `PEEK_PEEK` combo instead of `PEEK_PUSH`), and it is
+  **exactly tied** with the winning `tosDelta === 2` candidate on every
+  criterion `pickCheapest` (`orchestrator.ts`) currently checks: same byte
+  cost, same fragment length, and — this is the non-obvious part — the *same*
+  `maxStack === 2`. That last tie is not a `nodeInvariants` bug: the
+  `"acc"`-side child here has its own internal scratch push (to combine its
+  own two leaves) that transiently stacks on top of the left half's
+  already-pushed value, so the true peak really is 2 for *both* candidates —
+  `maxStack` genuinely cannot distinguish them, because they don't actually
+  differ there. `pickCheapest`'s tie-break chain (bytes → fragment length →
+  maxStack) is exhausted in a real tie, so its `reduce` silently falls back
+  to whichever candidate the worklist happened to generate first — an
+  accident of worklist pop order, not a considered preference.
+
+  **Fix**: add net `tosDelta` itself as a further tie-break criterion in
+  `pickCheapest` (prefer lower net stack growth when bytes/length/maxStack
+  all tie) — lower `tosDelta` is strictly better all else equal, since it
+  leaves fewer permanently-unreclaimed register slots behind, and nothing
+  currently scores that. (An earlier version of this note guessed the cause
+  was a *missing* rule for combining two stack-resident operands — that
+  guess was wrong and has been corrected here: the rule exists and ties, it
+  isn't absent.) Until fixed, the `assert.equal(node.tosDelta, 1, ...)` in
+  `lowerVarDecl` **will throw on real DSL source** containing a sufficiently
+  wide expression in a `let` initializer (empirically, 8+ leaves in a
+  balanced binary-op tree; narrower or more skewed trees may have a different
+  threshold — not yet characterized). The "Peek-addressed last-declared
+  local" optimization idea below is built on this same invariant and is
+  unsound as stated until this is fixed.
 - **Common-subexpression elimination**: not in scope for v1, but the
   multi-location assignment output (`{acc, reg(y)}`) interacts with it — a
   value already in a register can be the operand of multiple consumers
