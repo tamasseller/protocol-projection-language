@@ -1,9 +1,10 @@
 /**
  * @ppl/core/machine — Expression tiling orchestrator (worklist-based)
  *
- * Bottom-up rewrite search following the design in
- * docs/implementation-planning.md. Maintains a worklist of partially-tiled
- * EAST trees; each iteration pops one, finds all rule matches at any node,
+ * Bottom-up rewrite search — see docs/ir-engine.md for why pattern-rewrite
+ * search is used instead of Sethi-Ullman. Maintains a worklist of
+ * partially-tiled EAST trees; each iteration pops one, finds all rule
+ * matches at any node,
  * rewrites one match site, and pushes the result. Fully-tiled trees (root
  * is an RtlNode) accumulate into the results set.
  *
@@ -163,8 +164,8 @@ function findMatches(root: EastExpression, rules: readonly Rule[]): FoundMatch[]
  * that reach the same combined tiling never share object references even
  * though they're the same state. Used by `tileExpr`'s worklist to turn tree
  * search (revisit the same reachable state once per path) into graph search
- * (visit each reachable state once) — see docs/implementation-planning.md,
- * "From the lowering strategy" for the analysis.
+ * (visit each reachable state once) — see docs/ir-engine.md, "Dedup is
+ * implemented; full memoization is not" for the analysis.
  *
  * `RtlNode` leaves are hashed by full content (`output`/`fragment`/
  * `clobbers`/`tosDelta`/`maxStack` are all JSON-safe plain data, no cycles),
