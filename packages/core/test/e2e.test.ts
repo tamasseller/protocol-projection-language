@@ -318,13 +318,13 @@ describe("Stack-bridging compound expressions", () =>
     // themselves complex sub-expressions (not a bare identifier/literal),
     // no register/immediate two-level pattern can consume them directly —
     // the only viable tiling bridges through the stack (stackOperandRules'
-    // PEEK_ACC/PEEK_PEEK/POP_ACC/PEEK_PUSH combos, rules.ts). These put
-    // that path through lowerExpr's actual winner selection (not just
-    // tileExpr's candidate search — see test/rule-coverage.test.ts),
-    // across a few operator classes and both an acc-demand (`return`) and
-    // a tos-demand (declaration initializer) context, since only one of
-    // {PEEK_ACC, POP_ACC} survives an acc demand and only one of
-    // {PEEK_PEEK, PEEK_PUSH} survives a tos demand (isa-core.md §6.2).
+    // PEEK_PEEK/POP_ACC combos, rules.ts). These put that path through
+    // lowerExpr's actual winner selection (not just tileExpr's candidate
+    // search — see test/rule-coverage.test.ts), across a few operator
+    // classes and both an acc-demand (`return`) and a tos-demand
+    // (declaration initializer) context, since POP_ACC is the sole
+    // acc-output stack combo and PEEK_PEEK the sole tos-output one
+    // (isa-core.md §4.1).
 
     test("add: both sides complex, acc demand", () =>
     {
@@ -347,6 +347,32 @@ describe("Stack-bridging compound expressions", () =>
             u32 r = (a + b) + (c + d);
             return r;
         `, 10)
+    })
+
+    // Regression: a `"tos"`-demand initializer wide enough (8+ leaves in a
+    // balanced tree) used to net tosDelta=2 instead of 1 — the winning
+    // combine's top-level `(tos, acc)` site tied on bytes/length/maxStack
+    // between PEEK_PEEK (net-neutral) and the now-removed PEEK_PUSH
+    // (net-positive), and the tie broke on worklist order rather than
+    // preference (see ir-engine.md, "Known gaps"). Removing PEEK_PUSH
+    // entirely (isa-core.md §4.1 keeps only 5 combos) makes PEEK_PEEK the
+    // sole tos-output combo at that site, so the tie can no longer arise.
+    // This declaration would have thrown lowerVarDecl's `tosDelta === 1`
+    // assertion before that fix; here it must lower and execute cleanly.
+    test("add: 8-leaf balanced tree, tos demand (wide-tree regression)", () =>
+    {
+        assertReturn(`
+            u32 v0 = 1;
+            u32 v1 = 2;
+            u32 v2 = 3;
+            u32 v3 = 4;
+            u32 v4 = 5;
+            u32 v5 = 6;
+            u32 v6 = 7;
+            u32 v7 = 8;
+            u32 sum = ((v0 + v1) + (v2 + v3)) + ((v4 + v5) + (v6 + v7));
+            return sum;
+        `, 36)
     })
 
     test("sub (paired/RSUB): both sides complex, acc demand", () =>

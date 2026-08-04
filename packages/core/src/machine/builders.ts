@@ -107,27 +107,18 @@ export function nodeInvariants(args: {
         + meta.tosDelta
         + (args.extraTosDelta ?? 0)
 
-    // maxStack: SU weight across the children, then the combo instruction's
-    // own contribution, then any extra beyond the combo itself.
+    // maxStack: SU weight across the children, then any extra beyond the
+    // combo itself. The combo's own tosDelta is never positive (every
+    // binary-class combo either writes back in place or pops — see
+    // ir-engine.md, "Every stack-read combo also reclaims its operand"),
+    // so it can only ever draw down from a peak the children already
+    // established, never raise one — no separate term needed for it here.
     let running = 0
     let maxStack = 0
     for (const c of children)
     {
         maxStack = Math.max(maxStack, running + c.maxStack)
         running += c.tosDelta
-    }
-    // The combo instruction's own tosDelta can itself reach a new peak —
-    // e.g. PEEK_PUSH's +1 (the RPN combo that intentionally doesn't pop its
-    // stack operand, isa-core.md §6.3 combo 6: "the old [tos-1] is now
-    // below the new top"). Without this, a PEEK_PUSH-ending node and a
-    // same-cost PEEK_PEEK-ending node (which writes back in place, no new
-    // peak) would misreport the same maxStack, and the cost-model's
-    // maxStack tiebreaker couldn't tell the wasteful one from the clean
-    // one. Only a positive combo delta can raise the peak; a pop only ever
-    // draws down from a high already counted via the children above.
-    if (meta.tosDelta > 0)
-    {
-        maxStack = Math.max(maxStack, running + meta.tosDelta)
     }
     running += meta.tosDelta
     if (args.extraMaxStack !== undefined)

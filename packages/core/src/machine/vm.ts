@@ -14,7 +14,7 @@
  * the shape is ready for it. `RETURN` and `TRAP` need no bookkeeping beyond
  * a plain `return`/`throw`: unwinding the JS call stack unwinds the control
  * stack with it, which is exactly the ISA's "a terminator closes its block
- * on its own" rule (isa-core.md §14.3/§14.4) for free.
+ * on its own" rule (isa-core.md §4.5, §7.2) for free.
  *
  * Designed as an oracle for testing — correctness and clarity over
  * performance. Malformed IR (a stray `BLOCK_END`, an unknown opcode) throws
@@ -152,10 +152,8 @@ function runProc(proc: RtlProc, args: readonly number[]): {acc: number; steps: n
                 return regs[i.target] ?? 0
             case "IMM_ACC":
                 return i.imm
-            case "PEEK_ACC":
             case "PEEK_PEEK":
-            case "PEEK_PUSH":
-                assert.ok(tos > 0, `peek/pop with empty stack`)
+                assert.ok(tos > 0, `peek with empty stack`)
                 return regs[tos - 1] ?? 0
             case "POP_ACC":
                 assert.ok(tos > 0, `pop with empty stack`)
@@ -169,14 +167,12 @@ function runProc(proc: RtlProc, args: readonly number[]): {acc: number; steps: n
         if(!("combo" in i)) { acc = v; return }
         switch(i.combo)
         {
-            case "REG_ACC": case "IMM_ACC": case "POP_ACC": case "PEEK_ACC":
+            case "REG_ACC": case "IMM_ACC": case "POP_ACC":
                 acc = v; break
             case "REG_REG":
                 regs[i.target] = v; break
             case "PEEK_PEEK":
                 regs[tos - 1] = v; break
-            case "PEEK_PUSH":
-                regs[tos++] = v; break
         }
     }
 
@@ -189,13 +185,32 @@ function runProc(proc: RtlProc, args: readonly number[]): {acc: number; steps: n
 
         switch(i.op)
         {
-            case "MOVE": {
-                const reads = i.combo === "REG_ACC" || i.combo === "IMM_ACC"
-                    || i.combo === "PEEK_ACC" || i.combo === "POP_ACC"
-                writeResult(i, reads ? operand(i) : acc)
+            case "LOAD":
+                acc = regs[i.target] ?? 0
                 pc++
                 break
-            }
+
+            case "STORE":
+                regs[i.target] = acc
+                pc++
+                break
+
+            case "PUSH":
+                regs[tos++] = acc
+                pc++
+                break
+
+            case "POP":
+                assert.ok(tos > 0, `POP with empty stack`)
+                acc = regs[--tos] ?? 0
+                pc++
+                break
+
+            case "CONST":
+                acc = i.imm >>> 0
+                pc++
+                break
+
             case "ADD": case "SUB": case "RSUB": case "MUL":
             case "AND": case "OR": case "XOR": case "SHL": case "SHR": case "ASR":
             case "EQ": case "NE":

@@ -162,13 +162,14 @@ function lowerVarDecl(s: VariableDeclaration, alloc: RegAlloc): RtlInstr[]
         assert.ok(node, `Failed to lower variable initializer for ${d.id.name}`)
 
         // A "tos"-demand tiling's cheapest winner always nets exactly one
-        // push: every stack-combining rule offers a net-neutral write-back
-        // combo (PEEK_PEEK/POP_ACC) alongside the RPN one that doesn't
-        // reclaim its operand (PEEK_PUSH, isa-core.md §6.3 combo 6), the
-        // neutral ones are never pricier in bytes, and nodeInvariants'
-        // maxStack now correctly makes the cost model prefer them
-        // (builders.ts). A different value here means that invariant broke
-        // somewhere — a real lowerer bug, not a shape to accommodate.
+        // push: every stack-combining rule only ever offers net-neutral
+        // combos (PEEK_PEEK/POP_ACC, isa-core.md §4.1) — there is no
+        // competing combo that nets positive by reading a stack operand
+        // without reclaiming it (ir-engine.md, "Every stack-read combo
+        // also reclaims its operand"), so nothing can ever outbid the
+        // single net push a "tos" demand needs. A different value here
+        // means that invariant broke somewhere — a real lowerer bug, not a
+        // shape to accommodate.
         assert.equal(node.tosDelta, 1,
             `"tos"-demand initializer for ${d.id.name} nets tosDelta=${node.tosDelta}, expected exactly 1 — ` +
             `the winning tiling should always be a single net push; this indicates a lowerer bug, not a case to handle`)

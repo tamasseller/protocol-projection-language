@@ -10,7 +10,8 @@
  * and stack-combo ops are distinct variants, so TS narrows `target`/`imm`
  * availability by construction.
  *
- * Naming and semantics match isa-core.md §6.3 (combos), §8–§10 (opcodes).
+ * Naming and semantics match isa-core.md §3 (addressing modes), §4
+ * (instruction reference).
  */
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -41,10 +42,15 @@ export type Resource = "acc" | "tos"
 export type RegCombo = "REG_ACC" | "REG_REG"
 /** Immediate combo — carries an `imm` literal. */
 export type ImmCombo = "IMM_ACC"
-/** Stack-operand combos — no extra field. */
-export type StackCombo = "PEEK_ACC" | "PEEK_PEEK" | "POP_ACC" | "PEEK_PUSH"
+/**
+ * Stack-operand combos — no extra field. Only the two that reclaim what
+ * they read: peek-and-write-back-in-place, and pop. There is deliberately
+ * no peek-without-reclaiming and no push-on-top-of-peek combo — see
+ * ir-engine.md, "Every stack-read combo also reclaims its operand".
+ */
+export type StackCombo = "PEEK_PEEK" | "POP_ACC"
 
-/** All seven valid combos per isa-core.md §6.3. */
+/** All five valid binary-class combos (isa-core.md §3, §4.1). */
 export type ComboName = RegCombo | ImmCombo | StackCombo
 
 export interface ComboMeta
@@ -58,10 +64,8 @@ export interface ComboMeta
 export const COMBO: Record<ComboName, ComboMeta> = {
     REG_ACC:   { clobbers: ["acc"],        tosDelta:  0},
     REG_REG:   { clobbers: ["acc"],        tosDelta:  0},
-    PEEK_ACC:  { clobbers: ["acc"],        tosDelta:  0},
     PEEK_PEEK: { clobbers: ["acc", "tos"], tosDelta:  0},
     POP_ACC:   { clobbers: ["acc"],        tosDelta: -1},
-    PEEK_PUSH: { clobbers: ["acc", "tos"], tosDelta:  1},
     IMM_ACC:   { clobbers: ["acc"],        tosDelta:  0},
 }
 
@@ -69,58 +73,82 @@ export const COMBO: Record<ComboName, ComboMeta> = {
 // Opcode unions
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Binary-form opcodes — all take a combo (ALU + comparison + identity MOVE). */
+/** Binary-form opcodes — all take a combo (arithmetic + comparison). `MOVE`
+ *  is not among them: data movement has its own dedicated move-class ops
+ *  below, not a combo-driven identity op (isa-core.md §4.4). */
 export type BinaryOpcode =
-    // ALU (§8.1)
+    // Arithmetic (§4.1)
     | "ADD" | "SUB" | "RSUB" | "MUL"
     | "AND" | "OR" | "XOR"
     | "SHL" | "SHR" | "ASR"
-    | "MOVE"
-    // Comparison (§9.1)
+    // Comparison (§4.2)
     | "EQ" | "NE"
     | "LT_S" | "LE_S" | "GT_S" | "GE_S"
     | "LT_U" | "LE_U" | "GT_U" | "GE_U"
 
-/** Unary ALU opcodes — operate on acc in place, no combo (§10.1). */
+/** Comparison opcodes — carried by the small-immediate (`#0`-only) form in
+ *  addition to the extended one (isa-core.md §4.2); arithmetic has no small
+ *  form at all (§4.1). Shared source of truth for the cost model
+ *  (`encoding.ts`) — kept here, not duplicated in the rule table. */
+export const COMPARISON_OPS: ReadonlySet<BinaryOpcode> = new Set([
+    "EQ", "NE", "LT_S", "LE_S", "GT_S", "GE_S", "LT_U", "LE_U", "GT_U", "GE_U",
+])
+
+/** Unary ALU opcodes — operate on acc in place, no combo (§4.3). */
 export type UnaryOpcode = "NEG" | "NOT" | "CLZ" | "REVBITS"
 
-/** No-operand control flow opcodes (§11). */
+/** No-operand control flow opcodes (§4.5). */
 export type ControlOpcode =
     | "RETURN"
     | "BLOCK_END"
     | "LOOP"
+
+/** Move-class opcodes with a register operand — unfused local access, no
+ *  ALU combining (§4.4). */
+export type MoveRegOpcode = "LOAD" | "STORE"
 
 // ─────────────────────────────────────────────────────────────────────────────
 // RtlInstr — discriminated union
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Four instruction shapes, distinguished by `op` range and field presence.
+ * Six instruction shapes, distinguished by `op` range and field presence.
  * The combo split makes `target`/`imm` *required when applicable* rather than
  * optional — TS enforces the combo→field correlation by construction.
  *
  * Consumer narrowing recipe:
- *   1. `"callee" in instr`            → CALL
+ *   1. `"callee" in instr`             → CALL
  *   2. `instr.op === "BR_TABLE"/"TRAP"` → parametric
- *   3. `!("combo" in instr)`           → bare unary/control
- *   4. else `"target" in instr`        → register-combo binary
- *   5. else `"imm" in instr`           → immediate-combo binary
- *   6. else                             → stack-combo binary
+ *   3. `"combo" in instr`               → binary (arithmetic/comparison);
+ *      sub-narrow by combo: `target` → register-combo, `imm` → IMM_ACC,
+ *      else → stack-combo
+ *   4. `instr.op === "LOAD"/"STORE"`    → move-register (`target`)
+ *   5. `instr.op === "CONST"`           → move-immediate (`imm`)
+ *   6. else                              → bare (unary / PUSH / POP / control)
  */
 export type RtlInstr =
-    // 1a. Register-combo binary: ALU/CMP/MOVE reading a register operand.
-    //     target is REQUIRED (it names the operand register).
+    // 1a. Register-combo binary: arithmetic/comparison reading a register
+    //     operand. target is REQUIRED (it names the operand register).
     | { op: BinaryOpcode; combo: RegCombo; target: number }
-    // 1b. Immediate-combo binary: ALU/CMP/MOVE with an inline literal.
-    //     imm is REQUIRED.
+    // 1b. Immediate-combo binary: arithmetic/comparison with a literal.
+    //     imm is REQUIRED. Always the extended form for arithmetic; for
+    //     comparison, small (#0) when imm===0, extended otherwise — a cost
+    //     distinction only (encoding.ts), not a type distinction.
     | { op: BinaryOpcode; combo: "IMM_ACC"; imm: number }
-    // 1c. Stack-combo binary: ALU/CMP/MOVE on TOS (peek/pop/push).
+    // 1c. Stack-combo binary: arithmetic/comparison on TOS (peek-writeback
+    //     or pop).
     | { op: BinaryOpcode; combo: StackCombo }
-    // 2. Bare: unary ALU (acc in place) + no-operand control flow.
-    | { op: UnaryOpcode | ControlOpcode }
-    // 3. Parametric: single numeric parameter (BR_TABLE case count, TRAP code).
+    // 2. Move-class, register operand: unfused local access.
+    | { op: MoveRegOpcode; target: number }
+    // 3. Move-class, immediate: constant load. Small (0..15) vs extended is
+    //    a cost distinction only (encoding.ts), not a type distinction.
+    | { op: "CONST"; imm: number }
+    // 4. Bare: unary ALU (acc in place), no-operand move (PUSH/POP), and
+    //    no-operand control flow.
+    | { op: UnaryOpcode | ControlOpcode | "PUSH" | "POP" }
+    // 5. Parametric: single numeric parameter (BR_TABLE case count, TRAP code).
     | { op: "BR_TABLE" | "TRAP"; imm: number }
-    // 4. Call: procedure invocation by name.
+    // 6. Call: procedure invocation by name.
     | { op: "CALL"; callee: string }
 
 
@@ -137,33 +165,36 @@ export const isImmComboInstr = (i: RtlInstr): i is Extract<RtlInstr, { combo: "I
     "combo" in i && i.combo === "IMM_ACC"
 
 export const isStackComboInstr = (i: RtlInstr): i is Extract<RtlInstr, { combo: StackCombo }> =>
-    "combo" in i && (i.combo === "PEEK_ACC" || i.combo === "PEEK_PEEK"
-                  || i.combo === "POP_ACC" || i.combo === "PEEK_PUSH")
+    "combo" in i && (i.combo === "PEEK_PEEK" || i.combo === "POP_ACC")
 
-/** `acc ← rN` — load register into accumulator. (MOVE + REG_ACC) */
+/** `acc ← rN` — load register into accumulator (unfused; §4.4). */
 export const LOAD = (target: number): RtlInstr =>
-    ({ op: "MOVE", combo: "REG_ACC", target })
+    ({ op: "LOAD", target })
 
-/** `rN ← acc` — store accumulator to register. (MOVE + REG_REG) */
+/** `rN ← acc` — store accumulator to register (unfused; §4.4). */
 export const STORE = (target: number): RtlInstr =>
-    ({ op: "MOVE", combo: "REG_REG", target })
+    ({ op: "STORE", target })
 
-/** `[tos++] ← acc` — push accumulator onto stack. (MOVE + PEEK_PUSH, ≡ DUP) */
+/** `[tos++] ← acc` — push accumulator onto stack. */
 export const PUSH = (): RtlInstr =>
-    ({ op: "MOVE", combo: "PEEK_PUSH" })
+    ({ op: "PUSH" })
 
-/** `acc ← #imm` — load constant into accumulator. (MOVE + IMM_ACC) */
+/** `acc ← [--tos]` — pop stack into accumulator. */
+export const POP = (): RtlInstr =>
+    ({ op: "POP" })
+
+/** `acc ← #imm` — load constant into accumulator. */
 export const CONST = (imm: number): RtlInstr =>
-    ({ op: "MOVE", combo: "IMM_ACC", imm })
+    ({ op: "CONST", imm })
 
 /** `acc = acc ⟨op⟩ rN` — binary op with register operand, result → acc. */
 export const opReg = (op: BinaryOpcode, target: number): RtlInstr =>
     ({ op, combo: "REG_ACC", target })
 
 /** `rN = acc ⟨op⟩ rN` — binary op with register operand, write-back to that
- *  same register (ISA combo 2). The single-instruction form of "compute
+ *  same register (combo 2, §3). The single-instruction form of "compute
  *  into a register and store back into it" — e.g. `x += 1` reformulated as
- *  `1 + x` (commutative) folds to `MOVE #1; ADD x → x`, no separate STORE. */
+ *  `1 + x` (commutative) folds to `CONST #1; ADD x → x`, no separate STORE. */
 export const opRegWriteback = (op: BinaryOpcode, target: number): RtlInstr =>
     ({ op, combo: "REG_REG", target })
 
@@ -171,12 +202,12 @@ export const opRegWriteback = (op: BinaryOpcode, target: number): RtlInstr =>
 export const opImm = (op: BinaryOpcode, imm: number): RtlInstr =>
     ({ op, combo: "IMM_ACC", imm })
 
-/** Stack-combo binary op (peek/pop/push variants). */
+/** Stack-combo binary op (peek-writeback or pop). */
 export const opStack = (op: BinaryOpcode, combo: StackCombo): RtlInstr =>
     ({ op, combo })
 
 /** Bare unary ALU (`NEG`, `NOT`, `CLZ`, `REVBITS`) or no-operand control flow
- *  (`RETURN`, `BLOCK_END`, `BREAK`, `CONTINUE`, `LOOP`). */
+ *  (`RETURN`, `BLOCK_END`, `LOOP`). */
 export const bare = (op: UnaryOpcode | ControlOpcode): RtlInstr =>
     ({ op })
 
@@ -207,49 +238,32 @@ export interface RtlProgram
 // ─────────────────────────────────────────────────────────────────────────────
 // Human-readable disassembly — `format(instr)`
 //
-// Produces the assembly-style notation used in isa-core.md Appendix A:
+// Produces the assembly-style notation used in isa-core.md's appendix:
 //
-//   LOAD r0            MOVE + REG_ACC
-//   STORE r0           MOVE + REG_REG
-//   PUSH               MOVE + PEEK_PUSH
-//   MOVE #5            MOVE + IMM_ACC (also: CONST(5))
+//   LOAD r0            move-class, register
+//   STORE r0           move-class, register
+//   PUSH / POP         move-class, bare
+//   CONST #5           move-class, immediate
 //   ADD r0             <op> + REG_ACC
 //   ADD r0 → r0        <op> + REG_REG (write-back)
 //   ADD #5             <op> + IMM_ACC
 //   ADD [--tos]        <op> + POP_ACC
-//   ADD [tos-1]        <op> + PEEK_ACC
 //   ADD [tos-1] → [tos-1]  <op> + PEEK_PEEK
-//   ADD [tos-1] → [tos++]  <op> + PEEK_PUSH (RPN)
 //   NEG / NOT / CLZ / REVBITS   bare unary
 //   RETURN / BLOCK_END / ...    bare control
 //   BR_TABLE 3                  parametric
 //   TRAP 0                      parametric
 //   CALL foo                    call
-//
-// MOVE is special-cased to the LOAD/STORE/PUSH/CONST mnemonics for the
-// common data-movement idioms; other MOVE combos render literally.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const STACK_OPERAND: Record<StackCombo, string> = {
-    PEEK_ACC:  "[tos-1]",
     PEEK_PEEK: "[tos-1]",
     POP_ACC:   "[--tos]",
-    PEEK_PUSH: "[tos-1]",
 }
 
 const STACK_RESULT: Partial<Record<StackCombo, string>> = {
     PEEK_PEEK: "[tos-1]",
-    PEEK_PUSH: "[tos++]",
 }
-
-const PER_OP_INLINE: Partial<Record<BinaryOpcode, number>> = {
-    ADD: 1, SUB: 1, SHL: 1, SHR: 1,
-    MOVE: 0,
-    AND: 0xFF, OR: 0x80, XOR: 0xFF,
-}
-
-export const isInlineLiteral = (op: BinaryOpcode, imm: number): boolean =>
-    PER_OP_INLINE[op] === imm
 
 /**
  * Render one instruction as a human-readable string. The output is stable
@@ -258,35 +272,27 @@ export const isInlineLiteral = (op: BinaryOpcode, imm: number): boolean =>
  */
 export function format(instr: RtlInstr): string
 {
-    // 4. CALL
+    // 6. CALL
     if (instr.op === "CALL")
         return `CALL ${instr.callee}`
 
-    // 3. Parametric: BR_TABLE / TRAP
+    // 5. Parametric: BR_TABLE / TRAP
     if (instr.op === "BR_TABLE")
         return `BR_TABLE ${instr.imm}`
     if (instr.op === "TRAP")
         return `TRAP ${instr.imm}`
 
-    // 2. Bare unary/control
-    if (!("combo" in instr))
+    // Move-class
+    if (instr.op === "LOAD" || instr.op === "STORE")
+        return `${instr.op} ${instr.target}`
+    if (instr.op === "CONST")
+        return `CONST #${instr.imm}`
+    if (instr.op === "PUSH" || instr.op === "POP")
         return instr.op
 
-    // 1. Binary-form. Special-case MOVE into the idiomatic names.
-    if (instr.op === "MOVE")
-    {
-        switch (instr.combo)
-        {
-            case "REG_ACC":   return `LOAD ${instr.target}`      // acc ← rN
-            case "REG_REG":   return `STORE ${instr.target}`     // rN ← acc
-            case "PEEK_PUSH": return `PUSH`                      // [tos++] ← acc
-            case "IMM_ACC":   return `MOVE #${instr.imm}`        // acc ← #imm
-            // PEEK_ACC / PEEK_PEEK / POP_ACC on MOVE are unusual; render literally.
-            case "PEEK_ACC":  return `MOVE ${STACK_OPERAND.PEEK_ACC}`
-            case "PEEK_PEEK": return `MOVE ${STACK_OPERAND.PEEK_PEEK} → ${STACK_RESULT.PEEK_PEEK}`
-            case "POP_ACC":   return `MOVE ${STACK_OPERAND.POP_ACC}`
-        }
-    }
+    // 4. Bare unary/control
+    if (!("combo" in instr))
+        return instr.op
 
     // 1a. Register-combo binary
     if (instr.combo === "REG_ACC")

@@ -54,12 +54,11 @@ export function rule<P extends EastPattern>(
 
 type OpClass = "strict" | "commutative" | "paired"
 /**
- * "alu" ops have a register write-back combo (ISA combo 2, §6.3); "cmp"
- * ops don't — comparisons are restricted to the four read-capable combos
- * only (§9.2: register/peek/pop/imm, all → acc, "there is no write-back
- * variant"). This gates regOperandRules' REG_REG variant below: without
- * it, a comparison would get an ISA-invalid "write the boolean back into
- * a register" instruction generated for it.
+ * "alu" ops have a register write-back combo (isa-core.md §3, combo 2);
+ * "cmp" ops don't — comparisons are restricted to four combos, all → acc,
+ * with no write-back variant at all (§4.2). This gates regOperandRules'
+ * REG_REG variant below: without it, a comparison would get an ISA-invalid
+ * "write the boolean back into a register" instruction generated for it.
  */
 interface OpEntry {ast: BinaryOperator; isa: BinaryOpcode; class: OpClass; kind: "alu" | "cmp"; swap?: BinaryOpcode}
 
@@ -131,17 +130,17 @@ function unaryRules(): Rule[]
  *
  * - REG_ACC: result → acc (the general case; always generated).
  * - REG_REG: result written back directly into the *operand identifier's
- *   own register* (ISA combo 2, "rN = acc OP rN") — not an arbitrary
+ *   own register* (combo 2, "rN = acc OP rN") — not an arbitrary
  *   externally-chosen target. This is what makes `x = x op e` (or its
  *   `x op= e` sugar) collapse to one instruction beyond the operand load:
  *   e.g. `x += 1` reformulated as the commutative `1 + x` folds to
- *   `MOVE #1; ADD x → x`, no separate STORE. assignmentRules (below)
+ *   `CONST #1; ADD x → x`, no separate STORE. assignmentRules (below)
  *   picks this variant up when it already targets its own assignment's
  *   register; every other consumer simply never demands `{reg: N}` for an
  *   unrelated N, so it's otherwise inert. Only generated for `alu` ops —
- *   comparisons have no write-back combo at all (ISA §9.2), so gating on
- *   `writeback` here keeps an ISA-invalid instruction from ever being
- *   constructed for e.g. `x = y < 10`.
+ *   comparisons have no write-back combo at all (isa-core.md §4.2), so
+ *   gating on `writeback` here keeps an ISA-invalid instruction from ever
+ *   being constructed for e.g. `x = y < 10`.
  */
 function regOperandRules(astOp: BinaryOperator, isaOp: BinaryOpcode, flipped: boolean, writeback: boolean, resolveLocal: (name: string) => number): Rule[]
 {
@@ -179,10 +178,10 @@ function regOperandRules(astOp: BinaryOperator, isaOp: BinaryOpcode, flipped: bo
 /**
  * IMM_ACC: operand is a Literal consumed via two-level pattern. Two output
  * variants (acc, tos). There is deliberately no register-writeback variant
- * here: the ISA's imm addressing mode always forces its result to acc
- * (§6.2) — there is no combo that both applies an immediate and writes
- * back to a register in one instruction. `x += 1`-shaped expressions get
- * their one-instruction form a different way: reformulated via
+ * here: the immediate addressing mode always forces its result to acc
+ * (isa-core.md §3) — there is no combo that both applies an immediate and
+ * writes back to a register in one instruction. `x += 1`-shaped expressions
+ * get their one-instruction form a different way: reformulated via
  * commutativity as `1 + x` (an already-tiled acc value combined with a
  * *register* operand), which is regOperandRules' REG_REG variant, above.
  */
@@ -213,17 +212,20 @@ function immOperandRules(astOp: BinaryOperator, isaOp: BinaryOpcode, flipped: bo
     })
 }
 
-/** Stack-operand combos: both children are RtlNodes (acc + tos). Four combos. */
+/**
+ * Stack-operand combos: both children are RtlNodes (acc + tos). Two combos
+ * — peek-and-write-back-in-place, and pop — the only two that reclaim what
+ * they read; see ir-engine.md, "Every stack-read combo also reclaims its
+ * operand" for why there is no third or fourth variant here.
+ */
 function stackOperandRules(astOp: BinaryOperator, isaOp: BinaryOpcode, flipped: boolean): Rule[]
 {
     const pattern = flipped
         ? pBinary(astOp, pRtl("tos"), pRtl("acc"))
         : pBinary(astOp, pRtl("acc"), pRtl("tos"))
     const combos: {combo: StackCombo; output: OutputLocation}[] = [
-        {combo: "PEEK_ACC", output: "acc"},
         {combo: "PEEK_PEEK", output: "tos"},
         {combo: "POP_ACC", output: "acc"},
-        {combo: "PEEK_PUSH", output: "tos"},
     ]
     return combos.map(({combo, output}) =>
     {

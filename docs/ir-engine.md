@@ -162,28 +162,30 @@ This section is the one place this document tracks state rather than
 timeless rationale — it exists so a future session doesn't have to
 rediscover the following from scratch.
 
-**The implementation has not been migrated to this spec yet.** The code
-under `packages/core/src/machine/` (`rules.ts`, `rtl.ts`, `builders.ts`,
-`vm.ts`) still implements the *previous* seven-combo ISA (the one with the
-peek-without-reclaim and push-on-top-of-peek combos this spec removes) and
-its nested bit-prefix encoding. This spec describes the target design;
-bringing the lowerer, VM, and any encoder in line with it is unstarted
-work, not a subtle bug.
+**The RTL-level implementation is migrated; a real byte encoder still
+doesn't exist.** `packages/core/src/machine/` (`rtl.ts`'s combo/opcode
+types, `rules.ts`'s rule generation, `encoding.ts`'s cost model, `vm.ts`'s
+dispatch) now match this spec's combo set and op classification — the
+peek-without-reclaim and push-on-top-of-peek combos are gone, `MOVE` is
+split into its own move-class ops, and the cost model reflects arithmetic's
+extended-only immediate and comparison's small-zero form. What's still
+unstarted is an actual bit-level serializer/deserializer implementing §5's
+byte layout — `encoding.ts` remains a relative cost estimate for the
+lowerer's own candidate comparison, not a real codec, matching the
+abstraction level the code was already at before this migration.
 
-**A cost-model tie-break gap exists in the current (pre-migration) code.**
-`orchestrator.ts`'s `pickCheapest` breaks ties by byte count, then
-fragment length, then peak stack depth (`maxStack`) — and for a
-sufficiently wide expression (empirically, 8+ leaves in a balanced
-binary-op tree), two candidates can tie on all three while genuinely
-differing in net stack growth (`tosDelta`), and the tie silently resolves
-by worklist pop order rather than preference. This lets a `"tos"`-demand
-initializer net `tosDelta = 2` instead of the expected `1`, which trips the
-hard assertion in `lowerVarDecl` (`lower.ts`). Once the ISA migration
-above lands, the specific tied shape (the wasteful peek-without-reclaim
-combo that this spec removes) can no longer be constructed at all, which
-resolves this as a side effect — a `tosDelta` tie-break added to
-`pickCheapest` directly would also fix it sooner, but is no longer
-strictly necessary once the migration happens.
+**The cost-model tie-break gap this migration exposed is now structurally
+closed, not patched over.** `orchestrator.ts`'s `pickCheapest` still breaks
+ties by byte count, then fragment length, then peak stack depth
+(`maxStack`), with no `tosDelta` criterion — but the specific tie that
+this gap could previously expose (a wasteful peek-without-reclaim combo
+tying a net-neutral write-back combo on every other criterion) can no
+longer arise, because the wasteful combo no longer exists at all. A
+regression test (`e2e.test.ts`, "add: 8-leaf balanced tree... wide-tree
+regression") lowers and executes the exact shape that used to trip
+`lowerVarDecl`'s `tosDelta === 1` assertion, confirming `tosDelta` comes
+back `1` as expected. `pickCheapest` still has no `tosDelta` tie-break —
+that remains true — but nothing currently reachable needs one.
 
 **The "peek the last-declared local" optimization idea is dead, not just
 unimplemented.** An earlier idea proposed addressing the most-recently
@@ -193,16 +195,21 @@ This spec's addressing-mode cut removes the combo that idea depended on —
 every remaining stack-read combo reclaims what it reads — so the idea has
 no combo left to use, not merely a missing implementation.
 
-**Dedup is implemented; full memoization is not.** `tileExpr`'s worklist
-(`orchestrator.ts`) hashes each partially-tiled expression tree
-structurally and skips re-exploring a state already reached via a
-different rewrite order, which fixed a real timeout (a 4-leaf balanced sum
-under a `"tos"` demand: >120s before, ~24ms after). It does not fix the
-underlying growth in distinct output-variant combinations as trees widen
-(measured ~512ms at 6 leaves, ~22.5s at 8, and 10 did not finish in 120s).
-A `(subtree, demanded_output) → tiling_set` memoization cache — reusing
-the same structural-hashing machinery — is the next step if wider
-expressions need to lower quickly.
+**Dedup is implemented; full memoization is not — still open for wide
+trees.** `tileExpr`'s worklist (`orchestrator.ts`) hashes each
+partially-tiled expression tree structurally and skips re-exploring a
+state already reached via a different rewrite order, which fixed a real
+timeout (a 4-leaf balanced sum under a `"tos"` demand: >120s before,
+~20ms after). It does not fix the underlying growth in distinct
+output-variant combinations as trees widen. Measured after the combo-set
+migration above (which roughly halved the branching factor at every
+stack-bridging site by removing two of the four stack combos): ~186ms at 6
+leaves, ~5.6s at 8, ~28s at 9, and 10 did not finish in the time given —
+better than the pre-migration figures (~22.5s at 8, 10 not finishing in
+120s) but still exponential-ish, not fixed. A `(subtree, demanded_output)
+→ tiling_set` memoization cache — reusing the same structural-hashing
+machinery — remains the next step if wider expressions need to lower
+quickly.
 
 **Common-subexpression elimination is not implemented.** A repeated
 subexpression re-evaluates every occurrence; the multi-location

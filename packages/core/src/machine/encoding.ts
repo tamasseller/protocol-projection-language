@@ -1,14 +1,43 @@
-import {isInlineLiteral, RtlInstr} from "./rtl"
+import {COMPARISON_OPS, RtlInstr} from "./rtl"
 
+/** Bytes an unsigned LEB128 encoding of a u32 value would need — 7 payload
+ *  bits per byte, up to 5 bytes for the full 32-bit range. */
+function leb128Bytes(n: number): number
+{
+    if (n < 0x80) return 1
+    if (n < 0x4000) return 2
+    if (n < 0x200000) return 3
+    if (n < 0x10000000) return 4
+    return 5
+}
+
+/**
+ * Relative byte-cost estimate used by the lowerer's cost model
+ * (orchestrator.ts's `pickCheapest`) to compare candidate tilings — not a
+ * real serializer (isa-core.md §5 has no implementation here yet). Costs
+ * follow the encoding described there: register operands and register-mode
+ * combos cost 2 bytes (opcode + index); peek/pop combos cost 1 (no trailing
+ * operand); arithmetic's immediate combo is always the extended form
+ * (isa-core.md §4.1 — no per-op inline literal); comparison's immediate
+ * combo gets a 1-byte form only for `#0` (§4.2); `CONST` gets a 1-byte form
+ * for `0..15` (§4.4).
+ */
 export function instrBytes(instr: RtlInstr): number
 {
     if (instr.op === "CALL") return 2
     if (instr.op === "BR_TABLE" || instr.op === "TRAP") return 2
+    if (instr.op === "LOAD" || instr.op === "STORE") return 2
+    if (instr.op === "PUSH" || instr.op === "POP") return 1
+    if (instr.op === "CONST")
+        return instr.imm >= 0 && instr.imm <= 15 ? 1 : 1 + leb128Bytes(instr.imm)
     if (!("combo" in instr)) return 1
-    if (instr.combo === "PEEK_ACC" || instr.combo === "PEEK_PEEK"
-     || instr.combo === "POP_ACC" || instr.combo === "PEEK_PUSH") return 1
-    if (instr.combo === "REG_ACC" || instr.combo === "REG_REG") return 2
-    if (instr.combo === "IMM_ACC")
-        return isInlineLiteral(instr.op, instr.imm) ? 1 : 2
-    return 2
+    switch (instr.combo)
+    {
+        case "REG_ACC": case "REG_REG": return 2
+        case "PEEK_PEEK": case "POP_ACC": return 1
+        case "IMM_ACC": {
+            const smallEligible = COMPARISON_OPS.has(instr.op) && instr.imm === 0
+            return smallEligible ? 1 : 1 + leb128Bytes(instr.imm)
+        }
+    }
 }

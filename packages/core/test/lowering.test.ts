@@ -113,9 +113,9 @@ describe("Leaf tiling", () =>
             minCount: 2,
             contains: [
                 // leafRules() literal→acc: pLiteral() → CONST(42)
-                ["MOVE #42"],
+                ["CONST #42"],
                 // leafRules() literal→tos: pLiteral() → CONST(42); PUSH()
-                ["MOVE #42", "PUSH"],
+                ["CONST #42", "PUSH"],
             ],
         })
     })
@@ -133,15 +133,15 @@ describe("Leaf tiling", () =>
         })
     })
 
-    test("literal 0 (per-op inline for MOVE)", () =>
+    test("literal 0", () =>
     {
         checkVariants("return 0;", {
             minCount: 2,
             contains: [
-                // leafRules() literal→acc: CONST(0); MOVE's per-op inline literal is 0
-                ["MOVE #0"],
+                // leafRules() literal→acc: CONST(0)
+                ["CONST #0"],
                 // leafRules() literal→tos: CONST(0); PUSH()
-                ["MOVE #0", "PUSH"],
+                ["CONST #0", "PUSH"],
             ],
         })
     })
@@ -243,28 +243,27 @@ describe("Binary — register operand", () =>
 
 describe("Binary — immediate operand", () =>
 {
-    test("x + 1 (per-op inline literal)", () =>
+    test("x + 1 (immediate operand)", () =>
     {
         checkVariants("return x + 1;", {
             minCount: 4,
             contains: [
                 // immOperandRules direct: pBinary("+", pRtl("acc"), pLiteral(1)) — acc output variant
-                // 1 is ADD's per-op inline literal (§17.3), so this is 1 byte for the ADD itself
                 ["LOAD x", "ADD #1"],
             ],
         })
     })
 
-    test("x + 5 (imm-extended + flipped)", () =>
+    test("x + 5 (immediate operand + flipped)", () =>
     {
         checkVariants("return x + 5;", {
             minCount: 4,
             contains: [
-                // immOperandRules direct: 5 ≠ ADD's per-op inline (1) → imm-extended (2B)
+                // immOperandRules direct: arithmetic's imm combo is always the extended form
                 ["LOAD x", "ADD #5"],
                 // regOperandRules flipped: pBinary("+", pIdentifier(x), pRtl("acc"))
-                // right=CONST(5), left=raw x → MOVE #5; ADD x (commutative, 5+x = x+5)
-                ["MOVE #5", "ADD x"],
+                // right=CONST(5), left=raw x → CONST #5; ADD x (commutative, 5+x = x+5)
+                ["CONST #5", "ADD x"],
             ],
         })
     })
@@ -280,45 +279,45 @@ describe("Binary — immediate operand", () =>
                 // The variants come from: (a) immOperandRules flipped(commutative):
                 //   pBinary("+", pLiteral(5), pRtl("acc")) with right=LOAD x → LOAD x; ADD #5
                 // (b) regOperandRules direct: pBinary("+", pRtl("acc"), pIdentifier(x))
-                //   with left=CONST(5) → MOVE #5; ADD x
+                //   with left=CONST(5) → CONST #5; ADD x
                 ["LOAD x", "ADD #5"],
-                ["MOVE #5", "ADD x"],
+                ["CONST #5", "ADD x"],
             ],
         })
     })
 
-    test("x - 1 (per-op inline for SUB)", () =>
+    test("x - 1 (immediate operand for SUB)", () =>
     {
         checkVariants("return x - 1;", {
             minCount: 2,
             contains: [
                 // immOperandRules direct: pBinary("-", pRtl("acc"), pLiteral(1)) → LOAD x; SUB #1
-                // 1 is SUB's per-op inline literal (§17.3)
                 // No flipped imm variant — flipped would be RSUB #1 which computes 1-x, not x-1.
                 // But flipped reg: pBinary("-", pIdentifier(x), pRtl("acc")) with right=CONST(1)
-                //   → MOVE #1; RSUB x computes acc=1, then x - 1 ✅ (not asserted here but valid)
+                //   → CONST #1; RSUB x computes acc=1, then x - 1 ✅ (not asserted here but valid)
                 ["LOAD x", "SUB #1"],
             ],
         })
     })
 
-    test("x << 1 (per-op inline for SHL)", () =>
+    test("x << 1 (immediate operand for SHL)", () =>
     {
         checkVariants("return x << 1;", {
             minCount: 2,
             contains: [
-                // immOperandRules direct only; SHL is strict — 1 is its per-op inline literal
+                // immOperandRules direct only; SHL is strict
                 ["LOAD x", "SHL #1"],
             ],
         })
     })
 
-    test("x << 3 (imm-extended, no inline for 3)", () =>
+    test("x << 3 (immediate operand, larger constant)", () =>
     {
         checkVariants("return x << 3;", {
             minCount: 2,
             contains: [
-                // immOperandRules direct: 3 ≠ SHL's per-op inline (1) → imm-extended (2B)
+                // immOperandRules direct — arithmetic's imm combo has no small form at all,
+                // so this costs the same as x << 1 above regardless of the constant's size
                 ["LOAD x", "SHL #3"],
             ],
         })
@@ -330,11 +329,11 @@ describe("Binary — immediate operand", () =>
             minCount: 4,
             contains: [
                 // immOperandRules direct: pBinary("==", pRtl("acc"), pLiteral(0))
-                // 0 is the comparison imm-zero literal (§17.4)
+                // 0 is comparison's dedicated small-immediate literal (isa-core.md §4.2)
                 ["LOAD x", "EQ #0"],
                 // regOperandRules flipped: pBinary("==", pIdentifier(x), pRtl("acc"))
-                // with right=CONST(0) → MOVE #0; EQ x (EQ is commutative)
-                ["MOVE #0", "EQ x"],
+                // with right=CONST(0) → CONST #0; EQ x (EQ is commutative)
+                ["CONST #0", "EQ x"],
             ],
         })
     })
@@ -347,7 +346,7 @@ describe("Binary — immediate operand", () =>
                 // immOperandRules direct: pBinary("!=", pRtl("acc"), pLiteral(0))
                 ["LOAD x", "NE #0"],
                 // regOperandRules flipped (NE is commutative)
-                ["MOVE #0", "NE x"],
+                ["CONST #0", "NE x"],
             ],
         })
     })
@@ -364,8 +363,8 @@ describe("Commutative & paired flips", () =>
                 // right=LOAD x → LOAD x; ADD #1
                 ["LOAD x", "ADD #1"],
                 // regOperandRules direct: pBinary("+", pRtl("acc"), pIdentifier(x))
-                // left=CONST(1) → MOVE #1; ADD x
-                ["MOVE #1", "ADD x"],
+                // left=CONST(1) → CONST #1; ADD x
+                ["CONST #1", "ADD x"],
             ],
         })
     })
@@ -432,7 +431,7 @@ describe("Compound expressions (stack bridge)", () =>
             // both sub-expressions are complex → must bridge through the stack
             containsOp: ["MUL"],
             // stackOperandRules MUL combos consume one operand from acc and one from TOS
-            containsCombo: ["POP_ACC", "PEEK_ACC"],
+            containsCombo: ["POP_ACC", "PEEK_PEEK"],
         })
     })
 })
@@ -455,8 +454,8 @@ describe("Assignment", () =>
         checkVariants("return x = 0;", {
             minCount: 1,
             contains: [
-                // assignmentRules() → child(CONST(0)) + STORE("x"), 0 is MOVE's per-op inline
-                ["MOVE #0", "STORE x"],
+                // assignmentRules() → child(CONST(0)) + STORE("x")
+                ["CONST #0", "STORE x"],
             ],
         })
     })
@@ -533,15 +532,15 @@ describe("Root output demand (tileExpr with demand parameter)", () =>
     {
         const vs = variantsOf("return 42;", "acc")
         assert.equal(vs.length, 1)
-        // Only MOVE #42; no PUSH suffix
-        assert.deepStrictEqual(vs[0], ["MOVE #42"])
+        // Only CONST #42; no PUSH suffix
+        assert.deepStrictEqual(vs[0], ["CONST #42"])
     })
 
     test("literal — tos demand returns only tos variant", () =>
     {
         const vs = variantsOf("return 42;", "tos")
         assert.equal(vs.length, 1)
-        assert.deepStrictEqual(vs[0], ["MOVE #42", "PUSH"])
+        assert.deepStrictEqual(vs[0], ["CONST #42", "PUSH"])
     })
 
     test("identifier — acc demand returns only LOAD, no PUSH", () =>
@@ -564,9 +563,9 @@ describe("Root output demand (tileExpr with demand parameter)", () =>
     {
         const all   = variantsOf("return x + y;")
         const acc   = variantsOf("return x + y;", "acc")
-        // tos-output combos (PEEK_PUSH, PEEK_PEEK) are filtered;
-        // acc-output combos (POP_ACC, PEEK_ACC, REG_ACC) survive even if they
-        // contain intermediate PUSH instructions (the *root* output determines)
+        // the tos-output combo (PEEK_PEEK) is filtered; acc-output combos
+        // (POP_ACC, REG_ACC) survive even if they contain intermediate PUSH
+        // instructions (the *root* output determines)
         assert.ok(acc.length < all.length,
             `acc demand should filter out tos-output variants (all=${all.length}, acc=${acc.length})`)
         // POP_ACC combo has intermediate PUSH but root output is acc — valid
@@ -585,9 +584,9 @@ describe("Root output demand (tileExpr with demand parameter)", () =>
         // Every tos variant must push onto the stack at the end
         for (const v of tos)
         {
-            const hasPush = v.some(s => s.includes("[tos++]") || s === "PUSH")
+            const hasPush = v.some(s => s === "PUSH")
             assert.ok(hasPush,
-                `expected tos-output (PUSH or PEEK_PUSH) in tos-demand variant: ${v.join(", ")}`)
+                `expected a PUSH in tos-demand variant: ${v.join(", ")}`)
         }
     })
 
