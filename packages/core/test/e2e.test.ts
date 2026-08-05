@@ -310,6 +310,63 @@ describe("Unary operators", () =>
             return ~x;
         `, ~5)
     })
+
+    // Multi-level rule (rules.ts, "unary:~~:cancel"/"unary:--:cancel"):
+    // matches straight through the inner UnaryExpression's raw shape rather
+    // than its one-level-reduced RtlNode, so double negation/double bitwise-
+    // not costs nothing beyond the operand itself — see ir-engine.md.
+    test("double negation cancels", () =>
+    {
+        assertReturn(`
+            u32 x = 5;
+            return -(-x);
+        `, 5)
+    })
+})
+
+describe("Builtin calls (clz, revbits)", () =>
+{
+    // isa-core.md §10.5 — `clz(x)`/`revbits(x)` are DSL-level built-ins with
+    // fixed lowering to the CLZ/REVBITS unary ops, parsed as ordinary
+    // Identifier(args) calls but not real procedure calls (rules.ts,
+    // matcher.ts's BuiltinCall pattern).
+
+    test("clz", () =>
+    {
+        assertReturn(`
+            u32 x = 5;
+            return clz(x);
+        `, Math.clz32(5))
+    })
+
+    test("clz of zero", () =>
+    {
+        assertReturn("return clz(0);", 32)
+    })
+
+    test("revbits", () =>
+    {
+        assertReturn(`
+            u32 x = 1;
+            return revbits(x);
+        `, 0x80000000)
+    })
+
+    test("revbits(clz(x)) — composed builtins", () =>
+    {
+        assertReturn(`
+            u32 x = 5;
+            return revbits(clz(x));
+        `, 0xb8000000)
+    })
+
+    test("double bitwise-not cancels", () =>
+    {
+        assertReturn(`
+            u32 x = 5;
+            return ~~x;
+        `, 5)
+    })
 })
 
 describe("Stack-bridging compound expressions", () =>

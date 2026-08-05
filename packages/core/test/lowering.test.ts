@@ -1,12 +1,20 @@
 /**
- * @ppl/core/test — Exhaustive tiling tests
+ * @ppl/core/test — Cost-optimal tiling tests
  *
- * Tests `tileExpr` directly: for each DSL expression, asserts that specific
- * expected tilings are present among the exhaustive variant set, and that
- * the variant count meets a minimum (exploration is happening).
+ * Tests `lowerExpr` directly: for each DSL expression, asserts the exact
+ * instruction sequence its cost-optimal tiling produces. `tileNode`
+ * (orchestrator.ts) prunes every node's candidate set to a Pareto frontier
+ * as it builds it, so a dominated tiling (e.g. a stack-bridge combo when a
+ * cheaper register combo is available for the same output) never survives
+ * to be picked — these tests check the *winner*, not "does some candidate
+ * exist somewhere," since a merely-realizable-but-dominated candidate is no
+ * longer part of what `tileExpr` returns at all.
  *
- * `lowerExpr` (cost-based selection) is deliberately untested here — it will
- * be covered separately once the cost model and tie-breaking stabilize.
+ * Some expressions have more than one tiling tied on every cost axis
+ * (bytes, fragment length, maxStack) — `pickCheapest` resolves those
+ * arbitrarily, by whichever the ruleset happens to construct first. Those
+ * cases use `checkWinnerOneOf`, asserting the winner is *a* member of the
+ * tied set rather than pinning one arbitrary-among-equals choice.
  */
 
 import { describe, test } from "node:test"
@@ -14,7 +22,7 @@ import assert from "node:assert/strict"
 
 import { ir } from "../src/ir"
 import { DEFAULT_RULESET } from "../src/machine/rules"
-import { tileExpr } from "../src/machine/orchestrator"
+import { tileExpr, lowerExpr } from "../src/machine/orchestrator"
 import { format, type OutputLocation } from "../src/machine/rtl"
 import type { EastExpression } from "../src/machine/east"
 import type { ReturnStatement } from "../src/machine/ast"
@@ -29,121 +37,51 @@ function exprOf(source: string): EastExpression
     return stmt.argument! as EastExpression
 }
 
-/**
- * Assert that `tileExpr` produces variants for `return <expr>;`.
- *
- * - `minCount`: the variant set must have at least this many entries.
- * - `contains`: each entry must appear as an exact formatted-instruction-list
- *   match in some variant.
- * - `containsOp`: each opcode string must appear in at least one variant's
- *   fragment (structural check for compound expressions).
- * - `containsCombo`: at least one variant must contain an instruction with
- *   the given combo (structural check for stack-bridge cases).
- */
-interface VariantExpectations
+/** Assert the cost-optimal tiling of `return <expr>;` under `demand` is
+ *  exactly `expected` — the unique winner, no tie among candidates. */
+function checkWinner(source: string, demand: OutputLocation, expected: string[]): void
 {
-    minCount?: number
-    contains?: string[][]
-    containsOp?: string[]
-    containsCombo?: string[]
+    const node = lowerExpr(exprOf(source), DEFAULT_RULESET, demand)
+    assert.ok(node, `No viable tiling for: ${source}`)
+    assert.deepStrictEqual(node.fragment.map(format), expected,
+        `${source} (demand=${demand}): expected optimal tiling [${expected.join(", ")}], ` +
+        `got [${node.fragment.map(format).join(", ")}]`)
 }
 
-function checkVariants(source: string, exp: VariantExpectations): void
+/** Like `checkWinner`, for expressions where several tilings genuinely tie
+ *  on every cost axis — asserts the winner is *some* member of `acceptable`
+ *  rather than pinning one arbitrary-among-equals choice. */
+function checkWinnerOneOf(source: string, demand: OutputLocation, acceptable: string[][]): void
 {
-    const expr = exprOf(source)
-    const variants = tileExpr(expr, DEFAULT_RULESET)
-    if (variants.length === 0)
-        assert.fail(`No viable tiling for: ${source}`)
-
-    if (exp.minCount !== undefined && variants.length < exp.minCount)
-        assert.fail(
-            `${source}: expected ≥${exp.minCount} variants, got ${variants.length}`)
-
-    // Format every variant once.
-    const formatted = variants.map(v => v.fragment.map(format))
-
-    // Each `contains` entry must appear exactly in some variant.
-    if (exp.contains)
-    {
-        for (const want of exp.contains)
-        {
-            const found = formatted.some(f =>
-                f.length === want.length && f.every((s, i) => s === want[i]))
-            if (!found)
-                assert.fail(
-                    `${source}: expected variant [${want.join(", ")}] not found.\n` +
-                    `Got ${variants.length} variants.`)
-        }
-    }
-
-    // Each `containsOp` opcode must appear in at least one variant.
-    if (exp.containsOp)
-    {
-        for (const wantOp of exp.containsOp)
-        {
-            const found = variants.some(v =>
-                v.fragment.some(i => i.op === wantOp))
-            if (!found)
-                assert.fail(
-                    `${source}: expected opcode ${wantOp} in some variant, none found.`)
-        }
-    }
-
-    // Each `containsCombo` combo must appear in at least one variant.
-    if (exp.containsCombo)
-    {
-        for (const wantCombo of exp.containsCombo)
-        {
-            const found = variants.some(v =>
-                v.fragment.some(i => "combo" in i && i.combo === wantCombo))
-            if (!found)
-                assert.fail(
-                    `${source}: expected combo ${wantCombo} in some variant, none found.`)
-        }
-    }
+    const node = lowerExpr(exprOf(source), DEFAULT_RULESET, demand)
+    assert.ok(node, `No viable tiling for: ${source}`)
+    const got = node.fragment.map(format)
+    const ok = acceptable.some(a => a.length === got.length && a.every((s, i) => s === got[i]))
+    assert.ok(ok,
+        `${source} (demand=${demand}): winner [${got.join(", ")}] not among the tied-acceptable set:\n` +
+        acceptable.map(a => `  [${a.join(", ")}]`).join("\n"))
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 describe("Leaf tiling", () =>
 {
-    test("literal → acc and tos variants", () =>
+    test("literal", () =>
     {
-        checkVariants("return 42;", {
-            minCount: 2,
-            contains: [
-                // leafRules() literal→acc: pLiteral() → CONST(42)
-                ["CONST #42"],
-                // leafRules() literal→tos: pLiteral() → CONST(42); PUSH()
-                ["CONST #42", "PUSH"],
-            ],
-        })
+        checkWinner("return 42;", "acc", ["CONST #42"])
+        checkWinner("return 42;", "tos", ["CONST #42", "PUSH"])
     })
 
-    test("identifier → acc and tos variants", () =>
+    test("identifier", () =>
     {
-        checkVariants("return x;", {
-            minCount: 2,
-            contains: [
-                // leafRules() id→acc: pIdentifier() → LOAD("x")
-                ["LOAD x"],
-                // leafRules() id→tos: pIdentifier() → LOAD("x"); PUSH()
-                ["LOAD x", "PUSH"],
-            ],
-        })
+        checkWinner("return x;", "acc", ["LOAD x"])
+        checkWinner("return x;", "tos", ["LOAD x", "PUSH"])
     })
 
     test("literal 0", () =>
     {
-        checkVariants("return 0;", {
-            minCount: 2,
-            contains: [
-                // leafRules() literal→acc: CONST(0)
-                ["CONST #0"],
-                // leafRules() literal→tos: CONST(0); PUSH()
-                ["CONST #0", "PUSH"],
-            ],
-        })
+        checkWinner("return 0;", "acc", ["CONST #0"])
+        checkWinner("return 0;", "tos", ["CONST #0", "PUSH"])
     })
 })
 
@@ -151,288 +89,200 @@ describe("Unary tiling", () =>
 {
     test("negation", () =>
     {
-        checkVariants("return -x;", {
-            minCount: 1,
-            contains: [
-                // unaryRules() pUnary("-", pRtl("acc")) → child(LOAD x) + bare("NEG")
-                ["LOAD x", "NEG"],
-            ],
-        })
+        checkWinner("return -x;", "acc", ["LOAD x", "NEG"])
     })
 
     test("bitwise not", () =>
     {
-        checkVariants("return ~x;", {
-            minCount: 1,
-            contains: [
-                // unaryRules() pUnary("~", pRtl("acc")) → child(LOAD x) + bare("NOT")
-                ["LOAD x", "NOT"],
-            ],
-        })
+        checkWinner("return ~x;", "acc", ["LOAD x", "NOT"])
     })
 
-    test("double negation", () =>
+    // rules.ts, "unary:~~:cancel" — a multi-level rule matching straight
+    // through the inner UnaryExpression's raw shape. It strictly beats
+    // applying unary:~ twice (2 fewer instructions), so it's the unique
+    // winner, not merely a candidate among others.
+    test("double negation cancels", () =>
     {
-        checkVariants("return ~~x;", {
-            minCount: 1,
-            contains: [
-                // outer unaryRules() pUnary("~", pRtl("acc")) applied to inner NOT's RtlNode
-                ["LOAD x", "NOT", "NOT"],
-            ],
-        })
+        checkWinner("return ~~x;", "acc", ["LOAD x"])
+    })
+})
+
+describe("Builtin calls (clz, revbits)", () =>
+{
+    // rules.ts, "builtin:clz"/"builtin:revbits" (matcher.ts's BuiltinCall
+    // pattern) — `clz(x)`/`revbits(x)` parse as an ordinary Identifier(args)
+    // call (isa-core.md §10.5) but lower to a bare unary op on the argument
+    // in acc, not a real procedure call with a pushed/popped argument.
+    test("clz(x)", () =>
+    {
+        checkWinner("return clz(x);", "acc", ["LOAD x", "CLZ"])
+    })
+
+    test("revbits(x)", () =>
+    {
+        checkWinner("return revbits(x);", "acc", ["LOAD x", "REVBITS"])
     })
 })
 
 describe("Binary — register operand", () =>
 {
-    test("x + y (commutative: both orders + stack variants)", () =>
+    // Commutative ops: both evaluation orders cost the same (2 LOADs +
+    // 1 register-combo ALU op either way), so this is a genuine tie.
+    test("x + y", () =>
     {
-        checkVariants("return x + y;", {
-            minCount: 8,
-            contains: [
-                // regOperandRules direct: pBinary("+", pRtl("acc"), pIdentifier(y)) → LOAD x; ADD y
-                ["LOAD x", "ADD y"],
-                // regOperandRules flipped: pBinary("+", pIdentifier(x), pRtl("acc")) → LOAD y; ADD x
-                ["LOAD y", "ADD x"],
-                // stackOperandRules POP_ACC: eval y→acc; PUSH; eval x→acc; ADD [--tos] (pickBinaryOrder)
-                ["LOAD y", "PUSH", "LOAD x", "ADD [--tos]"],
-                // stackOperandRules POP_ACC: opposite evaluation order
-                ["LOAD x", "PUSH", "LOAD y", "ADD [--tos]"],
-            ],
-        })
+        checkWinnerOneOf("return x + y;", "acc", [
+            ["LOAD x", "ADD y"],
+            ["LOAD y", "ADD x"],
+        ])
     })
 
-    test("x - y (paired: direct SUB + flipped RSUB + stack)", () =>
+    test("x - y (paired: direct SUB ties with flipped RSUB)", () =>
     {
-        checkVariants("return x - y;", {
-            minCount: 8,
-            contains: [
-                // regOperandRules direct: pBinary("-", pRtl("acc"), pIdentifier(y)) → LOAD x; SUB y
-                ["LOAD x", "SUB y"],
-                // regOperandRules flipped: pBinary("-", pIdentifier(x), pRtl("acc")) → LOAD y; RSUB x
-                // RSUB x computes x - acc = x - y, yielding the correct result
-                ["LOAD y", "RSUB x"],
-            ],
-        })
+        checkWinnerOneOf("return x - y;", "acc", [
+            ["LOAD x", "SUB y"],
+            ["LOAD y", "RSUB x"],
+        ])
     })
 
-    test("x & y (commutative)", () =>
+    test("x & y", () =>
     {
-        checkVariants("return x & y;", {
-            minCount: 4,
-            contains: [
-                // regOperandRules direct
-                ["LOAD x", "AND y"],
-                // regOperandRules flipped (commutative)
-                ["LOAD y", "AND x"],
-            ],
-        })
+        checkWinnerOneOf("return x & y;", "acc", [
+            ["LOAD x", "AND y"],
+            ["LOAD y", "AND x"],
+        ])
     })
 
-    test("x << y (strict: direct only, no flip)", () =>
+    // SHL is strict (no commutative/paired flip), so there's exactly one
+    // candidate at all — no tie to resolve.
+    test("x << y (strict: no flip)", () =>
     {
-        checkVariants("return x << y;", {
-            minCount: 4,
-            contains: [
-                // regOperandRules direct only; SHL is strict (no commutative/paired flip)
-                ["LOAD x", "SHL y"],
-            ],
-        })
+        checkWinner("return x << y;", "acc", ["LOAD x", "SHL y"])
     })
 })
 
 describe("Binary — immediate operand", () =>
 {
-    test("x + 1 (immediate operand)", () =>
+    // Arithmetic's immediate combo has no small form (ir-engine.md), so it
+    // always costs LOAD(2) + op-imm-extended(2) = 4 bytes. But reformulating
+    // commutatively as `1 + x` and tiling the literal via CONST's small
+    // 0–15 range costs CONST(1) + op-register(2) = 3 bytes instead — cheaper
+    // whenever the literal fits that range, so it's the unique winner, not
+    // the direct-immediate form these expressions might suggest at a glance.
+    test("x + 1 (small-literal reg-flip beats direct immediate)", () =>
     {
-        checkVariants("return x + 1;", {
-            minCount: 4,
-            contains: [
-                // immOperandRules direct: pBinary("+", pRtl("acc"), pLiteral(1)) — acc output variant
-                ["LOAD x", "ADD #1"],
-            ],
-        })
+        checkWinner("return x + 1;", "acc", ["CONST #1", "ADD x"])
     })
 
-    test("x + 5 (immediate operand + flipped)", () =>
+    test("x + 5 (small-literal reg-flip beats direct immediate)", () =>
     {
-        checkVariants("return x + 5;", {
-            minCount: 4,
-            contains: [
-                // immOperandRules direct: arithmetic's imm combo is always the extended form
-                ["LOAD x", "ADD #5"],
-                // regOperandRules flipped: pBinary("+", pIdentifier(x), pRtl("acc"))
-                // right=CONST(5), left=raw x → CONST #5; ADD x (commutative, 5+x = x+5)
-                ["CONST #5", "ADD x"],
-            ],
-        })
+        checkWinner("return x + 5;", "acc", ["CONST #5", "ADD x"])
     })
 
-    test("5 + x (commutative flip)", () =>
+    test("5 + x (already literal-on-left; same winner as x + 5)", () =>
     {
-        checkVariants("return 5 + x;", {
-            minCount: 4,
-            contains: [
-                // immOperandRules direct: pBinary("+", pRtl("acc"), pLiteral(x) no—x is Identifier)
-                // Actually immOperandRules direct: left=CONST(5), right=raw x → CONST(5); ADD x
-                // No — imm pattern needs right to be pLiteral. x is Identifier, so this doesn't match.
-                // The variants come from: (a) immOperandRules flipped(commutative):
-                //   pBinary("+", pLiteral(5), pRtl("acc")) with right=LOAD x → LOAD x; ADD #5
-                // (b) regOperandRules direct: pBinary("+", pRtl("acc"), pIdentifier(x))
-                //   with left=CONST(5) → CONST #5; ADD x
-                ["LOAD x", "ADD #5"],
-                ["CONST #5", "ADD x"],
-            ],
-        })
+        checkWinner("return 5 + x;", "acc", ["CONST #5", "ADD x"])
     })
 
-    test("x - 1 (immediate operand for SUB)", () =>
+    // Paired (SUB/RSUB) gets the same reg-flip win: CONST #1 tiles the
+    // literal to acc, then RSUB x computes target(x) − acc(1) = x − 1.
+    test("x - 1 (small-literal reg-flip via RSUB beats direct immediate)", () =>
     {
-        checkVariants("return x - 1;", {
-            minCount: 2,
-            contains: [
-                // immOperandRules direct: pBinary("-", pRtl("acc"), pLiteral(1)) → LOAD x; SUB #1
-                // No flipped imm variant — flipped would be RSUB #1 which computes 1-x, not x-1.
-                // But flipped reg: pBinary("-", pIdentifier(x), pRtl("acc")) with right=CONST(1)
-                //   → CONST #1; RSUB x computes acc=1, then x - 1 ✅ (not asserted here but valid)
-                ["LOAD x", "SUB #1"],
-            ],
-        })
+        checkWinner("return x - 1;", "acc", ["CONST #1", "RSUB x"])
     })
 
-    test("x << 1 (immediate operand for SHL)", () =>
+    // SHL is strict — no flipped form exists at all, so the direct
+    // immediate is the only candidate regardless of the constant's size
+    // (arithmetic's immediate has no small form to make 1 cheaper than 3).
+    test("x << 1 (strict: direct immediate only)", () =>
     {
-        checkVariants("return x << 1;", {
-            minCount: 2,
-            contains: [
-                // immOperandRules direct only; SHL is strict
-                ["LOAD x", "SHL #1"],
-            ],
-        })
+        checkWinner("return x << 1;", "acc", ["LOAD x", "SHL #1"])
     })
 
-    test("x << 3 (immediate operand, larger constant)", () =>
+    test("x << 3 (strict: direct immediate only)", () =>
     {
-        checkVariants("return x << 3;", {
-            minCount: 2,
-            contains: [
-                // immOperandRules direct — arithmetic's imm combo has no small form at all,
-                // so this costs the same as x << 1 above regardless of the constant's size
-                ["LOAD x", "SHL #3"],
-            ],
-        })
+        checkWinner("return x << 3;", "acc", ["LOAD x", "SHL #3"])
     })
 
-    test("x == 0 (zero-compare, both orientations)", () =>
+    // Comparison's #0 gets its own dedicated small form (isa-core.md §4.2),
+    // so direct-immediate and reg-flip-via-CONST both cost 3 bytes here —
+    // a genuine tie, unlike the arithmetic cases above.
+    test("x == 0 (zero-compare: direct and reg-flip tie)", () =>
     {
-        checkVariants("return x == 0;", {
-            minCount: 4,
-            contains: [
-                // immOperandRules direct: pBinary("==", pRtl("acc"), pLiteral(0))
-                // 0 is comparison's dedicated small-immediate literal (isa-core.md §4.2)
-                ["LOAD x", "EQ #0"],
-                // regOperandRules flipped: pBinary("==", pIdentifier(x), pRtl("acc"))
-                // with right=CONST(0) → CONST #0; EQ x (EQ is commutative)
-                ["CONST #0", "EQ x"],
-            ],
-        })
+        checkWinnerOneOf("return x == 0;", "acc", [
+            ["LOAD x", "EQ #0"],
+            ["CONST #0", "EQ x"],
+        ])
     })
 
-    test("x != 0 (zero-compare, both orientations)", () =>
+    test("x != 0 (zero-compare: direct and reg-flip tie)", () =>
     {
-        checkVariants("return x != 0;", {
-            minCount: 4,
-            contains: [
-                // immOperandRules direct: pBinary("!=", pRtl("acc"), pLiteral(0))
-                ["LOAD x", "NE #0"],
-                // regOperandRules flipped (NE is commutative)
-                ["CONST #0", "NE x"],
-            ],
-        })
+        checkWinnerOneOf("return x != 0;", "acc", [
+            ["LOAD x", "NE #0"],
+            ["CONST #0", "NE x"],
+        ])
     })
 })
 
 describe("Commutative & paired flips", () =>
 {
-    test("1 + x (literal-on-left, commutative flip)", () =>
+    test("1 + x (literal already on the left)", () =>
     {
-        checkVariants("return 1 + x;", {
-            minCount: 4,
-            contains: [
-                // immOperandRules flipped(commutative): pBinary("+", pLiteral(1), pRtl("acc"))
-                // right=LOAD x → LOAD x; ADD #1
-                ["LOAD x", "ADD #1"],
-                // regOperandRules direct: pBinary("+", pRtl("acc"), pIdentifier(x))
-                // left=CONST(1) → CONST #1; ADD x
-                ["CONST #1", "ADD x"],
-            ],
-        })
+        checkWinner("return 1 + x;", "acc", ["CONST #1", "ADD x"])
     })
 
-    test("y - x (paired flip: SUB direct + RSUB flipped)", () =>
+    test("y - x (paired flip: direct SUB ties with flipped RSUB)", () =>
     {
-        checkVariants("return y - x;", {
-            minCount: 8,
-            contains: [
-                // regOperandRules direct: pBinary("-", pRtl("acc"), pIdentifier(x)) → LOAD y; SUB x
-                ["LOAD y", "SUB x"],
-                // regOperandRules flipped: pBinary("-", pIdentifier(y), pRtl("acc"))
-                // right=LOAD x → LOAD x; RSUB y (RSUB computes y - acc = y - x) ✅
-                ["LOAD x", "RSUB y"],
-            ],
-        })
+        checkWinnerOneOf("return y - x;", "acc", [
+            ["LOAD y", "SUB x"],
+            ["LOAD x", "RSUB y"],
+        ])
     })
 })
 
 describe("Chained expressions", () =>
 {
-    test("x + y + z (all-register variants present)", () =>
+    test("x + y + z (evaluation order ties)", () =>
     {
-        checkVariants("return x + y + z;", {
-            minCount: 20,
-            contains: [
-                // (x+y)+z: worklist tiles x+y→acc first (regOperandRules direct), then ADD z
-                ["LOAD x", "ADD y", "ADD z"],
-                // (y+x)+z: worklist tiles y→acc first, ADDs x, then ADD z (commutative flip)
-                ["LOAD y", "ADD x", "ADD z"],
-            ],
-        })
+        checkWinnerOneOf("return x + y + z;", "acc", [
+            ["LOAD x", "ADD y", "ADD z"],
+            ["LOAD y", "ADD x", "ADD z"],
+        ])
     })
 
-    test("x + y - z (mixed commutative + paired)", () =>
+    test("x + y - z (mixed commutative + paired, evaluation order ties)", () =>
     {
-        checkVariants("return x + y - z;", {
-            minCount: 10,
-            contains: [
-                // (x+y)-z: inner ADD via regOperandRules direct, outer SUB via regOperandRules direct
-                ["LOAD x", "ADD y", "SUB z"],
-                // (y+x)-z: same but inner ADD uses commutative flip
-                ["LOAD y", "ADD x", "SUB z"],
-            ],
-        })
+        checkWinnerOneOf("return x + y - z;", "acc", [
+            ["LOAD x", "ADD y", "SUB z"],
+            ["LOAD y", "ADD x", "SUB z"],
+        ])
     })
 })
 
 describe("Compound expressions (stack bridge)", () =>
 {
-    test("x + y * z (MUL present in some variant)", () =>
+    test("x + y * z (MUL binds tighter; evaluation order ties)", () =>
     {
-        checkVariants("return x + y * z;", {
-            minCount: 10,
-            // parsed as x + (y * z); MUL must appear because * has higher precedence than +
-            containsOp: ["MUL"],
-        })
+        checkWinnerOneOf("return x + y * z;", "acc", [
+            ["LOAD y", "MUL z", "ADD x"],
+            ["LOAD z", "MUL y", "ADD x"],
+        ])
     })
 
-    test("(a + b) * (c + d) (MUL + stack-combo present)", () =>
+    // Both operands are themselves compound, so no register/immediate
+    // pattern can reach either one directly — every viable tiling must
+    // bridge through the stack, and none dominates another (all 8
+    // evaluation-order permutations tie at the same byte/maxStack cost).
+    // Pruning still discards nothing here, unlike the register-operand
+    // cases above, precisely because nothing cheaper is realizable.
+    test("(a + b) * (c + d) — stack bridging is the only option", () =>
     {
-        checkVariants("return (a + b) * (c + d);", {
-            minCount: 10,
-            // both sub-expressions are complex → must bridge through the stack
-            containsOp: ["MUL"],
-            // stackOperandRules MUL combos consume one operand from acc and one from TOS
-            containsCombo: ["POP_ACC", "PEEK_PEEK"],
-        })
+        const node = lowerExpr(exprOf("return (a + b) * (c + d);"), DEFAULT_RULESET, "acc")
+        assert.ok(node, "must find a tiling")
+        const formatted = node.fragment.map(format)
+        assert.ok(formatted.includes("MUL [--tos]"),
+            `expected a stack-bridge MUL, got: ${formatted.join(", ")}`)
+        assert.ok(formatted.includes("PUSH"),
+            `expected an intermediate PUSH bridging the two sums, got: ${formatted.join(", ")}`)
     })
 })
 
@@ -440,35 +290,19 @@ describe("Assignment", () =>
 {
     test("x = y", () =>
     {
-        checkVariants("return x = y;", {
-            minCount: 1,
-            contains: [
-                // assignmentRules() pAssign("=", pRtl("acc")) → child(LOAD y) + STORE("x")
-                ["LOAD y", "STORE x"],
-            ],
-        })
+        checkWinner("return x = y;", "acc", ["LOAD y", "STORE x"])
     })
 
     test("x = 0 (const-zero assignment)", () =>
     {
-        checkVariants("return x = 0;", {
-            minCount: 1,
-            contains: [
-                // assignmentRules() → child(CONST(0)) + STORE("x")
-                ["CONST #0", "STORE x"],
-            ],
-        })
+        checkWinner("return x = 0;", "acc", ["CONST #0", "STORE x"])
     })
 
+    // Same small-literal reg-flip win as the "x + 1" case above, just with
+    // an assignment's STORE appended.
     test("x = y + 1 (compound assignment RHS)", () =>
     {
-        checkVariants("return x = y + 1;", {
-            minCount: 2,
-            contains: [
-                // immOperandRules direct tilings y+1 to acc, then assignmentRules appends STORE x
-                ["LOAD y", "ADD #1", "STORE x"],
-            ],
-        })
+        checkWinner("return x = y + 1;", "acc", ["CONST #1", "ADD y", "STORE x"])
     })
 })
 
@@ -476,34 +310,26 @@ describe("Call", () =>
 {
     test("foo(x) — single pushed arg", () =>
     {
-        checkVariants("return foo(x);", {
-            minCount: 1,
-            contains: [
-                // callRule() tiles arg x to tos (LOAD x; PUSH), then appends CALL foo
-                ["LOAD x", "PUSH", "CALL foo"],
-            ],
-        })
+        checkWinner("return foo(x);", "acc", ["LOAD x", "PUSH", "CALL foo"])
     })
 
     test("foo(x, y) — two pushed args", () =>
     {
-        checkVariants("return foo(x, y);", {
-            minCount: 1,
-            contains: [
-                ["LOAD x", "PUSH", "LOAD y", "PUSH", "CALL foo"],
-            ],
-        })
+        checkWinner("return foo(x, y);", "acc", ["LOAD x", "PUSH", "LOAD y", "PUSH", "CALL foo"])
     })
 
-    test("foo(x + 1) — computed arg", () =>
+    // A pushed arg's demand is "tos", not "acc" — there's no rule that
+    // takes an acc-output candidate and appends a bare PUSH, so the
+    // reg-flip trick from the immediate-operand tests above doesn't apply
+    // here: the direct-immediate-with-trailing-PUSH form ties with both
+    // stack-bridge evaluation orders of (literal, identifier).
+    test("foo(x + 1) — computed arg, three-way tie", () =>
     {
-        checkVariants("return foo(x + 1);", {
-            minCount: 2,
-            contains: [
-                // callRule() tiles x+1 to tos variant (immOperandRules acc+tos output) + CALL
-                ["LOAD x", "ADD #1", "PUSH", "CALL foo"],
-            ],
-        })
+        checkWinnerOneOf("return foo(x + 1);", "acc", [
+            ["LOAD x", "ADD #1", "PUSH", "CALL foo"],
+            ["CONST #1", "PUSH", "LOAD x", "ADD [tos-1] → [tos-1]", "CALL foo"],
+            ["LOAD x", "PUSH", "CONST #1", "ADD [tos-1] → [tos-1]", "CALL foo"],
+        ])
     })
 })
 
@@ -557,37 +383,35 @@ describe("Root output demand (tileExpr with demand parameter)", () =>
         assert.deepStrictEqual(vs[0], ["LOAD x", "PUSH"])
     })
 
-    // ── Binary — acc output combos only ─────────────────────────────────────
+    // ── Binary — pruning discards a dominated stack combo entirely ─────────
 
-    test("x + y with acc demand — no tos-output stack combos survive", () =>
+    // When a register alternative is available for the same output tag, the
+    // stack-bridge combo (PEEK_PEEK/POP_ACC) is strictly dominated — it
+    // never survives pruning at all, regardless of demand. And since the
+    // register combo's two evaluation orders (`LOAD x;ADD y` vs `LOAD
+    // y;ADD x`) tie exactly on every cost axis, pruning collapses them to a
+    // single representative too — there's only one acc-output candidate
+    // left, not merely "no stack combo among several."
+    test("x + y with acc demand — dominated stack combo doesn't survive", () =>
     {
-        const all   = variantsOf("return x + y;")
-        const acc   = variantsOf("return x + y;", "acc")
-        // the tos-output combo (PEEK_PEEK) is filtered; acc-output combos
-        // (POP_ACC, REG_ACC) survive even if they contain intermediate PUSH
-        // instructions (the *root* output determines)
-        assert.ok(acc.length < all.length,
-            `acc demand should filter out tos-output variants (all=${all.length}, acc=${acc.length})`)
-        // POP_ACC combo has intermediate PUSH but root output is acc — valid
-        const hasPopAcc = acc.some(v => v.join(" ").includes("ADD [--tos]"))
-        assert.ok(hasPopAcc,
-            `acc demand should retain POP_ACC (stack bridge with acc output), got:\n` +
-            acc.map(v => v.join(", ")).join("\n"))
+        const acc = variantsOf("return x + y;", "acc")
+        assert.equal(acc.length, 1, `expected the tied register-combo variants collapsed to one, got ${acc.length}`)
+        assert.ok(!acc[0]!.join(" ").includes("tos"),
+            `acc-output candidate should never be a stack-bridge combo: ${acc[0]!.join(", ")}`)
     })
 
-    test("x + y with tos demand — only tos-output stack combos survive", () =>
+    test("x + y with tos demand — the (non-dominated) stack combo survives", () =>
     {
-        const all   = variantsOf("return x + y;")
-        const tos   = variantsOf("return x + y;", "tos")
+        const all = variantsOf("return x + y;")
+        const tos = variantsOf("return x + y;", "tos")
         assert.ok(tos.length < all.length,
             `tos demand should filter out acc variants (all=${all.length}, tos=${tos.length})`)
-        // Every tos variant must push onto the stack at the end
-        for (const v of tos)
-        {
-            const hasPush = v.some(s => s === "PUSH")
-            assert.ok(hasPush,
-                `expected a PUSH in tos-demand variant: ${v.join(", ")}`)
-        }
+        // There is no register-combo alternative for "tos" output at all, so
+        // the stack-bridge candidate isn't dominated by anything — but its
+        // two evaluation orders still tie exactly, so only one survives.
+        assert.equal(tos.length, 1, `expected the tied evaluation orders collapsed to one, got ${tos.length}`)
+        assert.ok(tos[0]!.includes("PUSH"),
+            `expected a PUSH in the tos-demand variant: ${tos[0]!.join(", ")}`)
     })
 
     // ── Assignment — acc demand includes reg-output (write-back) ────────────
@@ -617,29 +441,27 @@ describe("Root output demand (tileExpr with demand parameter)", () =>
 
     // ── Compound — acc demand still allows stack bridging internally ─────────
 
+    // All 8 evaluation-order permutations of this shape tie exactly on
+    // bytes/maxStack/clobbers (neither operand is a bare identifier, so no
+    // register/immediate rule can apply at all — every viable tiling must
+    // bridge through the stack the same way), so pruning collapses them to
+    // a single representative rather than leaving "several."
     test("(a+b)*(c+d) with acc demand — stack bridging still works", () =>
     {
         const vs = variantsOf("return (a + b) * (c + d);", "acc")
-        assert.ok(vs.length >= 3,
-            `expected ≥3 acc-output variants for compound expression, got ${vs.length}`)
-        // Verify at least one variant uses stack bridging (POP_ACC combo on MUL).
-        // The internal operands may be pushed; only the root MUL must output to acc.
-        const hasStackBridge = vs.some(v =>
-            v.some(s => s.includes("ADD [--tos]") || s.includes("ADD [tos-1]")))
-        assert.ok(hasStackBridge,
-            `expected at least one acc-output variant with stack bridging, got:\n` +
-            vs.map(v => v.join(", ")).join("\n"))
+        assert.equal(vs.length, 1, `expected the tied evaluation orders collapsed to one, got ${vs.length}`)
+        assert.ok(vs[0]!.includes("MUL [--tos]"),
+            `expected the acc-output variant to use a stack-bridge MUL, got: ${vs[0]!.join(", ")}`)
     })
 
     // ── Cost-optimal selection (smoke test on lowerExpr) ────────────────────
 
     test("lowerExpr with acc demand picks the cheapest acc variant", () =>
     {
-        const { lowerExpr } = require("../src/machine/orchestrator") as typeof import("../src/machine/orchestrator")
         const expr = exprOf("return x + y;")
         const node = lowerExpr(expr, DEFAULT_RULESET, "acc")
         assert.ok(node, "must find at least one acc variant")
-        // Cheapest acc variant for x+y: register-combo (2B) beats stack-combo (3B incl PUSH)
+        // Cheapest acc variant for x+y: register-combo (2 instrs) beats stack-combo
         assert.ok(node.fragment.length <= 3,
             `expected ≤3 instrs for optimal acc tiling, got ${node.fragment.length}: ${node.fragment.map(format).join(", ")}`)
     })
@@ -648,17 +470,13 @@ describe("Root output demand (tileExpr with demand parameter)", () =>
     //
     // The real pipeline never lowers a CALL through the VM yet (vm.ts's
     // CALL case is a deliberate stub — see its file header), so there's no
-    // e2e-executable way to make the `call` rule win. These call
-    // `lowerExpr` directly instead, exactly like the acc-demand smoke test
-    // above, just to put `call` and `identifier:tos` through the rule that
-    // `lowerExpr` actually *selects* (test/rule-coverage.test.ts only
-    // counts winners, not mere tileExpr candidates — see "Call" above,
-    // which already covers these structurally via checkVariants/tileExpr
-    // but never calls lowerExpr).
+    // e2e-executable way to make the `call` rule win. This calls `lowerExpr`
+    // directly instead, exactly like the acc-demand smoke test above, just
+    // to put `call` and `identifier:tos` through the rule that `lowerExpr`
+    // actually *selects* (test/rule-coverage.test.ts only counts winners).
 
     test("lowerExpr on foo(x) selects the call rule (and identifier:tos for the arg)", () =>
     {
-        const { lowerExpr } = require("../src/machine/orchestrator") as typeof import("../src/machine/orchestrator")
         const expr = exprOf("return foo(x);")
         const node = lowerExpr(expr, DEFAULT_RULESET, "acc")
         assert.ok(node, "must find a call lowering")

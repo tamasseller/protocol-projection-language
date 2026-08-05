@@ -1,125 +1,40 @@
 /**
- * @ppl/core/machine — Expression tiling orchestrator (worklist-based)
+ * @ppl/core/machine — Expression tiling orchestrator (bottom-up memoized)
  *
  * Bottom-up rewrite search — see docs/ir-engine.md for why pattern-rewrite
- * search is used instead of Sethi-Ullman. Maintains a worklist of
- * partially-tiled EAST trees; each iteration pops one, finds all rule
- * matches at any node,
- * rewrites one match site, and pushes the result. Fully-tiled trees (root
- * is an RtlNode) accumulate into the results set.
+ * search is used instead of Sethi-Ullman. `tileNode` recursively computes
+ * every viable tiling of an EAST subtree, memoized by node identity so a
+ * subtree is only ever tiled once no matter how many rules or ancestors end
+ * up asking for it.
  *
- * Termination: every rule replaces ≥1 DSL node with exactly one RTL-AST
- * node, so the DSL-node count strictly decreases.
+ * This is not a separate bottom-up pass that finishes children before a
+ * parent's rules run: a pattern's own internal structure (e.g. `Binary`
+ * nested inside `Binary`) is matched directly against the raw, untiled AST
+ * shape, and only a pattern's `Rtl` leaves trigger `tileNode` on the
+ * subtree underneath them (see matcher.ts's `matchAllEast`). That is what
+ * lets a multi-level pattern still see an intermediate node's original
+ * shape rather than only its already-reduced candidate set.
  *
- * Correct for deep/multi-level patterns and for restructuring rules — not
- * just shallow rules. Cost-pruning could be added to the worklist loop.
+ * Termination: the AST is a tree with no cycles, so the recursion is
+ * strictly bounded by tree depth; each node's rule-application loop tries a
+ * fixed ruleset, so total work is linear in tree size times ruleset size
+ * (times the cross-product width of multi-candidate pattern slots, which is
+ * bounded by how many rules can produce a given output tag — a ruleset
+ * property, not something that grows with tree size).
  */
 
 import type { Rule } from "./rules"
-import { matchEast } from "./matcher"
+import { matchAllEast } from "./matcher"
 import type { EastMatch } from "./matcher"
-import type { EastExpression, RtlNode, EastBinary, EastUnary, EastAssign, EastCall } from "./east"
-import {
-    isRtlNode,
-    isLiteral,
-    isIdentifier,
-    isEastBinary,
-    isEastUnary,
-    isEastAssign,
-} from "./east"
-import type { RtlInstr, BinaryOpcode, OutputLocation, RtlProc } from "./rtl"
+import type { EastExpression, RtlNode } from "./east"
+import { isRtlNode } from "./east"
+import type { OutputLocation } from "./rtl"
 import { outputHas } from "./rtl"
 import {instrBytes} from "./encoding"
 
 export function fragmentBytes(node: RtlNode): number
 {
     return node.fragment.reduce((s, i) => s + instrBytes(i), 0)
-}
-
-type ChildKey =
-    | "root"
-    | { kind: "Binary"; side: "left" | "right" }
-    | { kind: "Unary"; role: "argument" }
-    | { kind: "Assign"; role: "right" }
-    | { kind: "Call"; role: "arg"; index: number }
-
-interface Site
-{
-    node: EastExpression
-    key: ChildKey
-}
-
-function* walk(node: EastExpression, key: ChildKey = "root"): Generator<Site>
-{
-    yield { node, key }
-    if (node.type === "BinaryExpression")
-    {
-        yield* walk(node.left, { kind: "Binary", side: "left" })
-        yield* walk(node.right, { kind: "Binary", side: "right" })
-    }
-    else if (node.type === "UnaryExpression")
-    {
-        yield* walk(node.argument, { kind: "Unary", role: "argument" })
-    }
-    else if (node.type === "AssignmentExpression")
-    {
-        yield* walk(node.right, { kind: "Assign", role: "right" })
-    }
-    else if (node.type === "CallExpression")
-    {
-        for (let i = 0; i < node.arguments.length; i++)
-            yield* walk(node.arguments[i]!, { kind: "Call", role: "arg", index: i })
-    }
-}
- 
-function replaceInTree(root: EastExpression, target: EastExpression, replacement: EastExpression): EastExpression
-{
-    if (root === target) return replacement
-
-    if (root.type === "BinaryExpression")
-    {
-        const left = root.left === target ? replacement : replaceInTree(root.left, target, replacement)
-        const right = root.right === target ? replacement : replaceInTree(root.right, target, replacement)
-        if (left === root.left && right === root.right) return root
-        return { ...root, left, right }
-    }
-    if (root.type === "UnaryExpression")
-    {
-        const arg = root.argument === target ? replacement : replaceInTree(root.argument, target, replacement)
-        if (arg === root.argument) return root
-        return { ...root, argument: arg }
-    }
-    if (root.type === "AssignmentExpression")
-    {
-        const right = root.right === target ? replacement : replaceInTree(root.right, target, replacement)
-        if (right === root.right) return root
-        return { ...root, right }
-    }
-    if (root.type === "CallExpression")
-    {
-        let changed = false
-        const args = root.arguments.map(a =>
-        {
-            if (a === target) { changed = true; return replacement }
-            const r = replaceInTree(a, target, replacement)
-            if (r !== a) changed = true
-            return r
-        })
-        if (!changed) return root
-        return { ...root, arguments: args }
-    }
-    return root
-}
- 
-interface FoundMatch
-{
-    rule: Rule
-    target: EastExpression
-    /** Every RtlNode consumed by this match, however deep in the pattern
-     *  shape (e.g. both sides of a Binary, or every call arg) — these are
-     *  the children whose own rule-provenance folds into the replacement's. */
-    childNodes: RtlNode[]
-    build: () => RtlNode | undefined
 }
 
 function collectRtlNodes(m: EastMatch): RtlNode[]
@@ -131,58 +46,126 @@ function collectRtlNodes(m: EastMatch): RtlNode[]
         case "Unary": return collectRtlNodes(m.argumentMatch)
         case "Assign": return collectRtlNodes(m.rightMatch)
         case "Call": return m.argNodes
+        case "BuiltinCall": return [m.argNode]
         default: return [] // Literal, Identifier — no RTL children
     }
 }
 
-function findMatches(root: EastExpression, rules: readonly Rule[]): FoundMatch[]
+/**
+ * Does `b` make `a` pointless — no worse on every axis a consumer further
+ * up the tree can observe, and strictly better on at least one? Consumers
+ * only ever look at `output` (as an exact-tag lookup), `fragment`'s byte
+ * cost, `maxStack`, and `clobbers` (via `destroys`/`destroysAny`,
+ * builders.ts) — `tosDelta` isn't a separate axis because it's already
+ * fixed once `output` is fixed (every rule producing a given output tag
+ * nets the same tos effect). Only candidates with the *same* `output` are
+ * compared: a `{reg: N}`-tagged candidate doesn't compete with an
+ * `"acc"`-tagged one, since a future demand for one can never be satisfied
+ * by the other.
+ */
+function dominates(b: RtlNode, a: RtlNode): boolean
 {
-    const found: FoundMatch[] = []
-    for (const { node } of walk(root))
-    {
-        for (const r of rules)
-        {
-            const m = matchEast(node, r.pattern)
-            if (m)
-            {
-                found.push({
-                    rule: r,
-                    target: node,
-                    childNodes: collectRtlNodes(m),
-                    build: () => r.build(m as any),
-                })
-            }
-        }
-    }
-    return found
+    if (!b.clobbers.every(r => a.clobbers.includes(r))) return false
+    const bBytes = fragmentBytes(b), aBytes = fragmentBytes(a)
+    if (bBytes > aBytes || b.maxStack > a.maxStack) return false
+    return bBytes < aBytes || b.maxStack < a.maxStack || b.clobbers.length < a.clobbers.length
 }
 
 /**
- * Canonical structural key for a (partially tiled) EAST tree — content-based,
- * not object-identity-based. Needed because `fm.build()` mints a fresh
- * `RtlNode` on every rule application, so two different rewrite *orders*
- * that reach the same combined tiling never share object references even
- * though they're the same state. Used by `tileExpr`'s worklist to turn tree
- * search (revisit the same reachable state once per path) into graph search
- * (visit each reachable state once) — see docs/ir-engine.md, "Dedup is
- * implemented; full memoization is not" for the analysis.
+ * Reduce `candidates` to a Pareto frontier per exact output tag-set. This
+ * is what caps a node's contribution to a parent's cross product at a
+ * small constant instead of letting it grow with the subtree underneath.
  *
- * `RtlNode` leaves are hashed by full content (`output`/`fragment`/
- * `clobbers`/`tosDelta`/`maxStack` are all JSON-safe plain data, no cycles),
- * since two structurally-identical fragments could in principle be tagged
- * with different metadata by different rules. EAST leaves/internal nodes are
- * hashed by their semantic content (name/value/operator + recursively-hashed
- * children), not by JS object identity.
+ * Two steps, not one: first collapse exact cost ties (same bytes, maxStack,
+ * *and* clobbers) to a single representative, then apply strict domination
+ * across what's left. The first step matters on its own — a wide
+ * commutative tree has many evaluation orders that cost exactly the same
+ * (e.g. `x + y`'s `LOAD x; ADD y` and `LOAD y; ADD x`), and none of those
+ * dominates another (`dominates` requires a strict improvement), so without
+ * collapsing ties first, every one of them survives and multiplies at the
+ * next level up. Once ties are collapsed, `clobbers ⊆ {"acc", "tos"}`
+ * bounds the rest to at most 4 clobber-subsets per tag, each contributing
+ * only its own (bytes, maxStack) frontier — a small constant, not something
+ * that grows with the subtree.
+ *
+ * Safe to do locally, at every node, because `nodeInvariants` composes
+ * bytes additively and maxStack/clobbers monotonically up the tree:
+ * substituting a same-cost or dominating candidate for another anywhere
+ * inside a larger tiling can only match or beat the original, never lose
+ * to it — the same monotonicity argument optimal bottom-up tree-pattern
+ * selection (BURS-style instruction selection) relies on. See
+ * docs/ir-engine.md.
  */
-function hashTree(node: EastExpression): string
+function pruneToFrontier(candidates: RtlNode[]): RtlNode[]
 {
-    if (isRtlNode(node)) return `R:${JSON.stringify(node)}`
-    if (isLiteral(node)) return `L:${node.value}`
-    if (isIdentifier(node)) return `I:${node.name}`
-    if (isEastBinary(node)) return `B:${node.operator}(${hashTree(node.left)},${hashTree(node.right)})`
-    if (isEastUnary(node)) return `U:${node.operator}(${hashTree(node.argument)})`
-    if (isEastAssign(node)) return `A:${node.operator}(${node.left.name},${hashTree(node.right)})`
-    return `C:${node.callee.name}(${node.arguments.map(hashTree).join(",")})`
+    const groups = new Map<string, RtlNode[]>()
+    for (const c of candidates)
+    {
+        const key = JSON.stringify(c.output)
+        const group = groups.get(key)
+        if (group) group.push(c)
+        else groups.set(key, [c])
+    }
+
+    const kept: RtlNode[] = []
+    for (const group of groups.values())
+    {
+        const byCostPoint = new Map<string, RtlNode>()
+        for (const c of group)
+        {
+            const costKey = `${fragmentBytes(c)}|${c.maxStack}|${[...c.clobbers].sort()}`
+            if (!byCostPoint.has(costKey)) byCostPoint.set(costKey, c)
+        }
+        const reps = [...byCostPoint.values()]
+        for (const a of reps)
+            if (!reps.some(b => b !== a && dominates(b, a)))
+                kept.push(a)
+    }
+    return kept
+}
+
+/**
+ * Every viable tiling of `node`, memoized by object identity in `memo`. An
+ * already-tiled `RtlNode` (a leaf passed in as-is, e.g. by a caller that
+ * pre-tiled part of the tree) is returned unchanged. Otherwise every rule
+ * is tried against `node`; `matchAllEast` resolves each pattern's `Rtl`
+ * leaves by recursing into this same function (memoized), so a subtree
+ * shared by several rules' patterns — or asked for by both this node's own
+ * rules and some rule higher up the tree — is only ever computed once. The
+ * result is pruned to a Pareto frontier before caching, so a dominated
+ * candidate (e.g. a stack-bridge combo that a register combo always beats
+ * when both are available) never survives to inflate a parent's search —
+ * see `pruneToFrontier`. This means `tileNode`/`tileExpr` no longer return
+ * *every* structurally-realizable tiling, only the cost-relevant ones.
+ */
+function tileNode(node: EastExpression, rules: readonly Rule[], memo: WeakMap<EastExpression, RtlNode[]>): RtlNode[]
+{
+    if (isRtlNode(node)) return [node]
+
+    const cached = memo.get(node)
+    if (cached) return cached
+
+    const results: RtlNode[] = []
+    const tile = (n: EastExpression) => tileNode(n, rules, memo)
+
+    for (const r of rules)
+    {
+        const matches = matchAllEast(node, r.pattern, tile)
+        for (const m of matches)
+        {
+            const built = r.build(m as any)
+            if (!built) continue   // realizability prune
+
+            const inherited = collectRtlNodes(m).flatMap(c => [...(nodeRuleNames.get(c) ?? [])])
+            nodeRuleNames.set(built, new Set([r.name, ...inherited]))
+
+            results.push(built)
+        }
+    }
+
+    const pruned = pruneToFrontier(results)
+    memo.set(node, pruned)
+    return pruned
 }
 
 // ── Rule-coverage provenance ────────────────────────────────────────────────
@@ -212,55 +195,9 @@ export const touchedRuleNames = new Set<string>()
  
 export function tileExpr(expr: EastExpression, rules: readonly Rule[], demand?: OutputLocation): RtlNode[]
 {
-    const results: RtlNode[] = []
-    const worklist: EastExpression[] = [expr]
-    // Turns tree search into graph search: many different rewrite orders
-    // reach the same combined tiling (independent sites can be tiled in
-    // either order), and without this every such order re-explores its own
-    // copy of the remaining work. See hashTree's doc comment.
-    const seen = new Set<string>([hashTree(expr)])
-
-    while (worklist.length > 0)
-    {
-        const tree = worklist.pop()!
-
-        // Fully tiled: root is an RtlNode → collect and continue.
-        if (isRtlNode(tree))
-        {
-            results.push(tree)
-            continue
-        }
-
-        const matches = findMatches(tree, rules)
-        for (const fm of matches)
-        {
-            const replacement = fm.build()
-            if (!replacement) continue   // realizability prune
-
-            const inherited = fm.childNodes.flatMap(c => [...(nodeRuleNames.get(c) ?? [])])
-            nodeRuleNames.set(replacement, new Set([fm.rule.name, ...inherited]))
-
-            const newTree = replaceInTree(tree, fm.target, replacement)
-            const key = hashTree(newTree)
-            if (seen.has(key)) continue   // already reached via a different rewrite order
-            seen.add(key)
-            worklist.push(newTree)
-        }
-    }
-
-    if (demand)
-    {
-        const filtered = results.filter(n => outputSatisfies(n, demand))
-        return filtered
-    }
-
-    return results
-}
-
-function outputSatisfies(node: RtlNode, demand?: OutputLocation): boolean
-{
-    if (!demand) return true
-    return outputHas(node.output, demand)
+    const memo = new WeakMap<EastExpression, RtlNode[]>()
+    const results = tileNode(expr, rules, memo)
+    return demand ? results.filter(n => outputHas(n.output, demand)) : results
 }
 
 /** Cheapest-by-byte-count pick among an already-filtered variant set, with

@@ -16,7 +16,7 @@
 
 import type {BinaryOperator, UnaryOperator} from "./ast"
 import type {EastPattern, MatchOf} from "./matcher"
-import {pLiteral, pIdentifier, pRtl, pBinary, pUnary, pAssign, pCall} from "./matcher"
+import {pLiteral, pIdentifier, pRtl, pBinary, pUnary, pAssign, pCall, pBuiltinCall} from "./matcher"
 import type {ComboName, OutputLocation, Resource, RtlInstr, BinaryOpcode, UnaryOpcode, StackCombo} from "./rtl"
 import {CONST, PUSH, LOAD, STORE, opReg, opRegWriteback, opImm, opStack, bare, call, outputHas} from "./rtl"
 import type {RtlNode} from "./east"
@@ -116,11 +116,50 @@ function leafRules(resolveLocal: (name: string) => number): Rule[]
 
 function unaryRules(): Rule[]
 {
-    return UNARY_OPS.map(({ast, isa}) =>
-        rule(`unary:${ast}`, pUnary(ast, pRtl("acc")), m =>
-            unaryNode(m.argumentMatch.node, ["acc"],
-                [...m.argumentMatch.node.fragment, bare(isa)])),
-    )
+    return [
+        ...UNARY_OPS.map(({ast, isa}) =>
+            rule(`unary:${ast}`, pUnary(ast, pRtl("acc")), m =>
+                unaryNode(m.argumentMatch.node, ["acc"],
+                    [...m.argumentMatch.node.fragment, bare(isa)]))),
+
+        // Multi-level pattern: an involution (NEG or NOT) applied twice
+        // cancels, so the inner value can be used as-is with neither
+        // instruction emitted. This spans three AST levels — outer unary,
+        // inner unary, and whatever the inner unary's own argument tiles
+        // to — reaching past the inner UnaryExpression's own raw shape
+        // rather than its (also-viable) one-level-reduced RtlNode. It
+        // competes directly against applying `unary:${ast}` twice, which
+        // costs two extra instructions this always beats on bytes.
+        ...UNARY_OPS.map(({ast}) =>
+            rule(`unary:${ast}${ast}:cancel`, pUnary(ast, pUnary(ast, pRtl("acc"))), m =>
+                m.argumentMatch.argumentMatch.node)),
+    ]
+}
+
+// ── Builtin-call rules ──────────────────────────────────────────────────────
+
+/**
+ * DSL-level built-ins with fixed lowering (isa-core.md §10.5) that take the
+ * `name(arg)` call-like syntax but aren't real procedure calls — each is
+ * exactly one bare unary op, so its single argument is demanded at `"acc"`
+ * (like `unaryRules`' operand) rather than pushed to `"tos"` the way a real
+ * call's arguments are (rules.ts's `callRule`). Matching is purely by
+ * callee name and arity; nothing reserves these names as keywords (per
+ * §10.5, `trap`/etc. are functions, not keywords), so a same-named,
+ * one-argument user procedure would be shadowed by these rules rather than
+ * ever reaching `callRule` — an accepted consequence of "built-in by
+ * convention, not by reserved word."
+ */
+const BUILTIN_UNARY_CALLS: readonly {name: string; isa: UnaryOpcode}[] = [
+    {name: "clz", isa: "CLZ"},
+    {name: "revbits", isa: "REVBITS"},
+] as const
+
+function builtinCallRules(): Rule[]
+{
+    return BUILTIN_UNARY_CALLS.map(({name, isa}) =>
+        rule(`builtin:${name}`, pBuiltinCall(name, "acc"), m =>
+            unaryNode(m.argNode, ["acc"], [...m.argNode.fragment, bare(isa)])))
 }
 
 // ── Binary rule generators ──────────────────────────────────────────────────
@@ -314,6 +353,7 @@ function callRule(): Rule
 export const ruleset = (resolveLocal: (name: string) => number) => [
     ...leafRules(resolveLocal),
     ...unaryRules(),
+    ...builtinCallRules(),
     ...OP_TABLE.flatMap(entry => binaryRulesForOp(entry, resolveLocal)),
     ...assignmentRules(resolveLocal),
     callRule(),

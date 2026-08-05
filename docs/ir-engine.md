@@ -154,6 +154,38 @@ realizable tilings via pattern-rewrite rules and picks the byte-minimal
 result directly — SU-style stack-depth reasoning survives only as a
 tiebreaker among orderings that already tie on byte cost.
 
+**Pattern matching resolves sub-tilings on demand, not against a
+pre-rewritten tree.** A rule's pattern can nest arbitrarily deep (e.g. a
+`Unary` inside another `Unary`'s argument slot), and the only leaf that
+ever needs an already-tiled value is one explicitly tagged `Rtl(...)` —
+every other position is matched directly against the AST's own shape
+(operator, kind), untouched. Resolving an `Rtl` leaf means recursively
+tiling whatever subtree sits there and filtering its candidates by the
+demanded tag, not checking whether some earlier pass happened to have
+already rewritten that position. The alternative — reduce every child to
+its finished candidate table before a parent's rules ever run — is the
+more obvious way to implement bottom-up tiling, but it would silently
+foreclose multi-level rules: by the time a parent got to inspect a child,
+the child's own raw operator/kind shape would already be gone, replaced by
+whatever candidates it reduced to. Demand-driven resolution keeps that raw
+shape visible for as many levels as a pattern cares to nest.
+
+**Fixed-lowering built-ins get their own pattern kind, not the real-call
+one.** `clz(x)`/`revbits(x)` (isa-core.md §10.5) parse identically to a
+real procedure call — `Identifier(args)` — but a `CallPattern` match
+demands every argument already be tiled to `"tos"`, matching the pushed-
+argument convention real calls use. Bare `CLZ`/`REVBITS` operate on `acc`
+directly, so forcing their operand through `"tos"` would mean an
+unnecessary push/pop around what should be a single instruction beyond the
+operand. Rather than bend `CallPattern` to support a per-call argument
+demand it otherwise never needs, `BuiltinCallPattern` matches by callee
+name and arity directly and demands its one argument at whatever tag the
+built-in actually needs. Nothing reserves these names as keywords — a
+same-named, same-arity user procedure would be shadowed rather than ever
+reaching the real call rule, which is the accepted cost of "built-in by
+naming convention," matching how `trap` is already documented as "a
+function, not a keyword" (§10.5).
+
 ---
 
 ## Known gaps and open work
@@ -195,21 +227,68 @@ This spec's addressing-mode cut removes the combo that idea depended on —
 every remaining stack-read combo reclaims what it reads — so the idea has
 no combo left to use, not merely a missing implementation.
 
-**Dedup is implemented; full memoization is not — still open for wide
-trees.** `tileExpr`'s worklist (`orchestrator.ts`) hashes each
-partially-tiled expression tree structurally and skips re-exploring a
-state already reached via a different rewrite order, which fixed a real
-timeout (a 4-leaf balanced sum under a `"tos"` demand: >120s before,
-~20ms after). It does not fix the underlying growth in distinct
-output-variant combinations as trees widen. Measured after the combo-set
-migration above (which roughly halved the branching factor at every
-stack-bridging site by removing two of the four stack combos): ~186ms at 6
-leaves, ~5.6s at 8, ~28s at 9, and 10 did not finish in the time given —
-better than the pre-migration figures (~22.5s at 8, 10 not finishing in
-120s) but still exponential-ish, not fixed. A `(subtree, demanded_output)
-→ tiling_set` memoization cache — reusing the same structural-hashing
-machinery — remains the next step if wider expressions need to lower
-quickly.
+**Tiling is now bottom-up recursion memoized by node identity, not a
+worklist.** `tileNode` (`orchestrator.ts`) directly computes every viable
+tiling of an EAST subtree, caching the result per node in a `WeakMap`; the
+old worklist model — mutate a copy of the whole tree one rewrite at a time
+and re-scan it for the next match — is gone, along with the structural
+`hashTree`/`seen` dedup it needed to avoid re-deriving the same combined
+tiling via a different rewrite *order*. That source of redundancy doesn't
+exist in the new model at all: recursion never explores orderings, so
+there is nothing for memoization-by-identity to actually deduplicate on a
+plain tree (no node is ever any other node's child), but it costs nothing
+to keep and protects against any future DAG-like sharing (e.g. CSE). The
+matcher (`matchAllEast`, `matcher.ts`) resolves a pattern's `Rtl` leaves by
+calling back into `tileNode` on demand rather than assuming the tree has
+already been pre-rewritten there, which is what lets a multi-level pattern
+(e.g. `pUnary(op, pUnary(op, ...))`) still see an intermediate node's raw,
+untiled shape — the involution-cancellation rules below depend on exactly
+this.
+
+Removing the order-redundancy is a large, measured win at the sizes that
+previously blew up: a balanced sum tree under an `"acc"` demand now takes
+2.3ms at 6 leaves, 5.9ms at 8, 9.6ms at 9, 20ms at 10 — all of which used
+to take seconds or not finish (worklist figures: ~186ms at 6, ~5.6s at 8,
+~28s at 9, 10 not finishing). It doesn't make tiling linear on its own,
+though: the number of *equally-realizable* tilings of a wide tree is
+genuinely combinatorial (each internal node's candidate count is the cross
+product of its children's tag-relevant candidate counts), so without
+further pruning a node keeps every one of them and the count still grows
+with tree width — 164ms at 12 leaves, 874ms at 14, 3.9s at 16 (524288
+variants at the root), heap exhaustion around n=18–20.
+
+`tileNode` now prunes every node's candidate table to a Pareto frontier
+before caching it (`pruneToFrontier`, `orchestrator.ts`), which closes this
+properly. Two steps matter, not one: first collapse candidates that tie
+*exactly* on `(bytes, maxStack, clobbers)` to a single representative —
+this is the dominant effect for a commutative tree, since e.g. `x + y`'s
+two evaluation orders (`LOAD x; ADD y` vs `LOAD y; ADD x`) cost identically
+and neither one *dominates* the other (domination needs a strict
+improvement), so without this step ties simply accumulate and multiply at
+the next level up. Second, apply strict domination across what's left —
+`clobbers ⊆ {"acc", "tos"}` bounds that to at most 4 clobber-subsets per
+output tag, each keeping only its own small `(bytes, maxStack)` frontier.
+Both steps are safe to apply locally, at every node: `nodeInvariants`
+composes bytes additively and maxStack/clobbers monotonically up the tree,
+so substituting a same-cost or dominating candidate for another anywhere
+inside a larger tiling can only match or beat the original, never lose to
+it — the standard justification for local pruning in bottom-up optimal
+tree-pattern selection (BURS-style instruction selection).
+
+With both steps, `tileExpr` is now effectively flat in tree width: the
+same balanced-sum benchmark measures 2-6ms of tiling time all the way from
+n=16 to n=128 (`test/bench.ts`). `pickCheapest` still only runs once, at
+the root, exactly as before — pruning just keeps every node's table from
+growing into something worth running it against.
+
+While measuring this, a separate, unrelated bottleneck turned up: at
+n≈128+, `test/bench.ts`'s wall-clock time is dominated by *parsing*, not
+tiling — the grammar's generated recursive-descent parser (`grammer.pegjs`)
+takes seconds to tens of seconds on a deeply-nested wide expression well
+before `tileExpr` is ever called, independent of anything in `machine/`.
+This wasn't investigated further (out of scope for tiling work), but is
+worth a future session knowing about before assuming a slow wide-expression
+benchmark is a tiling regression.
 
 **Common-subexpression elimination is not implemented.** A repeated
 subexpression re-evaluates every occurrence; the multi-location
@@ -217,6 +296,16 @@ assignment output (`{acc, reg(target)}`) is the one piece of machinery
 already in place that CSE could build on, since it lets a value already
 resident in a register serve as an operand for more than one consumer
 without re-computing it.
+
+**`trap(code)` is the one documented built-in still unlowered.** §10.5 lists
+three fixed-lowering built-ins; `clz`/`revbits` now have rules
+(`rules.ts`'s `builtinCallRules`, matched via matcher.ts's
+`BuiltinCallPattern`), but `trap(code)` doesn't fit that same shape — its
+argument is a literal baked directly into the instruction's `imm`
+(`TRAP #code`), not a general expression tiled to a register location, so
+it needs its own pattern (matching the argument as `pLiteral()` rather
+than demanding a tag) rather than reusing `BuiltinCallPattern` as-is.
+Unstarted, not designed against.
 
 **`CALL` has no working dispatch.** The spec's `CALL proc_idx` takes a
 numeric procedure-table index, but the current IR (`rtl.ts`) carries a

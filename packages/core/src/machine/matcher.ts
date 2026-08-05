@@ -69,6 +69,22 @@ export interface AssignPattern<V extends EastPattern = EastPattern>
  */
 export interface CallPattern { kind: "Call" }
 
+/**
+ * Builtin-call pattern: `name(arg)` — the DSL's function-call-like syntax
+ * for a fixed-lowering built-in (isa-core.md §10.5, e.g. `clz(x)`,
+ * `revbits(x)`), distinct from `CallPattern`'s real-procedure-call shape.
+ * Unlike a real call, the argument is demanded at `argOutput` directly
+ * (typically `"acc"`, since these lower to a bare unary op) rather than
+ * always pushed to `"tos"` — there's exactly one argument, matched by
+ * position, not a sub-pattern, since every current built-in is unary.
+ */
+export interface BuiltinCallPattern
+{
+    kind: "BuiltinCall"
+    name: string
+    argOutput: OutputLocation
+}
+
 // 2. Match interfaces
 
 export interface LiteralMatch { kind: "Literal"; value: number }
@@ -108,6 +124,12 @@ export interface CallMatch
     argNodes: RtlNode[]
 }
 
+export interface BuiltinCallMatch
+{
+    kind: "BuiltinCall"
+    argNode: RtlNode
+}
+
 // 3. Union types
 
 export type EastPattern =
@@ -118,6 +140,7 @@ export type EastPattern =
     | UnaryPattern
     | AssignPattern
     | CallPattern
+    | BuiltinCallPattern
 
 export type EastMatch =
     | LiteralMatch
@@ -127,6 +150,7 @@ export type EastMatch =
     | UnaryMatch
     | AssignMatch
     | CallMatch
+    | BuiltinCallMatch
 
 // 4. MatchOf<P> — pattern → match mapping (recursively maps child sub-patterns)
 
@@ -141,96 +165,113 @@ export type MatchOf<P extends EastPattern> =
   : P extends AssignPattern<infer V>
       ? AssignMatch<MatchOf<V>>
   : P extends CallPattern          ? CallMatch
+  : P extends BuiltinCallPattern   ? BuiltinCallMatch
   : never
 
-// 5. matchEast — single dispatcher, inlines all per-kind matching
-
-export function matchEast<P extends EastPattern>(
+// 5. matchAllEast — single dispatcher, inlines all per-kind matching
+//
+// Returns every way `P` can match `N`, not just the first. A pattern's `Rtl`
+// leaf can be satisfied by more than one candidate tiling of the subtree
+// underneath it (e.g. a stack combo needs `"acc"` specifically, but that
+// subtree might also have a `"tos"` and a register-writeback candidate) —
+// each is a distinct match, and a `Binary`/`Unary`/`Assign`/`Call` pattern
+// combines its children's match sets via cross product, since any pairing
+// of a viable left match with a viable right match is itself viable.
+//
+// `tile` resolves a `Rtl` leaf on demand: rather than requiring the tree to
+// already contain a pre-rewritten `RtlNode` at that position (the old
+// worklist model's assumption), it recursively tiles whatever raw AST
+// subtree sits there right now. This is what lets a pattern reach two or
+// more AST levels deep — nesting e.g. `pUnary(op, pUnary(op, ...))` — since
+// intermediate levels are matched directly against their still-raw shape
+// (operator/kind equality only) and only a pattern's own `Rtl` leaves ever
+// trigger tiling. A naive "fully tile children, then match the parent
+// against the finished result" scheme would have already collapsed an
+// intermediate node before the parent's pattern ever got to see its raw
+// shape — see docs/ir-engine.md for why this matters.
+export function matchAllEast<P extends EastPattern>(
     N: EastExpression,
     P: P,
-): MatchOf<P> | undefined
+    tile: (node: EastExpression) => readonly RtlNode[],
+): MatchOf<P>[]
 {
     switch (P.kind)
     {
         case "Literal":
-            return (isLiteral(N)
-                ? { kind: "Literal", value: N.value } as MatchOf<P>
-                : undefined)
+            return isLiteral(N)
+                ? [{ kind: "Literal", value: N.value } as MatchOf<P>]
+                : []
 
         case "Identifier":
-            return (isIdentifier(N)
-                ? { kind: "Identifier", name: N.name } as MatchOf<P>
-                : undefined)
+            return isIdentifier(N)
+                ? [{ kind: "Identifier", name: N.name } as MatchOf<P>]
+                : []
 
         case "Rtl":
-            if (!isRtlNode(N)) return undefined
-            // Output is always an array; demand check is `.includes` uniformly.
-            if (P.output !== undefined && !outputHas(N.output, P.output)) return undefined
-            return { kind: "Rtl", node: N } as MatchOf<P>
+        {
+            const candidates = tile(N)
+            const filtered = P.output === undefined
+                ? candidates
+                : candidates.filter(c => outputHas(c.output, P.output!))
+            return filtered.map(node => ({ kind: "Rtl", node } as MatchOf<P>))
+        }
 
         case "Binary":
         {
-            if (!isEastBinary(N)) return undefined
-            if (N.operator !== P.operator) return undefined
-            const leftMatch = matchEast(N.left, P.left)
-            if (leftMatch === undefined) return undefined
-            const rightMatch = matchEast(N.right, P.right)
-            if (rightMatch === undefined) return undefined
-            return {
-                kind: "Binary",
-                operator: N.operator,
-                leftMatch,
-                rightMatch,
-            } as MatchOf<P>
+            if (!isEastBinary(N)) return []
+            if (N.operator !== P.operator) return []
+            const leftMatches = matchAllEast(N.left, P.left, tile)
+            if (leftMatches.length === 0) return []
+            const rightMatches = matchAllEast(N.right, P.right, tile)
+            if (rightMatches.length === 0) return []
+            const out: MatchOf<P>[] = []
+            for (const leftMatch of leftMatches)
+                for (const rightMatch of rightMatches)
+                    out.push({ kind: "Binary", operator: N.operator, leftMatch, rightMatch } as MatchOf<P>)
+            return out
         }
 
         case "Unary":
         {
-            if (!isEastUnary(N)) return undefined
-            if (N.operator !== P.operator) return undefined
-            const argumentMatch = matchEast(N.argument, P.argument)
-            if (argumentMatch === undefined) return undefined
-            return {
-                kind: "Unary",
-                operator: N.operator,
-                argumentMatch,
-            } as MatchOf<P>
+            if (!isEastUnary(N)) return []
+            if (N.operator !== P.operator) return []
+            return matchAllEast(N.argument, P.argument, tile)
+                .map(argumentMatch => ({ kind: "Unary", operator: N.operator, argumentMatch } as MatchOf<P>))
         }
 
         case "Assign":
         {
-            if (!isEastAssign(N)) return undefined
-            if (N.operator !== P.operator) return undefined
+            if (!isEastAssign(N)) return []
+            if (N.operator !== P.operator) return []
             // left is always an Identifier per the EAST type
-            if (N.left.type !== "Identifier") return undefined
-            const rightMatch = matchEast(N.right, P.right)
-            if (rightMatch === undefined) return undefined
-            return {
-                kind: "Assign",
-                operator: N.operator,
-                target: N.left.name,
-                rightMatch,
-            } as MatchOf<P>
+            if (N.left.type !== "Identifier") return []
+            return matchAllEast(N.right, P.right, tile)
+                .map(rightMatch => ({ kind: "Assign", operator: N.operator, target: N.left.name, rightMatch } as MatchOf<P>))
         }
 
         case "Call":
         {
-            if (!isEastCall(N)) return undefined
+            if (!isEastCall(N)) return []
             // callee is always an Identifier per the EAST type
-            if (N.callee.type !== "Identifier") return undefined
-            // All args must be RtlNodes whose output includes "tos" (the only
-            // planned call shape — arg expressions pre-tiled, each pushed).
-            const argNodes: RtlNode[] = []
-            for (const arg of N.arguments)
-            {
-                if (!isRtlNode(arg) || !arg.output.includes("tos")) return undefined
-                argNodes.push(arg)
-            }
-            return {
-                kind: "Call",
-                callee: N.callee.name,
-                argNodes,
-            } as MatchOf<P>
+            if (N.callee.type !== "Identifier") return []
+            // Every argument must tile to at least one `"tos"` candidate (the
+            // only planned call shape — each arg expression pushed in turn);
+            // the match set is the cross product across all argument slots.
+            const perArg = N.arguments.map(arg => tile(arg).filter(c => outputHas(c.output, "tos")))
+            if (perArg.some(cands => cands.length === 0)) return []
+            let combos: RtlNode[][] = [[]]
+            for (const cands of perArg)
+                combos = combos.flatMap(prefix => cands.map(c => [...prefix, c]))
+            return combos.map(argNodes => ({ kind: "Call", callee: N.callee.name, argNodes } as MatchOf<P>))
+        }
+
+        case "BuiltinCall":
+        {
+            if (!isEastCall(N)) return []
+            if (N.callee.type !== "Identifier" || N.callee.name !== P.name) return []
+            if (N.arguments.length !== 1) return []
+            const candidates = tile(N.arguments[0]!).filter(c => outputHas(c.output, P.argOutput))
+            return candidates.map(argNode => ({ kind: "BuiltinCall", argNode } as MatchOf<P>))
         }
     }
 }
@@ -263,3 +304,6 @@ export const pAssign = <V extends EastPattern>(
     ({ kind: "Assign", operator, right })
 
 export const pCall = (): CallPattern => ({ kind: "Call" })
+
+export const pBuiltinCall = (name: string, argOutput: OutputLocation): BuiltinCallPattern =>
+    ({ kind: "BuiltinCall", name, argOutput })
