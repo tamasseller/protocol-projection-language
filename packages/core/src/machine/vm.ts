@@ -126,9 +126,9 @@ function skipBlocks(body: RtlInstr[], pc: number, count: number): number
 // closing a LOOP's body block is an unconditional back-edge to the opener.
 
 type BlockFrame =
-    | {kind: "case"; remaining: number}
-    | {kind: "loopCond"; loopPc: number}
-    | {kind: "loopBody"; loopPc: number}
+    | {kind: "case"; remaining: number; entryTos: number}
+    | {kind: "loopCond"; loopPc: number; entryTos: number}
+    | {kind: "loopBody"; loopPc: number; entryTos: number}
 
 /** Run one procedure to completion. All VM state is local to this call —
  *  a nested CALL would just be a nested call to this function. */
@@ -235,18 +235,25 @@ function runProc(proc: RtlProc, args: readonly number[]): {acc: number; steps: n
                 const N = i.imm
                 if(acc >= N) { pc = skipBlocks(body, pc + 1, N); break } // implicit default
                 pc = skipBlocks(body, pc + 1, acc) // skip cases before the selected one
-                ctrl.push({kind: "case", remaining: N - acc - 1})
+                ctrl.push({kind: "case", remaining: N - acc - 1, entryTos: tos})
                 break
             }
 
             case "LOOP":
-                ctrl.push({kind: "loopCond", loopPc: pc})
+                ctrl.push({kind: "loopCond", loopPc: pc, entryTos: tos})
                 pc++
                 break
 
             case "BLOCK_END": {
                 const top = ctrl.pop()
                 if(!top) throw new Error(`BLOCK_END at ${pc}: no open block`)
+
+                // §8.1: any TOS surplus above the block's entry depth is
+                // implicitly dropped here — the producer never emits its
+                // own cleanup pops, this is the "block boundary handles it"
+                // the spec promises.
+                assert.ok(tos >= top.entryTos, `TOS underflow at BLOCK_END ${pc}: below block entry depth`)
+                tos = top.entryTos
 
                 if(top.kind === "case")
                 {
@@ -256,7 +263,7 @@ function runProc(proc: RtlProc, args: readonly number[]): {acc: number; steps: n
                 if(top.kind === "loopCond")
                 {
                     if(acc === 0) { pc = skipBlocks(body, pc + 1, 1); break } // exit: skip the body block
-                    ctrl.push({kind: "loopBody", loopPc: top.loopPc})
+                    ctrl.push({kind: "loopBody", loopPc: top.loopPc, entryTos: top.entryTos})
                     pc++
                     break
                 }

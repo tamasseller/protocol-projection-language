@@ -322,14 +322,15 @@ describe("Call", () =>
     // takes an acc-output candidate and appends a bare PUSH, so the
     // reg-flip trick from the immediate-operand tests above doesn't apply
     // here: the direct-immediate-with-trailing-PUSH form ties with both
-    // stack-bridge evaluation orders of (literal, identifier).
-    test("foo(x + 1) — computed arg, three-way tie", () =>
+    // stack-bridge evaluation orders of (literal, identifier) on bytes and
+    // maxStack alone — but PEEK_PEEK clobbers `["acc", "tos"]` where the
+    // direct-immediate form only clobbers `["acc"]` (rtl.ts's `COMBO`
+    // table), so the direct form strictly dominates once clobbers count as
+    // a tie-break axis (orchestrator.ts's `dominates`): it's the unique
+    // winner, not merely one member of a surviving tied set.
+    test("foo(x + 1) — computed arg", () =>
     {
-        checkWinnerOneOf("return foo(x + 1);", "acc", [
-            ["LOAD x", "ADD #1", "PUSH", "CALL foo"],
-            ["CONST #1", "PUSH", "LOAD x", "ADD [tos-1] → [tos-1]", "CALL foo"],
-            ["LOAD x", "PUSH", "CONST #1", "ADD [tos-1] → [tos-1]", "CALL foo"],
-        ])
+        checkWinner("return foo(x + 1);", "acc", ["LOAD x", "ADD #1", "PUSH", "CALL foo"])
     })
 })
 

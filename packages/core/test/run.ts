@@ -9,6 +9,8 @@ import "./projection.runtime.test"
 import "./grammar.test"
 import "./lowering.test"
 import "./e2e.test"
+import "./algorithms.test"
+import "./coverage-sweep.test"
 
 // Must come last: reports on rule-name coverage accumulated by every
 // lowerExpr call in the files above (see the file for why).

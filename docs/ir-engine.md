@@ -194,7 +194,7 @@ This section is the one place this document tracks state rather than
 timeless rationale — it exists so a future session doesn't have to
 rediscover the following from scratch.
 
-**The RTL-level implementation is migrated; a real byte encoder still
+✅ **The RTL-level implementation is migrated; a real byte encoder still
 doesn't exist.** `packages/core/src/machine/` (`rtl.ts`'s combo/opcode
 types, `rules.ts`'s rule generation, `encoding.ts`'s cost model, `vm.ts`'s
 dispatch) now match this spec's combo set and op classification — the
@@ -206,7 +206,7 @@ byte layout — `encoding.ts` remains a relative cost estimate for the
 lowerer's own candidate comparison, not a real codec, matching the
 abstraction level the code was already at before this migration.
 
-**The cost-model tie-break gap this migration exposed is now structurally
+✅ **The cost-model tie-break gap this migration exposed is now structurally
 closed, not patched over.** `orchestrator.ts`'s `pickCheapest` still breaks
 ties by byte count, then fragment length, then peak stack depth
 (`maxStack`), with no `tosDelta` criterion — but the specific tie that
@@ -227,7 +227,7 @@ This spec's addressing-mode cut removes the combo that idea depended on —
 every remaining stack-read combo reclaims what it reads — so the idea has
 no combo left to use, not merely a missing implementation.
 
-**Tiling is now bottom-up recursion memoized by node identity, not a
+✅ **Tiling is now bottom-up recursion memoized by node identity, not a
 worklist.** `tileNode` (`orchestrator.ts`) directly computes every viable
 tiling of an EAST subtree, caching the result per node in a `WeakMap`; the
 old worklist model — mutate a copy of the whole tree one rewrite at a time
@@ -289,6 +289,34 @@ before `tileExpr` is ever called, independent of anything in `machine/`.
 This wasn't investigated further (out of scope for tiling work), but is
 worth a future session knowing about before assuming a slow wide-expression
 benchmark is a tiling regression.
+
+✅ **Rule coverage is now a hard gate, and a real VM bug turned up while
+building the exercise that surfaces it.** Every lowering rule in
+`rules.ts` is now driven to win somewhere by a deliberately-shaped probe
+(`coverage-sweep.test.ts`) and the result is asserted, not just logged
+(`rule-coverage.test.ts`); Pareto pruning means a rule only shows up if
+some expression makes it strictly cheapest or the first-inserted member of
+an exact tie, so several probe shapes needed real reasoning about the cost
+model to construct (documented per-shape in that file). On top of that,
+`algorithms.test.ts` lowers and executes four well-known algorithms
+(Collatz, Stein's binary GCD, bitwise integer sqrt, Russian peasant
+multiplication) against a plain-JS reference across a wide input sweep, to
+stress-test composition rather than individual rules. Stein's GCD failed:
+a local declared inside an `if`/`while` body (e.g. the swap temporary)
+read stale data on a later pass through that same block. The cause was in
+`vm.ts`, not the lowerer — `BLOCK_END` popped its control-stack frame and
+adjusted `pc` but never actually restored `tos` to the block's entry
+depth, even though §8.1 is explicit that this reset is the block
+boundary's job, not the producer's ("the producer never emits explicit
+cleanup pops; the block boundary handles it"), and §10.3 says the same
+thing from the lowering side (every DSL block "closes via a real
+`BLOCK_END` that resets TOS"). The lowerer was already conforming to that
+contract; the VM just wasn't honoring it. Fixed by giving each
+`BlockFrame` (`case`/`loopCond`/`loopBody`) an `entryTos` captured at
+`BR_TABLE`/`LOOP` time, and having `BLOCK_END` reset `tos` to it
+unconditionally before doing anything else, plus an assertion for §8.1's
+other half (`tos` may never end up *below* entry depth). All 314 tests
+pass with the fix in, including the Stein's GCD sweep across a,b = 1..30.
 
 **Common-subexpression elimination is not implemented.** A repeated
 subexpression re-evaluates every occurrence; the multi-location
