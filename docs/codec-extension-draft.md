@@ -1,16 +1,21 @@
 # Codec Extension — Draft Notes (recovered, historical)
 
-> **Status: historical draft, non-normative.** This is not new writing — it's
-> the codec-extension-specific portion of an early `docs/ir-engine.md`
-> revision, recovered from git history (the "object handles" design landed in
-> commit `a80b35d`; the whole file was removed in the documentation cleanup at
-> `e4f4da0`, along with the rest of that draft's now-superseded generic-core
-> rationale, which current `isa-core.md`/`ir-engine.md` already cover more
-> precisely). It's reproduced here verbatim because the codec extension itself
-> (ROADMAP.md items 6–8) was never re-specified after the cleanup, and this is
-> the most detailed record of that design that exists. Section numbers are
-> unchanged from the original document — they're internal cross-references
-> within this excerpt, not pointers into current docs.
+> **Status: historical draft, non-normative — superseded by
+> [codec-extension.md](./codec-extension.md).** That document is now the
+> normative *what* for the codec extension (ROADMAP.md item 7), in
+> isa-core.md's style; this file remains as the *why* behind its
+> non-obvious choices, the same role ir-engine.md plays for isa-core.md.
+> Read codec-extension.md first; come here only for rationale it doesn't
+> restate.
+>
+> This is not new writing — it's the codec-extension-specific portion of an
+> early `docs/ir-engine.md` revision, recovered from git history (the
+> "object handles" design landed in commit `a80b35d`; the whole file was
+> removed in the documentation cleanup at `e4f4da0`, along with the rest of
+> that draft's now-superseded generic-core rationale, which current
+> `isa-core.md`/`ir-engine.md` already cover more precisely). Section
+> numbers are unchanged from the original document — they're internal
+> cross-references within this excerpt, not pointers into current docs.
 >
 > **Known discrepancy vs. the current implementation:** this draft's `CALL`
 > carries `proc_idx, arg_count` as two operands. The ISA as actually built

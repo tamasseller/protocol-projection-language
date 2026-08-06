@@ -4,7 +4,7 @@
  * Exercises the `Extension` object threaded through every core stage using
  * a toy opcode, `double(x)` → `EXT DOUBLE_REG [regIndex]`: doubles a local
  * variable's value into `acc`. Not a real extension (that's the codec
- * extension, ROADMAP.md item 7, docs/codec-extension-draft.md) — just
+ * extension, ROADMAP.md item 7, docs/codec-extension.md) — just
  * enough to prove the hook itself works end to end, and that every stage
  * still behaves exactly as before when no extension is registered.
  */

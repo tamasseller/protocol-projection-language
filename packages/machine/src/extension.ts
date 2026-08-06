@@ -4,7 +4,7 @@
  * The generic core (rules.ts/lower.ts/validate.ts/vm.ts/bytecode.ts) never
  * hardcodes any domain-specific opcode. An `Extension` bundles everything a
  * concrete extension (e.g. the codec extension — ROADMAP.md item 7,
- * docs/codec-extension-draft.md) needs to plug into every stage: DSL-side
+ * docs/codec-extension.md) needs to plug into every stage: DSL-side
  * call resolution, the validator's stack-effect bookkeeping, VM execution,
  * and wire encode/decode. Every core entry point takes its `extension` as
  * an optional trailing parameter, defaulting to none — so nothing about an
@@ -19,8 +19,8 @@ import type { ExtInstr } from "./rtl"
 
 /**
  * Declared stack effect of one extension opcode (the "effect declarations"
- * idea from the historical codec-extension draft — docs/codec-extension-
- * draft.md §2.12) — lets validate.ts's per-procedure walk and vm.ts's
+ * idea from the codec extension spec — docs/codec-extension.md §6.3) — lets
+ * validate.ts's per-procedure walk and vm.ts's
  * dispatch stay ignorant of what the op actually does, needing only these
  * numbers/flags to keep isa-core.md §8's guarantees.
  */

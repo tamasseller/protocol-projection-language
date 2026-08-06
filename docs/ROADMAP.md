@@ -113,16 +113,20 @@ callee's last argument in `acc` rather than the stack (isa-core.md §4.6,
 Depends on (6). The actual codec stream-I/O and codec-invocation opcodes,
 likely implemented as an `Extension` (§11) inside `@ppl/codecs` — codec
 semantics have no business living inside `@ppl/machine`, which stays
-generic and protocol-agnostic by design (5).
+generic and protocol-agnostic by design (5). Specified in
+`docs/codec-extension.md` (design spec, not yet implemented; supersedes
+`docs/codec-extension-draft.md` as the normative reference — that file is
+now rationale-only, ir-engine.md's role relative to isa-core.md).
 
 Also worth designing once there's a real extension to design it against,
-deferred from (6) for exactly that reason: whether the validator should let
-an extension delegate custom, non-peak-shaped invariants (e.g. a handle
-must be entered before it's read) into the same walk it already does, and
-whether per-extension resource-peak statistics (e.g. maximum concurrent
-stream/object-handle counts) should generalize the existing stack-depth
-(§8.3) machinery to track named resources beyond the real TOS, getting the
-same per-procedure/tight-cross-call-site treatment for free.
+deferred from (6) for exactly that reason (`codec-extension.md` §7):
+whether the validator should let an extension delegate custom,
+non-peak-shaped invariants (e.g. a handle must be entered before it's read)
+into the same walk it already does, and whether per-extension resource-peak
+statistics (e.g. maximum concurrent stream/object-handle counts) should
+generalize the existing stack-depth (§8.3) machinery to track named
+resources beyond the real TOS, getting the same per-procedure/tight-cross-
+call-site treatment for free.
 
 ## 8. Remaining wire framing and codec-referenced-type serdes
 
