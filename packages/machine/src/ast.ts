@@ -1,5 +1,5 @@
 /**
- * @ppl/core — IR Grammar AST type definitions
+ * @ppl/machine — IR Grammar AST type definitions
  *
  * TypeScript types for the AST produced by the PEG.js parser (grammer.pegjs).
  * These types are referenced by the generated parser.d.ts via --return-types.

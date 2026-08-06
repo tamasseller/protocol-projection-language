@@ -1,5 +1,5 @@
 /**
- * @ppl/core/machine — RTL instruction representation
+ * @ppl/machine — RTL instruction representation
  *
  * Single source of truth for the lowered IR's instruction type. Consolidates
  * the former `RtlInstr` (east.ts), `ComboName`/`OutputLocation`/`Resource`
@@ -117,7 +117,7 @@ export type MoveRegOpcode = "LOAD" | "STORE"
  * optional — TS enforces the combo→field correlation by construction.
  *
  * Consumer narrowing recipe:
- *   1. `"callee" in instr`             → CALL
+ *   1. `"calleeIndex" in instr`        → CALL
  *   2. `instr.op === "BR_TABLE"/"TRAP"` → parametric
  *   3. `"combo" in instr`               → binary (arithmetic/comparison);
  *      sub-narrow by combo: `target` → register-combo, `imm` → IMM_ACC,
@@ -148,12 +148,36 @@ export type RtlInstr =
     | { op: UnaryOpcode | ControlOpcode | "PUSH" | "POP" }
     // 5. Parametric: single numeric parameter (BR_TABLE case count, TRAP code).
     | { op: "BR_TABLE" | "TRAP"; imm: number }
-    // 6. Call: procedure invocation by name.
-    | { op: "CALL"; callee: string }
+    // 6. Call: procedure invocation by resolved procedure-table index
+    //    (isa-core.md §2.3, §4.6) — never a bare name; resolving a callee
+    //    name to its table index is `lower.ts`'s job, on the fly, as it
+    //    discovers each procedure (ROADMAP.md item 2).
+    | { op: "CALL"; calleeIndex: number }
+    // 7. Extension: one domain-specific opcode (isa-core.md §5.1, byte
+    //    ≥128 — "owned by the active extension"). `ext` is opaque to the
+    //    generic core; `operands` are literal constants only, by design
+    //    (ROADMAP.md item 6) — never a register/stack reference resolved
+    //    at runtime, so an AOT translator can implement whatever an
+    //    extension op abstracts away (a struct field access, a `*ptr++`
+    //    read, ...) with ordinary target-native code, not an interpreter
+    //    loop. What an `ext` name means — its stack effect, VM execution,
+    //    and wire encoding — comes from an `Extension` object threaded
+    //    through `ruleset`/`lowerProgram`/`validateProgram`/`run`/
+    //    `encodeInstr`/`decodeInstr` as an optional parameter (see
+    //    extension.ts); with none registered, an `EXT` instruction is
+    //    simply data no stage knows how to interpret.
+    | { op: "EXT"; ext: string; operands: readonly number[] }
 
 
 export const isCallInstr = (i: RtlInstr): i is Extract<RtlInstr, { op: "CALL" }> =>
     i.op === "CALL"
+
+/** The `EXT` variant on its own — the shape `Extension.exec`/`ExtCodec`
+ *  (extension.ts) operate on. */
+export type ExtInstr = Extract<RtlInstr, { op: "EXT" }>
+
+export const isExtInstr = (i: RtlInstr): i is ExtInstr =>
+    i.op === "EXT"
 
 export const isParametricInstr = (i: RtlInstr): i is Extract<RtlInstr, { op: "BR_TABLE" | "TRAP" }> =>
     i.op === "BR_TABLE" || i.op === "TRAP"
@@ -219,15 +243,35 @@ export const brTable = (n: number): RtlInstr =>
 export const trap = (code: number): RtlInstr =>
     ({ op: "TRAP", imm: code })
 
-/** `CALL callee` — procedure invocation by name. */
-export const call = (callee: string): RtlInstr =>
-    ({ op: "CALL", callee })
+/** `CALL proc_idx` — invoke `procedure[calleeIndex]` (isa-core.md §4.6).
+ *  Calling convention: the callee's *last* argument (if any) arrives in
+ *  `acc`, not via the stack — `acc` is clobbered by the call regardless
+ *  (the callee's return value overwrites it), so routing the last argument
+ *  through it costs nothing and saves a `PUSH` for the extremely common
+ *  single-argument call. Only the callee's other `argCount - 1` arguments
+ *  (0 for a 0- or 1-argument callee) are actually popped off the stack. */
+export const call = (calleeIndex: number): RtlInstr =>
+    ({ op: "CALL", calleeIndex })
+
+/** `EXT ext operands...` — one extension-defined opcode (isa-core.md §5.1).
+ *  `operands` are literal constants, resolved at lowering time (register
+ *  indices, procedure-table indices, small handle literals, ...) — never
+ *  computed at runtime. */
+export const extInstr = (ext: string, operands: readonly number[]): ExtInstr =>
+    ({ op: "EXT", ext, operands })
 
 
 export interface RtlProc
 {
     argCount: number
     body: RtlInstr[]
+    /** Extension-owned header data (isa-core.md §2.3's extension fields —
+     *  e.g. the codec extension's ABI-kind selector). Opaque to the
+     *  generic core: never read or interpreted by `lower.ts`/`validate.ts`/
+     *  `vm.ts`/`bytecode.ts` themselves, only carried through from the
+     *  `Procedure` it was lowered from for whatever extension put it there
+     *  to read back. */
+    header?: unknown
 }
 
 export interface RtlProgram
@@ -253,7 +297,7 @@ export interface RtlProgram
 //   RETURN / BLOCK_END / ...    bare control
 //   BR_TABLE 3                  parametric
 //   TRAP 0                      parametric
-//   CALL foo                    call
+//   CALL 2                      call
 // ─────────────────────────────────────────────────────────────────────────────
 
 const STACK_OPERAND: Record<StackCombo, string> = {
@@ -272,9 +316,13 @@ const STACK_RESULT: Partial<Record<StackCombo, string>> = {
  */
 export function format(instr: RtlInstr): string
 {
+    // 7. EXT
+    if (instr.op === "EXT")
+        return [instr.ext, ...instr.operands].join(" ")
+
     // 6. CALL
     if (instr.op === "CALL")
-        return `CALL ${instr.callee}`
+        return `CALL ${instr.calleeIndex}`
 
     // 5. Parametric: BR_TABLE / TRAP
     if (instr.op === "BR_TABLE")

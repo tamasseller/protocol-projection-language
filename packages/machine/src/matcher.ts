@@ -1,5 +1,5 @@
 /**
- * @ppl/core/machine — EAST pattern matcher
+ * @ppl/machine — EAST pattern matcher
  *
  * Tree-shaped pattern matching for the Extended AST, mirroring the
  * semantic-type matcher in `../matcher.ts`. A pattern is itself a tree;
@@ -63,26 +63,34 @@ export interface AssignPattern<V extends EastPattern = EastPattern>
 }
 
 /**
- * Call pattern. The planned-only call rule requires all args to be already-
- * tiled RtlNodes with `tos` output; the pattern carries no per-arg sub-patterns.
- * The match just verifies the shape; the builder receives the RtlNode[] array.
+ * Call pattern. The planned-only call rule requires every argument but the
+ * last to already be tiled to `tos` output (pushed, in order); the *last*
+ * argument (if any) is tiled to `acc` instead — the calling convention
+ * passes it there rather than through the stack, since `acc` is clobbered
+ * by the call regardless (isa-core.md §4.6). A zero-argument call has no
+ * "last" argument, so this doesn't apply to it. The pattern carries no
+ * per-arg sub-patterns; the match just verifies the shape, and the builder
+ * receives the RtlNode[] array.
  */
 export interface CallPattern { kind: "Call" }
 
 /**
  * Builtin-call pattern: `name(arg)` — the DSL's function-call-like syntax
  * for a fixed-lowering built-in (isa-core.md §10.5, e.g. `clz(x)`,
- * `revbits(x)`), distinct from `CallPattern`'s real-procedure-call shape.
- * Unlike a real call, the argument is demanded at `argOutput` directly
- * (typically `"acc"`, since these lower to a bare unary op) rather than
- * always pushed to `"tos"` — there's exactly one argument, matched by
- * position, not a sub-pattern, since every current built-in is unary.
+ * `revbits(x)`, `trap(code)`), distinct from `CallPattern`'s
+ * real-procedure-call shape. There's exactly one argument, matched by
+ * position against a sub-pattern (like `UnaryPattern`'s `argument`) rather
+ * than always tiled to a fixed tag the way `CallPattern`'s arguments
+ * always go to `"tos"` — `clz`/`revbits` want `pRtl("acc")` (tile the
+ * argument, demand it land in `acc`), while `trap` wants `pLiteral()` (the
+ * argument must itself be a compile-time literal, since it's encoded
+ * directly into `TRAP #code`'s immediate, not computed at runtime).
  */
-export interface BuiltinCallPattern
+export interface BuiltinCallPattern<A extends EastPattern = EastPattern>
 {
     kind: "BuiltinCall"
     name: string
-    argOutput: OutputLocation
+    argument: A
 }
 
 // 2. Match interfaces
@@ -124,10 +132,10 @@ export interface CallMatch
     argNodes: RtlNode[]
 }
 
-export interface BuiltinCallMatch
+export interface BuiltinCallMatch<AM extends EastMatch = EastMatch>
 {
     kind: "BuiltinCall"
-    argNode: RtlNode
+    argumentMatch: AM
 }
 
 // 3. Union types
@@ -165,7 +173,8 @@ export type MatchOf<P extends EastPattern> =
   : P extends AssignPattern<infer V>
       ? AssignMatch<MatchOf<V>>
   : P extends CallPattern          ? CallMatch
-  : P extends BuiltinCallPattern   ? BuiltinCallMatch
+  : P extends BuiltinCallPattern<infer A>
+      ? BuiltinCallMatch<MatchOf<A>>
   : never
 
 // 5. matchAllEast — single dispatcher, inlines all per-kind matching
@@ -254,10 +263,13 @@ export function matchAllEast<P extends EastPattern>(
             if (!isEastCall(N)) return []
             // callee is always an Identifier per the EAST type
             if (N.callee.type !== "Identifier") return []
-            // Every argument must tile to at least one `"tos"` candidate (the
-            // only planned call shape — each arg expression pushed in turn);
-            // the match set is the cross product across all argument slots.
-            const perArg = N.arguments.map(arg => tile(arg).filter(c => outputHas(c.output, "tos")))
+            // Every argument but the last must tile to a `"tos"` candidate
+            // (pushed, in order); the last tiles to `"acc"` instead (the
+            // calling convention's last-arg-in-acc rule — CallPattern's doc
+            // comment). The match set is the cross product across all slots.
+            const last = N.arguments.length - 1
+            const perArg = N.arguments.map((arg, i) =>
+                tile(arg).filter(c => outputHas(c.output, i === last ? "acc" : "tos")))
             if (perArg.some(cands => cands.length === 0)) return []
             let combos: RtlNode[][] = [[]]
             for (const cands of perArg)
@@ -270,8 +282,8 @@ export function matchAllEast<P extends EastPattern>(
             if (!isEastCall(N)) return []
             if (N.callee.type !== "Identifier" || N.callee.name !== P.name) return []
             if (N.arguments.length !== 1) return []
-            const candidates = tile(N.arguments[0]!).filter(c => outputHas(c.output, P.argOutput))
-            return candidates.map(argNode => ({ kind: "BuiltinCall", argNode } as MatchOf<P>))
+            return matchAllEast(N.arguments[0]!, P.argument, tile)
+                .map(argumentMatch => ({ kind: "BuiltinCall", argumentMatch } as MatchOf<P>))
         }
     }
 }
@@ -305,5 +317,5 @@ export const pAssign = <V extends EastPattern>(
 
 export const pCall = (): CallPattern => ({ kind: "Call" })
 
-export const pBuiltinCall = (name: string, argOutput: OutputLocation): BuiltinCallPattern =>
-    ({ kind: "BuiltinCall", name, argOutput })
+export const pBuiltinCall = <A extends EastPattern>(name: string, argument: A): BuiltinCallPattern<A> =>
+    ({ kind: "BuiltinCall", name, argument })

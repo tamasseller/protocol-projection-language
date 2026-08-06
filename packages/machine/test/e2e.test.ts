@@ -1,5 +1,5 @@
 /**
- * @ppl/core/test — End-to-end lowering + VM tests
+ * @ppl/machine/test — End-to-end lowering + VM tests
  *
  * Each test: DSL source → parse → lower → VM execute → assert result.
  * Tests are "nontrivial but not complicated" — they verify the full
@@ -9,21 +9,31 @@
 import { describe, test } from "node:test"
 import assert from "node:assert/strict"
 
-import { ir } from "../src/ir"
-import { lowerProc } from "../src/machine/lower"
-import { run } from "../src/machine/vm"
-import {RtlProgram} from "../src/machine/rtl"
+import { ir, proc, concat } from "../src/ir"
+import { lowerProc, lowerProgram } from "../src/lower"
+import { run } from "../src/vm"
+import {RtlProgram} from "../src/rtl"
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /** Lower a DSL procedure body and run it, returning the VM result. */
-function runDsl(source: string): { acc: number; ok: boolean; steps: number }
+function runDsl(source: string): { acc: number; ok: boolean; steps: number; trapCode: number | null }
 {
     const frag = ir`${source}`
-    const proc = lowerProc(frag.body)
-    const prog: RtlProgram = { procedures: [proc] }
+    const lowered = lowerProc(frag.body)
+    const prog: RtlProgram = { procedures: [lowered] }
     const result = run(prog)
-    return { acc: result.acc, ok: result.ok, steps: result.steps }
+    return { acc: result.acc, ok: result.ok, steps: result.steps, trapCode: result.trapCode }
+}
+
+/** Lower a whole `Procedure` graph (entry + everything it calls) and run
+ *  it, also surfacing the assembled program for procedure-table-shape
+ *  assertions. */
+function runProgram(entry: ReturnType<typeof proc>): { acc: number; ok: boolean; program: RtlProgram }
+{
+    const program = lowerProgram(entry)
+    const result = run(program)
+    return { acc: result.acc, ok: result.ok, program }
 }
 
 /** Assert a DSL procedure returns the expected value. */
@@ -254,6 +264,29 @@ describe("Switch", () =>
             }
         `, 30)
     })
+
+    // A non-last case whose own body is an if/else where both branches
+    // return: `closeBlock`'s `alwaysTerminates` (lower.ts) treats this
+    // case as needing no trailing BLOCK_END of its own, since every path
+    // through it already ends in RETURN — but that BLOCK_END wasn't
+    // closing the nested if/else (already fully closed, 2-for-2) in the
+    // first place; it was closing *this switch case's own slot* among the
+    // switch's N siblings. Omitting it desyncs skipBlocks'/the VM's
+    // sibling counting for every case after this one.
+    test("non-last case whose body is a fully-terminating if/else", () =>
+    {
+        assertReturn(`
+            u32 x = 1;
+            u32 y = 0;
+            switch (x)
+            {
+                case 0:
+                    if (y) { return 100; } else { return 200; }
+                case 1:  return 300;
+                default: return 400;
+            }
+        `, 300)
+    })
 })
 
 describe("Complex expressions", () =>
@@ -359,6 +392,60 @@ describe("Builtin calls (clz, revbits)", () =>
             return revbits(clz(x));
         `, 0xb8000000)
     })
+})
+
+describe("Builtin calls (trap)", () =>
+{
+    // isa-core.md §10.5 — `trap(code)` lowers straight to `TRAP #code`.
+    // Unlike clz/revbits, `code` must be a compile-time literal (it's
+    // encoded into the instruction's own immediate, not tiled to a
+    // register location) and `trap` is a terminator, like `return` —
+    // lower.ts's `alwaysTerminates` special-cases it so a block ending in
+    // one doesn't get a spurious BLOCK_END appended after the TRAP.
+
+    test("unconditional trap", () =>
+    {
+        const { ok, trapCode } = runDsl("trap(7);")
+        assert.equal(ok, false)
+        assert.equal(trapCode, 7)
+    })
+
+    test("trap as the sole statement of an if-branch (no else)", () =>
+    {
+        const { ok, trapCode } = runDsl(`
+            u32 x = 1;
+            if (x == 1)
+                trap(3);
+            return 0;
+        `)
+        assert.equal(ok, false)
+        assert.equal(trapCode, 3)
+    })
+
+    test("trap on one branch, return on the other", () =>
+    {
+        const { ok, acc } = runDsl(`
+            u32 x = 0;
+            if (x == 1)
+                trap(9);
+            else
+                return 42;
+        `)
+        assert.equal(ok, true)
+        assert.equal(acc, 42)
+    })
+
+    test("falls through past an untaken trap branch", () =>
+    {
+        const { ok, acc } = runDsl(`
+            u32 x = 0;
+            if (x == 1)
+                trap(9);
+            return 5;
+        `)
+        assert.equal(ok, true)
+        assert.equal(acc, 5)
+    })
 
     test("double bitwise-not cancels", () =>
     {
@@ -411,7 +498,7 @@ describe("Stack-bridging compound expressions", () =>
     // combine's top-level `(tos, acc)` site tied on bytes/length/maxStack
     // between PEEK_PEEK (net-neutral) and the now-removed PEEK_PUSH
     // (net-positive), and the tie broke on worklist order rather than
-    // preference (see ir-engine.md, "Known gaps"). Removing PEEK_PUSH
+    // preference (see ir-engine.md, "Why these choices"). Removing PEEK_PUSH
     // entirely (isa-core.md §4.1 keeps only 5 combos) makes PEEK_PEEK the
     // sole tos-output combo at that site, so the tie can no longer arise.
     // This declaration would have thrown lowerVarDecl's `tosDelta === 1`
@@ -566,5 +653,88 @@ describe("Rule-coverage gap fill: identifier:tos", () =>
             u32 y = x;
             return y;
         `, 5)
+    })
+})
+
+describe("Multi-procedure programs (ROADMAP.md item 2)", () =>
+{
+    test("entry calls a helper procedure", () =>
+    {
+        const double = proc(["x"], ir`return x + x;`)
+        const entry = proc([], ir`return ${double}(21);`)
+
+        const { acc, ok } = runProgram(entry)
+        assert.ok(ok, `expected normal return, got trap`)
+        assert.equal(acc, 42)
+    })
+
+    test("helper procedure with multiple arguments, in order", () =>
+    {
+        const sub = proc(["a", "b"], ir`return a - b;`)
+        const entry = proc([], ir`return ${sub}(50, 8);`)
+
+        const { acc, ok } = runProgram(entry)
+        assert.ok(ok)
+        assert.equal(acc, 42)
+    })
+
+    test("a call's result can initialize a declared local, not just be assigned to one", () =>
+    {
+        const inc = proc(["x"], ir`return x + 1;`)
+        const entry = proc([], ir`
+            u32 y = ${inc}(5);
+            return y;
+        `)
+
+        const { acc, ok } = runProgram(entry)
+        assert.ok(ok)
+        assert.equal(acc, 6)
+    })
+
+    test("transitive calls resolve through more than one hop", () =>
+    {
+        const inc = proc(["x"], ir`return x + 1;`)
+        const twice = proc(["x"], ir`return ${inc}(${inc}(x));`)
+        const entry = proc([], ir`return ${twice}(40);`)
+
+        const { acc, ok } = runProgram(entry)
+        assert.ok(ok)
+        assert.equal(acc, 42)
+    })
+
+    test("the same Procedure referenced from two call sites shares one table slot", () =>
+    {
+        const square = proc(["x"], ir`return x * x;`)
+        const entry = proc([], ir`return ${square}(4) + ${square}(5);`)
+
+        const { acc, ok, program } = runProgram(entry)
+        assert.ok(ok)
+        assert.equal(acc, 4 * 4 + 5 * 5)
+        // entry + square — not three slots, even though square is called twice.
+        assert.equal(program.procedures.length, 2)
+    })
+
+    test("a procedure body assembled via concat (ir.ts's computed-arity pattern) is callable like any other", () =>
+    {
+        const step = (n: number) => proc(["acc"], ir`return acc + ${n};`)
+        const steps = [1, 2, 3].map(step)
+
+        const body = concat(
+            ir`u32 acc = 0;`,
+            ...steps.map(s => ir`acc = ${s}(acc);`),
+            ir`return acc;`,
+        )
+        const entry = proc([], body)
+
+        const { acc, ok, program } = runProgram(entry)
+        assert.ok(ok)
+        assert.equal(acc, 1 + 2 + 3)
+        assert.equal(program.procedures.length, 4) // entry + the three step procedures
+    })
+
+    test("a call to an unresolvable name fails to lower, rather than crashing the tiler", () =>
+    {
+        const entry = proc([], ir`return doesNotExist(1);`)
+        assert.throws(() => lowerProgram(entry), /Failed to lower return expression/)
     })
 })

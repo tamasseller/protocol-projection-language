@@ -4,6 +4,7 @@
   "version": "1.0.0",
   "description": "Declarative Serialization Compiler — monorepo root",
   "workspaces": [
+    "packages/machine",
     "packages/core",
     "packages/codecs",
     "packages/target-cpp",

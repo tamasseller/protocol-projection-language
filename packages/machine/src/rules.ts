@@ -1,5 +1,5 @@
 /**
- * @ppl/core/machine — Lowering ruleset
+ * @ppl/machine — Lowering ruleset
  *
  * Rule table for the EAST pattern-rewrite lowerer. Each rule is a
  * (pattern, build) pair. The orchestrator tries every rule at every match
@@ -15,12 +15,13 @@
  */
 
 import type {BinaryOperator, UnaryOperator} from "./ast"
-import type {EastPattern, MatchOf} from "./matcher"
+import type {EastPattern, MatchOf, CallPattern} from "./matcher"
 import {pLiteral, pIdentifier, pRtl, pBinary, pUnary, pAssign, pCall, pBuiltinCall} from "./matcher"
 import type {ComboName, OutputLocation, Resource, RtlInstr, BinaryOpcode, UnaryOpcode, StackCombo} from "./rtl"
-import {CONST, PUSH, LOAD, STORE, opReg, opRegWriteback, opImm, opStack, bare, call, outputHas} from "./rtl"
+import {CONST, PUSH, LOAD, STORE, opReg, opRegWriteback, opImm, opStack, bare, call, trap, outputHas} from "./rtl"
 import type {RtlNode} from "./east"
 import {nodeInvariants, pickBinaryOrder} from "./builders"
+import type {Extension} from "./extension"
 
 // ── Rule type + constructor ─────────────────────────────────────────────────
 
@@ -86,7 +87,10 @@ const UNARY_OPS: readonly {ast: UnaryOperator; isa: UnaryOpcode}[] = [
 
 // ── RtlNode construction helpers ────────────────────────────────────────────
 
-function leafNode(output: OutputLocation[], fragment: RtlInstr[], clobbers: Resource[], tosDelta: number, maxStack: number): RtlNode
+/** Exported for extensions (extension.ts's `Extension.rules`) — building a
+ *  leaf `RtlNode` for a domain-specific opcode is exactly this same shape,
+ *  not something the extension mechanism needs to reinvent. */
+export function leafNode(output: OutputLocation[], fragment: RtlInstr[], clobbers: Resource[], tosDelta: number, maxStack: number): RtlNode
 {
     return {type: "RtlNode", output, fragment, clobbers, tosDelta, maxStack}
 }
@@ -140,26 +144,47 @@ function unaryRules(): Rule[]
 
 /**
  * DSL-level built-ins with fixed lowering (isa-core.md §10.5) that take the
- * `name(arg)` call-like syntax but aren't real procedure calls — each is
- * exactly one bare unary op, so its single argument is demanded at `"acc"`
- * (like `unaryRules`' operand) rather than pushed to `"tos"` the way a real
- * call's arguments are (rules.ts's `callRule`). Matching is purely by
- * callee name and arity; nothing reserves these names as keywords (per
- * §10.5, `trap`/etc. are functions, not keywords), so a same-named,
- * one-argument user procedure would be shadowed by these rules rather than
- * ever reaching `callRule` — an accepted consequence of "built-in by
+ * `name(arg)` call-like syntax but aren't real procedure calls. Matching is
+ * purely by callee name and arity; nothing reserves these names as
+ * keywords (per §10.5, they're functions, not keywords), so a same-named
+ * user procedure of the same arity would be shadowed by these rules rather
+ * than ever reaching `callRule` — an accepted consequence of "built-in by
  * convention, not by reserved word."
+ *
+ * `clz`/`revbits` are each exactly one bare unary op, so their argument is
+ * demanded at `"acc"` (`pRtl("acc")`, like `unaryRules`' operand) rather
+ * than pushed to `"tos"` the way a real call's arguments are.
  */
 const BUILTIN_UNARY_CALLS: readonly {name: string; isa: UnaryOpcode}[] = [
     {name: "clz", isa: "CLZ"},
     {name: "revbits", isa: "REVBITS"},
 ] as const
 
+/**
+ * `trap(code)` → `TRAP #code`. Unlike the unary built-ins, `code` isn't a
+ * general expression tiled to a register location — it's encoded straight
+ * into the instruction's own immediate, so the pattern demands the
+ * argument literally *be* a `Literal` AST node (`pLiteral()`) rather than
+ * tiling it to any output tag at all. There's no addressing-mode choice to
+ * make (one literal, one fixed encoding), so unlike every other rule here
+ * this one never competes against an alternative — it's the only match for
+ * `trap(<literal>)` shape, full stop. `trap` is also, uniquely among these
+ * three, a terminator (isa-core.md §4.5): `alwaysTerminates` (lower.ts)
+ * special-cases a `trap(...)` statement the same way it does `return`, so
+ * a block ending in one doesn't get a spurious `BLOCK_END` appended after
+ * its `TRAP`.
+ */
 function builtinCallRules(): Rule[]
 {
-    return BUILTIN_UNARY_CALLS.map(({name, isa}) =>
-        rule(`builtin:${name}`, pBuiltinCall(name, "acc"), m =>
-            unaryNode(m.argNode, ["acc"], [...m.argNode.fragment, bare(isa)])))
+    return [
+        ...BUILTIN_UNARY_CALLS.map(({name, isa}) =>
+            rule(`builtin:${name}`, pBuiltinCall(name, pRtl("acc")), m =>
+                unaryNode(m.argumentMatch.node, ["acc"],
+                    [...m.argumentMatch.node.fragment, bare(isa)]))),
+
+        rule("builtin:trap", pBuiltinCall("trap", pLiteral()), m =>
+            leafNode(["acc"], [trap(m.argumentMatch.value)], [], 0, 0)),
+    ]
 }
 
 // ── Binary rule generators ──────────────────────────────────────────────────
@@ -256,20 +281,37 @@ function immOperandRules(astOp: BinaryOperator, isaOp: BinaryOpcode, flipped: bo
  * — peek-and-write-back-in-place, and pop — the only two that reclaim what
  * they read; see ir-engine.md, "Every stack-read combo also reclaims its
  * operand" for why there is no third or fourth variant here.
+ *
+ * `PEEK_PEEK` is `alu`-only: isa-core.md §4.2 gives comparisons exactly
+ * four addressing combos (register/pop/immediate-small/immediate-ext, all
+ * → acc), with no peek mode at all — only arithmetic's five-combo table
+ * (§4.1) has one. A comparison needing `"tos"` output for two compound
+ * operands still has a valid route, just a two-instruction one: `POP_ACC`
+ * (→ acc, always available) followed by an explicit `PUSH`, the same
+ * shape `immOperandRules`' own `"tos"` variant already uses. `POP_ACC`
+ * itself has no such restriction — mode 2 (pop → acc) is valid for both
+ * classes — so only `PEEK_PEEK` is gated here.
  */
-function stackOperandRules(astOp: BinaryOperator, isaOp: BinaryOpcode, flipped: boolean): Rule[]
+function stackOperandRules(astOp: BinaryOperator, isaOp: BinaryOpcode, flipped: boolean, hasPeek: boolean): Rule[]
 {
     const pattern = flipped
         ? pBinary(astOp, pRtl("tos"), pRtl("acc"))
         : pBinary(astOp, pRtl("acc"), pRtl("tos"))
-    const combos: {combo: StackCombo; output: OutputLocation}[] = [
-        {combo: "PEEK_PEEK", output: "tos"},
-        {combo: "POP_ACC", output: "acc"},
+    // Every variant is built from the same POP_ACC-addressed instruction;
+    // only the name/output/trailing-PUSH differ. `hasPeek` swaps the
+    // single-instruction PEEK_PEEK route for a two-instruction POP_ACC+PUSH
+    // one to reach `"tos"` — comparisons must still be able to reach it,
+    // just not via a combo their addressing table doesn't have.
+    const variants: {name: string; combo: StackCombo; output: OutputLocation; extra: RtlInstr[]; extraTosDelta: number; extraMaxStack: number}[] = [
+        {name: "POP_ACC", combo: "POP_ACC", output: "acc", extra: [], extraTosDelta: 0, extraMaxStack: 0},
+        hasPeek
+            ? {name: "PEEK_PEEK", combo: "PEEK_PEEK", output: "tos", extra: [], extraTosDelta: 0, extraMaxStack: 0}
+            : {name: "POP_ACC:tos", combo: "POP_ACC", output: "tos", extra: [PUSH()], extraTosDelta: 1, extraMaxStack: 1},
     ]
-    return combos.map(({combo, output}) =>
+    return variants.map(({name, combo, output, extra, extraTosDelta, extraMaxStack}) =>
     {
-        const name = `${astOp}->${isaOp}:${combo}${flipped ? ":flip" : ""}`
-        return rule(name, pattern, m =>
+        const ruleName = `${astOp}->${isaOp}:${name}${flipped ? ":flip" : ""}`
+        return rule(ruleName, pattern, m =>
         {
             const accChild = (flipped ? m.rightMatch : m.leftMatch).node
             const tosChild = (flipped ? m.leftMatch : m.rightMatch).node
@@ -278,7 +320,8 @@ function stackOperandRules(astOp: BinaryOperator, isaOp: BinaryOpcode, flipped: 
             const [first, second] = order
             return nodeInvariants({
                 children: [first, second], combo, output,
-                fragment: [...first.fragment, ...second.fragment, opStack(isaOp, combo)],
+                fragment: [...first.fragment, ...second.fragment, opStack(isaOp, combo), ...extra],
+                extraTosDelta, extraMaxStack,
             })
         })
     })
@@ -287,24 +330,28 @@ function stackOperandRules(astOp: BinaryOperator, isaOp: BinaryOpcode, flipped: 
 /** Generate all rules for one operator entry. */
 function binaryRulesForOp(entry: OpEntry, resolveLocal: (name: string) => number): Rule[]
 {
+    // Both gate on the same spec fact (isa-core.md §4.2): comparisons have
+    // no register-write-back combo *and* no peek combo — only arithmetic's
+    // addressing table (§4.1) has either.
     const writeback = entry.kind === "alu"
+    const hasPeek = entry.kind === "alu"
     const rules: Rule[] = []
     // Direct orientation: L→acc, R→operand
     rules.push(...regOperandRules(entry.ast, entry.isa, false, writeback, resolveLocal))
     rules.push(...immOperandRules(entry.ast, entry.isa, false))
-    rules.push(...stackOperandRules(entry.ast, entry.isa, false))
+    rules.push(...stackOperandRules(entry.ast, entry.isa, false, hasPeek))
     // Flipped orientation
     if(entry.class === "commutative")
     {
         rules.push(...regOperandRules(entry.ast, entry.isa, true, writeback, resolveLocal))
         rules.push(...immOperandRules(entry.ast, entry.isa, true))
-        rules.push(...stackOperandRules(entry.ast, entry.isa, true))
+        rules.push(...stackOperandRules(entry.ast, entry.isa, true, hasPeek))
     }
     else if(entry.class === "paired" && entry.swap)
     {
         rules.push(...regOperandRules(entry.ast, entry.swap, true, writeback, resolveLocal))
         rules.push(...immOperandRules(entry.ast, entry.swap, true))
-        rules.push(...stackOperandRules(entry.ast, entry.swap, true))
+        rules.push(...stackOperandRules(entry.ast, entry.swap, true, hasPeek))
     }
     return rules
 }
@@ -336,34 +383,92 @@ function assignmentRules(resolveLocal: (name: string) => number): Rule[]
     ]
 }
 
-function callRule(): Rule
+/** Common shape shared by `call:acc`/`call:tos` below — the call itself,
+ *  landing in `acc`, before either rule decides whether to leave it there
+ *  or push it on to `tos`.
+ *
+ *  `stackArgs` is how many of `argNodes` actually get pushed: all but the
+ *  last (matcher.ts's `CallPattern` already tiled the last one to `"acc"`
+ *  instead — the calling convention's last-arg-in-acc rule). `CALL` itself
+ *  only ever consumes `stackArgs` values off the stack, never the full
+ *  `argNodes.length`. */
+function callNode(m: MatchOf<CallPattern>, resolveCallee: (name: string) => number | undefined):
+    Omit<RtlNode, "type" | "output"> | undefined
 {
-    return rule("call", pCall(), m =>
-    {
-        const {argNodes, callee} = m
-        const fragment: RtlInstr[] = [...argNodes.flatMap(a => a.fragment), call(callee)]
-        const clobbers = new Set<Resource>(argNodes.flatMap(a => a.clobbers))
-        const tosDelta = argNodes.reduce((s, a) => s + a.tosDelta, 0) - argNodes.length
-        let running = 0, maxStack = 0
-        for(const arg of argNodes) {maxStack = Math.max(maxStack, running + arg.maxStack); running += arg.tosDelta}
-        return {type: "RtlNode", output: ["acc"], fragment, clobbers: [...clobbers], tosDelta, maxStack}
-    })
+    const {argNodes, callee} = m
+    // A callee this pass can't resolve (e.g. a builtin name like `clz`)
+    // isn't an error here — it just means this rule isn't viable for this
+    // call site; a builtin-specific rule handles it instead.
+    const calleeIndex = resolveCallee(callee)
+    if(calleeIndex === undefined) return undefined
+    const stackArgs = Math.max(argNodes.length - 1, 0)
+    const fragment: RtlInstr[] = [...argNodes.flatMap(a => a.fragment), call(calleeIndex)]
+    const clobbers = new Set<Resource>(argNodes.flatMap(a => a.clobbers))
+    const tosDelta = argNodes.reduce((s, a) => s + a.tosDelta, 0) - stackArgs
+    let running = 0, maxStack = 0
+    for(const arg of argNodes) {maxStack = Math.max(maxStack, running + arg.maxStack); running += arg.tosDelta}
+    return {fragment, clobbers: [...clobbers], tosDelta, maxStack}
 }
 
-export const ruleset = (resolveLocal: (name: string) => number) => [
+/**
+ * Two output variants of the same call, mirroring `leafRules`' `:acc`/
+ * `:tos` pair and `immOperandRules`'/`stackOperandRules`' own `"tos"`
+ * variant (a trailing `PUSH`, cost +1 instruction, +1 tosDelta/maxStack).
+ * Without `call:tos`, a call's result could only ever be read from `acc`
+ * — which rules out using one as a `u32 x = ...` initializer
+ * (`lowerVarDecl` demands `"tos"` unconditionally), as a binary operand
+ * needing a stack bridge, or nested as a non-last argument of another call
+ * (matcher.ts's per-argument tiling demands `"tos"` for every argument but
+ * the last — `call:acc` still directly satisfies a call nested as the
+ * *last* argument, e.g. `f(g(x))`, with no bridge needed at all).
+ */
+function callRules(resolveCallee: (name: string) => number | undefined): Rule[]
+{
+    return [
+        rule("call:acc", pCall(), m =>
+        {
+            const built = callNode(m, resolveCallee)
+            return built && {type: "RtlNode", output: ["acc"], ...built}
+        }),
+        rule("call:tos", pCall(), m =>
+        {
+            const built = callNode(m, resolveCallee)
+            if(!built) return undefined
+            return {
+                type: "RtlNode",
+                output: ["tos"],
+                fragment: [...built.fragment, PUSH()],
+                clobbers: [...built.clobbers, "acc"],
+                tosDelta: built.tosDelta + 1,
+                maxStack: Math.max(built.maxStack, built.tosDelta + 1),
+            }
+        }),
+    ]
+}
+
+export const ruleset = (
+    resolveLocal: (name: string) => number,
+    resolveCallee: (name: string) => number | undefined,
+    extension?: Extension,
+) => [
     ...leafRules(resolveLocal),
     ...unaryRules(),
     ...builtinCallRules(),
+    ...(extension?.rules?.(resolveLocal, resolveCallee) ?? []),
     ...OP_TABLE.flatMap(entry => binaryRulesForOp(entry, resolveLocal)),
     ...assignmentRules(resolveLocal),
-    callRule(),
+    ...callRules(resolveCallee),
 ]
 
 /**
- * Test/debug ruleset: resolves an identifier to its own name rather than a
- * real register index, so formatted fragments read as `LOAD x` instead of
- * `LOAD 0` — readable without wiring up a real per-scope allocator. Not for
- * lowering actual procedures; see `ProgramLowerer`/`lowerProc` (lower.ts)
- * for the allocator used by the real pipeline.
+ * Test/debug ruleset: resolves an identifier (local or callee) to its own
+ * name rather than a real register/procedure-table index, so formatted
+ * fragments read as `LOAD x`/`CALL foo` instead of `LOAD 0`/`CALL 0` —
+ * readable without wiring up a real per-scope allocator or procedure
+ * table. Not for lowering actual procedures; see `lowerProc`/`lowerProgram`
+ * (lower.ts) for the pipeline used for real.
  */
-export const DEFAULT_RULESET: Rule[] = ruleset(name => name as unknown as number)
+export const DEFAULT_RULESET: Rule[] = ruleset(
+    name => name as unknown as number,
+    name => name as unknown as number,
+)

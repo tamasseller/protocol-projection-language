@@ -125,6 +125,18 @@ one narrow, well-defined addition is later justified is cheap; guessing
 the *content* of that addition without evidence is not, so the guess is
 deferred, not made.
 
+**The calling convention passes the last argument in `acc`, not the
+stack.** `CALL`'s return value overwrites `acc` unconditionally, so nothing
+a caller might have left there survives across the call regardless of
+whether an argument routes through it — passing the callee's last argument
+in `acc` instead of pushing it costs nothing that wasn't already spent.
+This makes the single-argument call, by far the most common arity, free of
+any `PUSH` at all, and it composes directly for a call nested as another
+call's last argument (`f(g(x))`): `g(x)`'s own `acc`-output tiling already
+leaves its result exactly where `f`'s call needs it, no stack bridge
+(push-then-pop) required in between the way a stack-only convention would
+need for the same nesting.
+
 **No `DIV`/`MOD`.** Many microcontrollers lack hardware division, and
 including software-emulated division would silently emit expensive loops
 on those targets. Codec arithmetic is dominated by shifts, masks, adds,
@@ -171,53 +183,42 @@ whatever candidates it reduced to. Demand-driven resolution keeps that raw
 shape visible for as many levels as a pattern cares to nest.
 
 **Fixed-lowering built-ins get their own pattern kind, not the real-call
-one.** `clz(x)`/`revbits(x)` (isa-core.md §10.5) parse identically to a
-real procedure call — `Identifier(args)` — but a `CallPattern` match
-demands every argument already be tiled to `"tos"`, matching the pushed-
-argument convention real calls use. Bare `CLZ`/`REVBITS` operate on `acc`
-directly, so forcing their operand through `"tos"` would mean an
-unnecessary push/pop around what should be a single instruction beyond the
-operand. Rather than bend `CallPattern` to support a per-call argument
-demand it otherwise never needs, `BuiltinCallPattern` matches by callee
-name and arity directly and demands its one argument at whatever tag the
-built-in actually needs. Nothing reserves these names as keywords — a
-same-named, same-arity user procedure would be shadowed rather than ever
-reaching the real call rule, which is the accepted cost of "built-in by
-naming convention," matching how `trap` is already documented as "a
-function, not a keyword" (§10.5).
+one.** `clz(x)`/`revbits(x)`/`trap(code)` (isa-core.md §10.5) parse
+identically to a real procedure call — `Identifier(args)` — but a real
+call always resolves its callee against the procedure table (§10.5), and
+`CallPattern`'s match is built around that: it needs a resolvable callee
+to produce any candidate at all. A built-in has no table entry and no
+`CALL` involved — `clz(x)` lowers to one bare `CLZ` on whatever's in `acc`,
+`trap(code)` needs `code` to be a literal baked directly into `TRAP`'s own
+immediate, not a general expression tiled to any output tag. Rather than
+bend `CallPattern` to support callees with no table entry and per-call
+argument shapes it otherwise never needs, `BuiltinCallPattern` matches by
+callee name and arity directly and demands its one argument at whatever
+tag (or raw AST shape, for `trap`) the built-in actually needs. Nothing
+reserves these names as keywords — a same-named, same-arity user procedure
+would be shadowed rather than ever reaching the real call rule, which is
+the accepted cost of "built-in by naming convention," matching how `trap`
+is already documented as "a function, not a keyword" (§10.5).
 
----
-
-## Known gaps and open work
-
-This section is the one place this document tracks state rather than
-timeless rationale — it exists so a future session doesn't have to
-rediscover the following from scratch.
-
-✅ **The RTL-level implementation is migrated; a real byte encoder still
-doesn't exist.** `packages/core/src/machine/` (`rtl.ts`'s combo/opcode
-types, `rules.ts`'s rule generation, `encoding.ts`'s cost model, `vm.ts`'s
-dispatch) now match this spec's combo set and op classification — the
-peek-without-reclaim and push-on-top-of-peek combos are gone, `MOVE` is
-split into its own move-class ops, and the cost model reflects arithmetic's
-extended-only immediate and comparison's small-zero form. What's still
-unstarted is an actual bit-level serializer/deserializer implementing §5's
-byte layout — `encoding.ts` remains a relative cost estimate for the
-lowerer's own candidate comparison, not a real codec, matching the
-abstraction level the code was already at before this migration.
-
-✅ **The cost-model tie-break gap this migration exposed is now structurally
-closed, not patched over.** `orchestrator.ts`'s `pickCheapest` still breaks
-ties by byte count, then fragment length, then peak stack depth
-(`maxStack`), with no `tosDelta` criterion — but the specific tie that
-this gap could previously expose (a wasteful peek-without-reclaim combo
-tying a net-neutral write-back combo on every other criterion) can no
-longer arise, because the wasteful combo no longer exists at all. A
-regression test (`e2e.test.ts`, "add: 8-leaf balanced tree... wide-tree
-regression") lowers and executes the exact shape that used to trip
-`lowerVarDecl`'s `tosDelta === 1` assertion, confirming `tosDelta` comes
-back `1` as expected. `pickCheapest` still has no `tosDelta` tie-break —
-that remains true — but nothing currently reachable needs one.
+**Tiling prunes to a Pareto frontier at every node, not just once at the
+root.** A wide tree's tiling count is combinatorial by construction — each
+node's candidate count is the cross product of its children's
+tag-relevant candidate counts — so without pruning, candidate tables blow
+up long before `pickCheapest` ever gets to run. Two steps, applied locally
+at every node before its result is cached (`pruneToFrontier`,
+`orchestrator.ts`): first collapse candidates that tie *exactly* on
+`(bytes, maxStack, clobbers)` to one representative — the dominant effect
+on a commutative tree, since e.g. `x + y`'s two evaluation orders cost
+identically but neither one *dominates* the other (domination needs a
+strict improvement), so without this step ties alone accumulate and
+multiply at the next level up; then apply strict domination across what's
+left. Both steps are safe to apply purely locally because `nodeInvariants`
+composes bytes additively and maxStack/clobbers monotonically up the
+tree — substituting a same-cost or dominating candidate anywhere inside a
+larger tiling can only match or beat the original, never lose to it (the
+standard justification for local pruning in bottom-up optimal
+tree-pattern selection, BURS-style instruction selection). With both
+steps, tiling is effectively flat in tree width instead of combinatorial.
 
 **The "peek the last-declared local" optimization idea is dead, not just
 unimplemented.** An earlier idea proposed addressing the most-recently
@@ -227,125 +228,28 @@ This spec's addressing-mode cut removes the combo that idea depended on —
 every remaining stack-read combo reclaims what it reads — so the idea has
 no combo left to use, not merely a missing implementation.
 
-✅ **Tiling is now bottom-up recursion memoized by node identity, not a
-worklist.** `tileNode` (`orchestrator.ts`) directly computes every viable
-tiling of an EAST subtree, caching the result per node in a `WeakMap`; the
-old worklist model — mutate a copy of the whole tree one rewrite at a time
-and re-scan it for the next match — is gone, along with the structural
-`hashTree`/`seen` dedup it needed to avoid re-deriving the same combined
-tiling via a different rewrite *order*. That source of redundancy doesn't
-exist in the new model at all: recursion never explores orderings, so
-there is nothing for memoization-by-identity to actually deduplicate on a
-plain tree (no node is ever any other node's child), but it costs nothing
-to keep and protects against any future DAG-like sharing (e.g. CSE). The
-matcher (`matchAllEast`, `matcher.ts`) resolves a pattern's `Rtl` leaves by
-calling back into `tileNode` on demand rather than assuming the tree has
-already been pre-rewritten there, which is what lets a multi-level pattern
-(e.g. `pUnary(op, pUnary(op, ...))`) still see an intermediate node's raw,
-untiled shape — the involution-cancellation rules below depend on exactly
-this.
+**Common-subexpression elimination is out of scope, not just
+unimplemented.** Doing it correctly needs SSA-shaped reasoning, not a
+textual-equality shortcut: the DSL allows assignments inside expressions,
+so two syntactically identical subexpressions aren't safe to treat as the
+same value unless nothing could have mutated the registers they read
+in between — exactly the aliasing question SSA construction exists to
+answer cheaply. Anything short of that is either unsound or amounts to
+hand-rolled dataflow analysis, which is real-compiler-scale investment
+this project isn't taking on. (The multi-location assignment output,
+`{acc, reg(target)}`, would be the one piece of existing machinery CSE
+could reuse if that ever changed.)
 
-Removing the order-redundancy is a large, measured win at the sizes that
-previously blew up: a balanced sum tree under an `"acc"` demand now takes
-2.3ms at 6 leaves, 5.9ms at 8, 9.6ms at 9, 20ms at 10 — all of which used
-to take seconds or not finish (worklist figures: ~186ms at 6, ~5.6s at 8,
-~28s at 9, 10 not finishing). It doesn't make tiling linear on its own,
-though: the number of *equally-realizable* tilings of a wide tree is
-genuinely combinatorial (each internal node's candidate count is the cross
-product of its children's tag-relevant candidate counts), so without
-further pruning a node keeps every one of them and the count still grows
-with tree width — 164ms at 12 leaves, 874ms at 14, 3.9s at 16 (524288
-variants at the root), heap exhaustion around n=18–20.
+**Extension opcodes declare their stack effect; the validator never calls
+into extension code.** isa-core.md §11.2's effect declarations (TOS delta,
+peak transient depth, terminates?, call-shaped?) are static data the
+validator consults, not a hook it invokes — a validator that called into
+extension-supplied logic to re-derive these same numbers would duplicate
+work the declaration already states directly, and would make every one of
+§8's guarantees only as trustworthy as whatever extension code happened to
+run during validation, rather than provable from data alone. Declaring the
+effect once, statically, keeps the validator itself extension-agnostic:
+the exact same walk that proves §8.1–§8.5 for the generic core proves them
+for any registered extension too, with no extension-specific control flow
+inside the validator at all.
 
-`tileNode` now prunes every node's candidate table to a Pareto frontier
-before caching it (`pruneToFrontier`, `orchestrator.ts`), which closes this
-properly. Two steps matter, not one: first collapse candidates that tie
-*exactly* on `(bytes, maxStack, clobbers)` to a single representative —
-this is the dominant effect for a commutative tree, since e.g. `x + y`'s
-two evaluation orders (`LOAD x; ADD y` vs `LOAD y; ADD x`) cost identically
-and neither one *dominates* the other (domination needs a strict
-improvement), so without this step ties simply accumulate and multiply at
-the next level up. Second, apply strict domination across what's left —
-`clobbers ⊆ {"acc", "tos"}` bounds that to at most 4 clobber-subsets per
-output tag, each keeping only its own small `(bytes, maxStack)` frontier.
-Both steps are safe to apply locally, at every node: `nodeInvariants`
-composes bytes additively and maxStack/clobbers monotonically up the tree,
-so substituting a same-cost or dominating candidate for another anywhere
-inside a larger tiling can only match or beat the original, never lose to
-it — the standard justification for local pruning in bottom-up optimal
-tree-pattern selection (BURS-style instruction selection).
-
-With both steps, `tileExpr` is now effectively flat in tree width: the
-same balanced-sum benchmark measures 2-6ms of tiling time all the way from
-n=16 to n=128 (`test/bench.ts`). `pickCheapest` still only runs once, at
-the root, exactly as before — pruning just keeps every node's table from
-growing into something worth running it against.
-
-While measuring this, a separate, unrelated bottleneck turned up: at
-n≈128+, `test/bench.ts`'s wall-clock time is dominated by *parsing*, not
-tiling — the grammar's generated recursive-descent parser (`grammer.pegjs`)
-takes seconds to tens of seconds on a deeply-nested wide expression well
-before `tileExpr` is ever called, independent of anything in `machine/`.
-This wasn't investigated further (out of scope for tiling work), but is
-worth a future session knowing about before assuming a slow wide-expression
-benchmark is a tiling regression.
-
-✅ **Rule coverage is now a hard gate, and a real VM bug turned up while
-building the exercise that surfaces it.** Every lowering rule in
-`rules.ts` is now driven to win somewhere by a deliberately-shaped probe
-(`coverage-sweep.test.ts`) and the result is asserted, not just logged
-(`rule-coverage.test.ts`); Pareto pruning means a rule only shows up if
-some expression makes it strictly cheapest or the first-inserted member of
-an exact tie, so several probe shapes needed real reasoning about the cost
-model to construct (documented per-shape in that file). On top of that,
-`algorithms.test.ts` lowers and executes four well-known algorithms
-(Collatz, Stein's binary GCD, bitwise integer sqrt, Russian peasant
-multiplication) against a plain-JS reference across a wide input sweep, to
-stress-test composition rather than individual rules. Stein's GCD failed:
-a local declared inside an `if`/`while` body (e.g. the swap temporary)
-read stale data on a later pass through that same block. The cause was in
-`vm.ts`, not the lowerer — `BLOCK_END` popped its control-stack frame and
-adjusted `pc` but never actually restored `tos` to the block's entry
-depth, even though §8.1 is explicit that this reset is the block
-boundary's job, not the producer's ("the producer never emits explicit
-cleanup pops; the block boundary handles it"), and §10.3 says the same
-thing from the lowering side (every DSL block "closes via a real
-`BLOCK_END` that resets TOS"). The lowerer was already conforming to that
-contract; the VM just wasn't honoring it. Fixed by giving each
-`BlockFrame` (`case`/`loopCond`/`loopBody`) an `entryTos` captured at
-`BR_TABLE`/`LOOP` time, and having `BLOCK_END` reset `tos` to it
-unconditionally before doing anything else, plus an assertion for §8.1's
-other half (`tos` may never end up *below* entry depth). All 314 tests
-pass with the fix in, including the Stein's GCD sweep across a,b = 1..30.
-
-**Common-subexpression elimination is not implemented.** A repeated
-subexpression re-evaluates every occurrence; the multi-location
-assignment output (`{acc, reg(target)}`) is the one piece of machinery
-already in place that CSE could build on, since it lets a value already
-resident in a register serve as an operand for more than one consumer
-without re-computing it.
-
-**`trap(code)` is the one documented built-in still unlowered.** §10.5 lists
-three fixed-lowering built-ins; `clz`/`revbits` now have rules
-(`rules.ts`'s `builtinCallRules`, matched via matcher.ts's
-`BuiltinCallPattern`), but `trap(code)` doesn't fit that same shape — its
-argument is a literal baked directly into the instruction's `imm`
-(`TRAP #code`), not a general expression tiled to a register location, so
-it needs its own pattern (matching the argument as `pLiteral()` rather
-than demanding a tag) rather than reusing `BuiltinCallPattern` as-is.
-Unstarted, not designed against.
-
-**`CALL` has no working dispatch.** The spec's `CALL proc_idx` takes a
-numeric procedure-table index, but the current IR (`rtl.ts`) carries a
-`callee: string` name instead, and the VM's `CALL` case throws rather than
-resolving and invoking anything. Turning procedure names into table
-indices — and, more generally, how a program's procedure table gets built
-from multiple lowered fragments — is unstarted infrastructure work, not a
-bug in an existing mechanism.
-
-**Extension integration is unresolved.** How multiple `ir\`...\`` fragments
-stitch into one procedure (label/scope merging across fragment
-boundaries), how a procedure declares any extension header fields beyond
-`arg_count`, and how an extension registers its own call names for
-resolution — all remain open, application-layer questions with no chosen
-mechanism yet.

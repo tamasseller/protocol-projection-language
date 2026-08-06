@@ -1,5 +1,5 @@
 /**
- * @ppl/core/test — Lowering rule coverage gate
+ * @ppl/machine/test — Lowering rule coverage gate
  *
  * Asserts every lowering rule (rules.ts) appeared in a node `lowerExpr`
  * actually selected as its winning tiling somewhere in the suite. Must run
@@ -23,14 +23,14 @@
 import { describe, test } from "node:test"
 import assert from "node:assert/strict"
 
-import { ruleset } from "../src/machine/rules"
-import { touchedRuleNames } from "../src/machine/orchestrator"
+import { ruleset } from "../src/rules"
+import { touchedRuleNames } from "../src/orchestrator"
 
 describe("Rule coverage (gate)", () =>
 {
     test("every rule won as a lowering somewhere in the suite", () =>
     {
-        const all = ruleset(name => name as unknown as number)
+        const all = ruleset(name => name as unknown as number, name => name as unknown as number)
         const allNames = new Set(all.map(r => r.name))
         const uncovered = [...allNames].filter(n => !touchedRuleNames.has(n)).sort()
 

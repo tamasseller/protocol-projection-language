@@ -1,5 +1,5 @@
 /**
- * @ppl/core/test — Cost-optimal tiling tests
+ * @ppl/machine/test — Cost-optimal tiling tests
  *
  * Tests `lowerExpr` directly: for each DSL expression, asserts the exact
  * instruction sequence its cost-optimal tiling produces. `tileNode`
@@ -21,11 +21,11 @@ import { describe, test } from "node:test"
 import assert from "node:assert/strict"
 
 import { ir } from "../src/ir"
-import { DEFAULT_RULESET } from "../src/machine/rules"
-import { tileExpr, lowerExpr } from "../src/machine/orchestrator"
-import { format, type OutputLocation } from "../src/machine/rtl"
-import type { EastExpression } from "../src/machine/east"
-import type { ReturnStatement } from "../src/machine/ast"
+import { DEFAULT_RULESET } from "../src/rules"
+import { tileExpr, lowerExpr } from "../src/orchestrator"
+import { format, type OutputLocation } from "../src/rtl"
+import type { EastExpression } from "../src/east"
+import type { ReturnStatement } from "../src/ast"
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -308,29 +308,27 @@ describe("Assignment", () =>
 
 describe("Call", () =>
 {
-    test("foo(x) — single pushed arg", () =>
+    // The calling convention passes the *last* argument in acc, not via the
+    // stack (rtl.ts's `call` doc comment) — a single-argument call needs no
+    // PUSH at all.
+    test("foo(x) — single arg via acc, no push", () =>
     {
-        checkWinner("return foo(x);", "acc", ["LOAD x", "PUSH", "CALL foo"])
+        checkWinner("return foo(x);", "acc", ["LOAD x", "CALL foo"])
     })
 
-    test("foo(x, y) — two pushed args", () =>
+    test("foo(x, y) — first arg pushed, last via acc", () =>
     {
-        checkWinner("return foo(x, y);", "acc", ["LOAD x", "PUSH", "LOAD y", "PUSH", "CALL foo"])
+        checkWinner("return foo(x, y);", "acc", ["LOAD x", "PUSH", "LOAD y", "CALL foo"])
     })
 
-    // A pushed arg's demand is "tos", not "acc" — there's no rule that
-    // takes an acc-output candidate and appends a bare PUSH, so the
-    // reg-flip trick from the immediate-operand tests above doesn't apply
-    // here: the direct-immediate-with-trailing-PUSH form ties with both
-    // stack-bridge evaluation orders of (literal, identifier) on bytes and
-    // maxStack alone — but PEEK_PEEK clobbers `["acc", "tos"]` where the
-    // direct-immediate form only clobbers `["acc"]` (rtl.ts's `COMBO`
-    // table), so the direct form strictly dominates once clobbers count as
-    // a tie-break axis (orchestrator.ts's `dominates`): it's the unique
-    // winner, not merely one member of a surviving tied set.
+    // foo(x + 1)'s only argument is the *last* (only) one, so it's demanded
+    // at "acc", not "tos" — the same demand, and hence the same winner, as
+    // the "1 + x (literal already on the left)" test above: the flipped
+    // reg-combo form (`CONST #1; ADD x`) beats the direct immediate form
+    // (`LOAD x; ADD #1`) for an "acc" demand.
     test("foo(x + 1) — computed arg", () =>
     {
-        checkWinner("return foo(x + 1);", "acc", ["LOAD x", "ADD #1", "PUSH", "CALL foo"])
+        checkWinner("return foo(x + 1);", "acc", ["CONST #1", "ADD x", "CALL foo"])
     })
 })
 
@@ -467,20 +465,19 @@ describe("Root output demand (tileExpr with demand parameter)", () =>
             `expected ≤3 instrs for optimal acc tiling, got ${node.fragment.length}: ${node.fragment.map(format).join(", ")}`)
     })
 
-    // ── Winning-rule coverage: `call` and `identifier:tos` ──────────────────
+    // ── Winning-rule coverage: `call` and `identifier:acc` ──────────────────
     //
-    // The real pipeline never lowers a CALL through the VM yet (vm.ts's
-    // CALL case is a deliberate stub — see its file header), so there's no
-    // e2e-executable way to make the `call` rule win. This calls `lowerExpr`
-    // directly instead, exactly like the acc-demand smoke test above, just
-    // to put `call` and `identifier:tos` through the rule that `lowerExpr`
+    // This calls `lowerExpr` directly, exactly like the acc-demand smoke
+    // test above, just to put `call` through the rule that `lowerExpr`
     // actually *selects* (test/rule-coverage.test.ts only counts winners).
+    // `foo(x)`'s only argument is also its *last*, so it's demanded at
+    // "acc" (the calling convention's last-arg-in-acc rule) — no PUSH.
 
-    test("lowerExpr on foo(x) selects the call rule (and identifier:tos for the arg)", () =>
+    test("lowerExpr on foo(x) selects the call rule (and identifier:acc for the arg)", () =>
     {
         const expr = exprOf("return foo(x);")
         const node = lowerExpr(expr, DEFAULT_RULESET, "acc")
         assert.ok(node, "must find a call lowering")
-        assert.deepStrictEqual(node.fragment.map(format), ["LOAD x", "PUSH", "CALL foo"])
+        assert.deepStrictEqual(node.fragment.map(format), ["LOAD x", "CALL foo"])
     })
 })

@@ -1,5 +1,5 @@
 /**
- * @ppl/core/machine — Statement lowering pass
+ * @ppl/machine — Statement lowering pass
  *
  * Converts a parsed AST fragment (Statement[]) into a ResolvedProc with
  * numerical register indices and flattened control flow.
@@ -8,6 +8,11 @@
  *   1. Walk declarations to allocate registers (name → index).
  *   2. Walk statements, emitting RtlInstr[] with control flow.
  *   3. Expression sub-trees lowered via lowerExpr + register resolution.
+ *
+ * `lowerProc` handles one standalone body; `lowerProgram` handles a
+ * `Procedure` plus everything it transitively calls, resolving each `CALL`
+ * to a procedure-table index on the fly as that callee is first discovered
+ * (ROADMAP.md item 2).
  */
 
 import {lowerExpr, lowerStatementExpr} from "./orchestrator"
@@ -15,11 +20,13 @@ import type {EastExpression} from "./east"
 import type {
     Statement, ControlBody, IfStatement, WhileStatement,
     ForStatement, SwitchStatement, VariableDeclaration, ReturnStatement,
-    ExpressionStatement,
+    ExpressionStatement, Expression,
 } from "./ast"
-import {RtlProc, RtlInstr, bare, brTable} from "./rtl"
+import {RtlProc, RtlProgram, RtlInstr, bare, brTable} from "./rtl"
+import type {Procedure} from "./ir"
 import assert from "assert"
 import {Rule, ruleset} from "./rules"
+import type {Extension} from "./extension"
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Register allocator
@@ -39,12 +46,39 @@ class RegAlloc
      * renumbered from 0, its locals would alias whatever the parent (or an
      * argument) already put at those low indices.
      */
-    constructor(private _parent?: RegAlloc)
+    constructor(
+        private _parent?: RegAlloc,
+        private _resolveCallee?: (name: string) => number | undefined,
+        private _extension?: Extension,
+    )
     {
         this.next = _parent?.next ?? 0
     }
 
     get parent(): RegAlloc | undefined {return this._parent}
+
+    /** A nested scope (`new RegAlloc(alloc)`, no second argument) has no
+     *  callee resolver of its own — it inherits the enclosing procedure's,
+     *  the same way it inherits register numbering via `parent`. Returning
+     *  `undefined` (rather than throwing) for a name it can't place is
+     *  deliberate: `callRule` (rules.ts) treats that as "not a viable
+     *  candidate here," which is what lets a builtin call (`clz`, `trap`,
+     *  `revbits`) fall through to its own dedicated rule instead of every
+     *  call site hard-failing on names that were never meant to resolve
+     *  against a procedure table. */
+    get resolveCallee(): (name: string) => number | undefined
+    {
+        return this._resolveCallee
+            ?? this._parent?.resolveCallee
+            ?? (() => undefined)
+    }
+
+    /** A nested scope has no `Extension` of its own — it inherits the
+     *  enclosing procedure's, same as `resolveCallee`. */
+    get extension(): Extension | undefined
+    {
+        return this._extension ?? this._parent?.extension
+    }
 
     /** Allocate a named variable, returning its index. Idempotent. */
     alloc(name: string): number
@@ -68,39 +102,74 @@ class RegAlloc
 
     rules(): Rule[]
     {
-        return ruleset(name => this.resolve(name) ?? (() => {throw new Error(`Unresolved variable: ${name}`)})())
+        return ruleset(
+            name => this.resolve(name) ?? (() => {throw new Error(`Unresolved variable: ${name}`)})(),
+            this.resolveCallee,
+            this.extension,
+        )
     }
 }
 
-export class ProgramLowerer
+/** Lower a single, standalone procedure body — the common case for tests
+ *  and fragments that don't call another procedure. There is no procedure
+ *  table here, so any non-builtin call inside `stmts` fails to lower (no
+ *  rule can produce a candidate for it); use {@link lowerProgram} for a
+ *  fragment that references another `Procedure`. */
+export function lowerProc(stmts: readonly Statement[], args: string[] = [], extension?: Extension): RtlProc
 {
-    private procedures = new Map<symbol, RtlProc>()
+    const alloc = new RegAlloc(undefined, () => undefined, extension)
 
-    lower(args: string[], stmts: readonly Statement[]): RtlProc
+    for(const arg of args) alloc.alloc(arg)
+
+    return { argCount: args.length, body: lowerBlock(stmts, alloc) }
+}
+
+/**
+ * Lower `entry` and every `Procedure` it transitively calls (via each
+ * fragment's `calls` map) into one `RtlProgram`, discovering callees on
+ * demand: the first time a `CALL` to a not-yet-seen `Procedure` is hit
+ * during lowering, that procedure is assigned the next free table index
+ * and its body is lowered right there, recursively — one pass, no
+ * separate name-resolution step afterward. `entry` always lands at index
+ * 0. The index is reserved *before* recursing into the callee's own body
+ * (not after it returns) so that a self- or mutually-recursive reference
+ * resolves to the reserved index instead of re-entering — isa-core.md
+ * §8.2 forbids recursion outright, but that's enforced by the (not yet
+ * built) whole-program validator, not this pass; this pass only needs to
+ * not hang on such input.
+ */
+export function lowerProgram(entry: Procedure, extension?: Extension): RtlProgram
+{
+    const procedures: RtlProc[] = []
+    const indexOf = new Map<symbol, number>()
+
+    function resolve(target: Procedure): number
     {
-        const alloc = new RegAlloc()
+        const cached = indexOf.get(target.id)
+        if(cached !== undefined) return cached
 
-        for(const arg of args)
+        const index = procedures.length
+        indexOf.set(target.id, index)
+        procedures.push(undefined as unknown as RtlProc) // reserved — filled in below
+
+        // A name absent from this fragment's own `calls` map isn't
+        // necessarily an error — it may be a builtin (`clz`/`trap`/
+        // `revbits`) or an extension call, which this pass knows nothing
+        // about; returning `undefined` lets that call site's own rule win
+        // instead (see RegAlloc.resolveCallee's doc comment).
+        const alloc = new RegAlloc(undefined, name =>
         {
-            alloc.alloc(arg)
-        }
+            const callee = target.fragment.calls.get(name)
+            return callee && resolve(callee)
+        }, extension)
+        for(const arg of target.args) alloc.alloc(arg)
 
-        const proc: RtlProc =
-        {
-            argCount: args.length,
-            body: lowerBlock(stmts, alloc)
-        }
-
-        this.procedures.set(Symbol(), proc)
-        return proc
+        procedures[index] = { argCount: target.args.length, body: lowerBlock(target.fragment.body, alloc), header: target.header }
+        return index
     }
-}
 
-/** Lower a single procedure body with no arguments — the common case for
- *  tests and standalone fragments. */
-export function lowerProc(stmts: readonly Statement[], args: string[] = []): RtlProc
-{
-    return new ProgramLowerer().lower(args, stmts)
+    resolve(entry)
+    return { procedures }
 }
 
 function lowerBlock(stmts: readonly Statement[], alloc: RegAlloc): RtlInstr[]
@@ -218,17 +287,36 @@ function logicInvertRoot(expr: EastExpression): EastExpression
 }
 
 /**
- * Does this statement list unconditionally end control flow (so a
- * following `BLOCK_END` would be unreachable dead code)? Only the *last*
- * statement matters — anything after an unconditional terminator would
- * already be dead code in a well-formed program.
+ * Does this statement list's *own* fragment already end in a terminator
+ * with nothing further needing a close — i.e. is a following `BLOCK_END`
+ * both unnecessary and unreachable? Only the *last* statement matters, and
+ * only when it's a *direct* terminator (`return`/`trap(...)`) — not a
+ * compound construct (`if`, `switch`, a loop) whose branches merely happen
+ * to all terminate.
  *
- * This must be an AST-level check, not "does the compiled fragment's last
- * *instruction* happen to be RETURN/TRAP" — an `if` without an `else` can
- * end its emitted fragment with a RETURN that only fires along one path
- * (the other being the BR_TABLE implicit default), so the instruction tail
- * alone doesn't tell you whether the block truly always terminates.
+ * That distinction matters: `closeBlock`'s caller is always closing *this
+ * block's own slot* among an enclosing construct's siblings (an if's
+ * branch, a switch case, a loop's body sub-block) — never the true
+ * top-level procedure body (`lowerBlock` never calls `closeBlock`). A
+ * nested `if (a) return 1; else return 2;` as the last statement closes
+ * *itself* fully (both its own branches end in RETURN, 2-for-2) — but
+ * that says nothing about whether *this* (outer) slot has been closed;
+ * omitting this slot's own `BLOCK_END` on that reasoning desyncs the
+ * sibling-counting every consumer of the flat instruction stream relies
+ * on (`vm.ts`'s `skipBlocks`, and the eventual validator) — a case after
+ * this one gets misidentified as more of this case's own content. Only a
+ * direct `return`/`trap` *is* this slot's own close, with nothing to
+ * desync.
  */
+/** `trap(code);` — like `return`, a terminator (isa-core.md §4.5), but
+ *  parsed as an ordinary call (§10.5: `trap` is a function, not a
+ *  keyword), so there's no dedicated AST node to switch on; it's
+ *  recognized structurally by callee name instead. */
+function isTrapCall(expr: Expression): boolean
+{
+    return expr.type === "CallExpression" && expr.callee.name === "trap"
+}
+
 function alwaysTerminates(stmts: readonly Statement[]): boolean
 {
     const last = stmts[stmts.length - 1]
@@ -237,24 +325,16 @@ function alwaysTerminates(stmts: readonly Statement[]): boolean
     switch(last.type)
     {
         case "ReturnStatement": return true
-        case "IfStatement":
-            return last.alternate !== null
-                && controlBodyAlwaysTerminates(last.consequent)
-                && controlBodyAlwaysTerminates(last.alternate)
+        case "ExpressionStatement": return isTrapCall(last.expression)
         default: return false
     }
 }
 
-function controlBodyAlwaysTerminates(body: ControlBody): boolean
-{
-    return alwaysTerminates(body.type === "BlockStatement" ? body.body : [body])
-}
-
-/** Close a branch/case/loop-body fragment: omit the `BLOCK_END` when the
- *  statements it was lowered from already end control flow unconditionally
- *  (§14.3/§14.4 of isa-core.md — a terminator closes its block on its own;
- *  an explicit `BLOCK_END` after one would be dead code the validator
- *  rejects, and would find no open construct left to close). */
+/** Close a branch/case/loop-body fragment: omit the `BLOCK_END` only when
+ *  the statements it was lowered from end *directly* in `return`/`trap`
+ *  (§14.3/§14.4 of isa-core.md — a terminator closes its own block on its
+ *  own, so a `BLOCK_END` right after would be unreachable, per
+ *  `alwaysTerminates`'s doc comment above). */
 function closeBlock(stmts: readonly Statement[], fragment: RtlInstr[]): RtlInstr[]
 {
     return alwaysTerminates(stmts) ? fragment : [...fragment, bare("BLOCK_END")]

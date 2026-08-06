@@ -1,5 +1,5 @@
 /**
- * @ppl/core/test — Algorithm proofing / stress tests
+ * @ppl/machine/test — Algorithm proofing / stress tests
  *
  * Rule coverage (coverage-sweep.test.ts) proves each *individual* rule
  * fires and produces correct isolated behavior, but says nothing about
@@ -18,9 +18,9 @@ import { describe, test } from "node:test"
 import assert from "node:assert/strict"
 
 import { ir } from "../src/ir"
-import { lowerProc } from "../src/machine/lower"
-import { run } from "../src/machine/vm"
-import { RtlProgram } from "../src/machine/rtl"
+import { lowerProc } from "../src/lower"
+import { run } from "../src/vm"
+import { RtlProgram } from "../src/rtl"
 
 function runDsl(source: string): number
 {

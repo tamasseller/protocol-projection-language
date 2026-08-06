@@ -4,7 +4,7 @@
  */
 import {test, describe} from "node:test"
 import * as assert from "node:assert/strict"
-import {parse} from "../src/machine/parser.js"
+import {parse} from "../src/parser.js"
 
 /** Pretty-print an AST node for snapshot testing. */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any

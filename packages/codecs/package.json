@@ -10,7 +10,8 @@
     "test:types": "tsc --project tsconfig.test.json --noEmit"
   },
   "dependencies": {
-    "@ppl/core": "*"
+    "@ppl/core": "*",
+    "@ppl/machine": "*"
   },
   "devDependencies": {
     "@types/node": "^26.1.1",

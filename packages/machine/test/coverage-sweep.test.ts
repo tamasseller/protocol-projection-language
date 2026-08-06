@@ -1,5 +1,5 @@
 /**
- * @ppl/core/test — Rule-coverage sweep
+ * @ppl/machine/test — Rule-coverage sweep
  *
  * Data-driven: for every binary operator in rules.ts's op table, probes
  * every addressing-combo shape (register, immediate, stack) in both
@@ -24,11 +24,11 @@ import { describe, test } from "node:test"
 import assert from "node:assert/strict"
 
 import { ir } from "../src/ir"
-import { DEFAULT_RULESET } from "../src/machine/rules"
-import { lowerExpr, lowerStatementExpr, touchedRuleNames } from "../src/machine/orchestrator"
-import type { EastExpression } from "../src/machine/east"
-import type { ReturnStatement, ExpressionStatement } from "../src/machine/ast"
-import type { OutputLocation } from "../src/machine/rtl"
+import { DEFAULT_RULESET } from "../src/rules"
+import { lowerExpr, lowerStatementExpr, touchedRuleNames } from "../src/orchestrator"
+import type { EastExpression } from "../src/east"
+import type { ReturnStatement, ExpressionStatement } from "../src/ast"
+import type { OutputLocation } from "../src/rtl"
 
 /** Parse a bare expression (no `return`/`;`) by wrapping it into one. */
 function exprOf(expr: string): EastExpression
@@ -160,10 +160,26 @@ for (const {ast, isa, swap, hasFlip, writeback} of OPS)
             winsRule(`(p + q) ${ast} (r + s)`, "acc", `${ast}->${isa}:POP_ACC`)
         })
 
-        test("PEEK_PEEK (direct)", () =>
+        // PEEK_PEEK only exists for `alu` ops (isa-core.md §4.2 gives
+        // comparisons no peek combo at all — see rules.ts's
+        // stackOperandRules doc comment). A comparison reaches `"tos"` via
+        // POP_ACC + an explicit PUSH instead (`:POP_ACC:tos`), the only
+        // candidate at all for two compound operands, so it wins without
+        // needing PEEK_PEEK's tie-breaking setup.
+        if (writeback)
         {
-            winsRule(`(p + q) ${ast} (r + s)`, "tos", `${ast}->${isa}:PEEK_PEEK`)
-        })
+            test("PEEK_PEEK (direct)", () =>
+            {
+                winsRule(`(p + q) ${ast} (r + s)`, "tos", `${ast}->${isa}:PEEK_PEEK`)
+            })
+        }
+        else
+        {
+            test("POP_ACC:tos (direct, no peek combo for comparisons)", () =>
+            {
+                winsRule(`(p + q) ${ast} (r + s)`, "tos", `${ast}->${isa}:POP_ACC:tos`)
+            })
+        }
 
         if (hasFlip)
         {
@@ -179,16 +195,29 @@ for (const {ast, isa, swap, hasFlip, writeback} of OPS)
             // stack combo with no cheaper direct alternative. Putting the
             // cheaper-as-tos side on the left is exactly what flip's role
             // assignment (left=tos, right=acc) benefits from — direct
-            // would have to eat the pricier delta instead.
+            // would have to eat the pricier delta instead. Same reasoning
+            // applies whether the top-level op ends in PEEK_PEEK or
+            // POP_ACC+PUSH, since the asymmetry is about the *children's*
+            // cost, not the top-level combo.
             test("POP_ACC (flip)", () =>
             {
                 winsRule(`(8 + 9) ${ast} (p + q)`, "acc", `${ast}->${flipIsa}:POP_ACC:flip`)
             })
 
-            test("PEEK_PEEK (flip)", () =>
+            if (writeback)
             {
-                winsRule(`(8 + 9) ${ast} (p + q)`, "tos", `${ast}->${flipIsa}:PEEK_PEEK:flip`)
-            })
+                test("PEEK_PEEK (flip)", () =>
+                {
+                    winsRule(`(8 + 9) ${ast} (p + q)`, "tos", `${ast}->${flipIsa}:PEEK_PEEK:flip`)
+                })
+            }
+            else
+            {
+                test("POP_ACC:tos (flip, no peek combo for comparisons)", () =>
+                {
+                    winsRule(`(8 + 9) ${ast} (p + q)`, "tos", `${ast}->${flipIsa}:POP_ACC:tos:flip`)
+                })
+            }
         }
 
         if (writeback)

@@ -1,5 +1,5 @@
 /**
- * @ppl/core/machine — Expression tiling orchestrator (bottom-up memoized)
+ * @ppl/machine — Expression tiling orchestrator (bottom-up memoized)
  *
  * Bottom-up rewrite search — see docs/ir-engine.md for why pattern-rewrite
  * search is used instead of Sethi-Ullman. `tileNode` recursively computes
@@ -46,7 +46,7 @@ function collectRtlNodes(m: EastMatch): RtlNode[]
         case "Unary": return collectRtlNodes(m.argumentMatch)
         case "Assign": return collectRtlNodes(m.rightMatch)
         case "Call": return m.argNodes
-        case "BuiltinCall": return [m.argNode]
+        case "BuiltinCall": return collectRtlNodes(m.argumentMatch)
         default: return [] // Literal, Identifier — no RTL children
     }
 }

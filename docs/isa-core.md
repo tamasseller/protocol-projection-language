@@ -1,10 +1,13 @@
 # Generic Core ISA
 
 > **Status:** Normative spec — the *what*. For the *why* behind any
-> non-obvious choice below, see [ir-engine.md](./ir-engine.md). Domain
-> extensions (codec stream I/O, target access, codec invocation) are out of
-> scope for this document; they own the upper half of the opcode space
-> (§5.1) and are specified separately, when written.
+> non-obvious choice below, see [ir-engine.md](./ir-engine.md). This
+> document specifies the *mechanism* by which a domain extension plugs into
+> the core (§11) — the extension opcode space it owns (§5.1), and what the
+> core requires an extension to declare about its own opcodes to keep §8's
+> guarantees intact. What any concrete extension's opcodes actually *do*
+> (codec stream I/O, target access, codec invocation) is out of scope here
+> and specified separately, when written.
 
 ---
 
@@ -21,6 +24,11 @@ TOS-hybrid accumulator machine. It is:
   and resource footprint are all computable ahead of execution.
 - **Zero-allocation** — no instruction allocates heap memory; all storage
   is statically bounded.
+- **Extensible** — half the opcode space is reserved for a domain
+  extension (§5.1); the extension declares each of its opcodes' stack
+  effect (§11.2) so the core's validator and VM stay ignorant of what any
+  extension opcode actually does while still proving every guarantee in §8
+  over programs that use them.
 
 It contains no domain-specific concepts. A program is a **procedure
 table** — an indexed array of procedures, each a fixed header plus a body
@@ -225,8 +233,9 @@ that also needs a register operand uses its own register-mode combo
 | `CONST #k` (small) | `acc = k`, `k ∈ 0..15` | none (`k` inline in opcode) |
 | `CONST #imm` (extended) | `acc = imm` | LEB128 `u32` |
 
-`PUSH` is how call arguments and expression temporaries reach the stack
-(§4.1 has no push-mode combo of its own — see ir-engine.md for why).
+`PUSH` is how a call's non-last arguments (§4.6, §6) and expression
+temporaries reach the stack (§4.1 has no push-mode combo of its own — see
+ir-engine.md for why).
 `CONST` is the only way to get an arbitrary constant into `acc`; there is
 no move-with-immediate-mode ALU combo standing in for it.
 
@@ -279,11 +288,14 @@ inside it, or the condition block testing false on a later iteration.
 
 ### 4.6 Procedure invocation
 
-**`CALL proc_idx`** — invoke `procedure[proc_idx]`. The caller pushes
-exactly `procedure[proc_idx].arg_count` values (via `PUSH`, §4.4) before
-the call, in argument order; those become `r0..r(arg_count-1)` in the
-callee's frame (§6). The return value comes back in `acc`; the caller's
-TOS is rewound to discard the argument block on return.
+**`CALL proc_idx`** — invoke `procedure[proc_idx]`. Let `N =
+procedure[proc_idx].arg_count`. The caller pushes (via `PUSH`, §4.4) the
+first `N-1` arguments, in order; the *last* argument (if `N ≥ 1`) is left
+in `acc` instead of pushed — `acc` is clobbered by the call regardless (the
+callee's return value overwrites it), so passing the last argument through
+it costs nothing. Together these become `r0..r(N-1)` in the callee's frame
+(§6). The return value comes back in `acc`; the caller's TOS is rewound to
+discard the pushed argument block, if any, on return.
 
 ---
 
@@ -322,6 +334,8 @@ POP_ACC, IMM_EXT` (0–4); comparison — `REG_ACC, POP_ACC, IMM_SMALL,
 IMM_EXT` (0–3).
 
 This assignment uses 124 of the 128 core codes, deliberately — see §5.3.
+The full 128-entry table this derives — one row per byte value, no
+arithmetic required — is in the Appendix.
 
 ### 5.3 Reserved codes
 
@@ -340,37 +354,45 @@ revision of this spec, not an extension of this pocket.
 | Field | Encoding |
 |---|---|
 | Extended immediate (`ADD`/comparison ext form, `CONST` ext form) | unsigned LEB128, 1–5 bytes |
-| Register index (`LOAD`, `STORE`, and the register-mode arithmetic combos) | unsigned LEB128 |
+| Register index (`LOAD`, `STORE`, and both classes' `REG_ACC`/`REG_REG` combos) | unsigned LEB128 |
 | `BR_TABLE` extended case count, `TRAP` extended code, `CALL` procedure index | unsigned LEB128 |
 
 Register indices use LEB128 rather than a fixed-width byte uniformly
 across every instruction that carries one — one rule, no special case for
-small frames.
+small frames. (Comparison's `REG_ACC` mode carries one too, same as
+arithmetic's — both classes' register mode reads an operand from `rN`.)
+
+See the Appendix — Opcode Table for the full literal expansion of this
+section's formula, one row per byte value.
 
 ---
 
 ## 6. Calling Convention
 
-On `CALL proc_idx`, let `N = procedure[proc_idx].arg_count`. The callee's
+On `CALL proc_idx`, let `N = procedure[proc_idx].arg_count` and `K =
+max(N-1, 0)` — the number of arguments actually passed via the stack, the
+last one (if `N ≥ 1`) going through `acc` instead (§4.6). The callee's
 **frame base** is the caller's TOS value at the moment of the call:
 
 ```
 F_callee = caller_tos_at_call
-r0 .. r(N-1)   : arguments   (= caller's top N stack slots)
+r0 .. r(K-1)   : arguments 0..(K-1)   (= caller's top K stack slots)
+r(N-1)         : argument N-1         (= acc at the moment of the call, if N ≥ 1)
 rN ..          : local scratch, callee's TOS starts here
 ```
 
-The caller computes each argument into `acc` and executes `PUSH`, in
-order `arg0 .. arg(N-1)`; the top `N` slots of its stack are exactly the
-callee's argument block. The caller's frame below `F_callee` is untouched
-by the callee and reappears at its original indices after the call
-returns.
+The caller computes each of `arg0 .. arg(K-1)` into `acc` and executes
+`PUSH`, in order; the top `K` slots of its stack are exactly the callee's
+first `K` arguments. It then computes `arg(N-1)` into `acc` and executes
+`CALL` directly, with no `PUSH` for that last argument. The caller's frame
+below `F_callee` is untouched by the callee and reappears at its original
+indices after the call returns.
 
-On `RETURN`: the callee's TOS must be at its entry point (`F_callee + N`)
+On `RETURN`: the callee's TOS must be at its entry point (`F_callee + K`)
 — otherwise a validation error (§8.1). The frame is popped, the caller's
-TOS rewinds to its pre-call value (discarding the argument block), and the
-caller resumes after the `CALL` with `acc` holding the return value.
-Return is single-word; there is no multi-value return.
+TOS rewinds to its pre-call value (discarding the pushed argument block, if
+any), and the caller resumes after the `CALL` with `acc` holding the return
+value. Return is single-word; there is no multi-value return.
 
 ---
 
@@ -453,11 +475,18 @@ acyclic.
 
 ### 8.3 Stack-depth bound
 
-Per procedure, the maximum TOS depth reached on any path is statically
-computable; across the call graph, the worst case is the sum of
-per-procedure maxima along the longest call chain. A program whose bound
-exceeds a target's resources is rejected by the backend (the ISA imposes
-no numeric limit itself).
+Per procedure, the maximum TOS depth reached on any path — its **local
+peak** — is statically computable. Across the call graph, the worst-case
+total is the tight bound: at each call site, its contribution is that
+site's own TOS depth at the moment of the call (relative to the callee's
+frame base, §6) plus the callee's own worst-case total; the whole-program
+bound is the maximum of every procedure's local peak and every call site's
+contribution, computed bottom-up over the (acyclic, §8.2) call graph. This
+is tighter than summing per-procedure local peaks along the longest call
+chain, since a given call's own depth is frequently less than the caller's
+unrelated local peak reached elsewhere in its body. A program whose bound
+exceeds a target's resources is rejected by the backend (the ISA imposes no
+numeric limit itself).
 
 ### 8.4 Dead-code rejection
 
@@ -468,8 +497,9 @@ the same block with no intervening control target.
 ### 8.5 Header and block well-formedness
 
 For every `CALL proc_idx`: the procedure must exist, and the TOS depth
-pushed since the callee's entry point must equal its `arg_count`. Every
-`BR_TABLE` opener must have exactly `N` case-closers; every `LOOP` opener
+pushed since the callee's entry point must equal `max(arg_count - 1, 0)`
+(§6 — the callee's last argument, if any, comes from `acc`, not the
+stack). Every `BR_TABLE` opener must have exactly `N` case-closers; every `LOOP` opener
 must have exactly two sub-block closers, the first always `BLOCK_END`, the
 second either `BLOCK_END` or a terminator. Every `BLOCK_END` must close
 some open block.
@@ -495,7 +525,7 @@ The DSL is a strict subset of C99: this section specifies only the delta
 from C, not C's expression/statement grammar or precedence, which are
 inherited unchanged. The authoring entry point is a TypeScript tagged
 template: `` ir`<C-subset source>` ``, parsed by the PEG grammar at
-`packages/core/grammer.pegjs` into an AST (`ast.ts`).
+`packages/machine/grammer.pegjs` into an AST (`ast.ts`).
 
 ### 10.2 Included
 
@@ -573,6 +603,209 @@ The `for` increment always lowers to a single copy at the end of the body
 block, immediately before its `BLOCK_END` — there being no `continue` to
 jump around it, every path through the body reaches it exactly once per
 iteration.
+
+---
+
+## 11. Extension Mechanism
+
+### 11.1 The `EXT` instruction
+
+Every byte ≥128 (§5.1) encodes one **extension opcode**: an opaque name
+(owned entirely by whichever extension is active) plus a fixed-arity list
+of operands. The generic core never interprets the name or the operands;
+it only needs to know each opcode's *effect* (§11.2) to keep validating and
+executing programs that contain them.
+
+### 11.2 Effect declarations
+
+For the core's own static guarantees (§8) to hold over a program containing
+extension opcodes, without the validator or VM needing to know what any
+particular opcode *does*, every extension opcode declares:
+
+| Field | Meaning |
+|---|---|
+| TOS delta | Net TOS depth change contributed by the opcode itself. |
+| Peak transient depth | The deepest TOS gets above its own entry depth while the opcode executes, even if it nets back to the same depth by the time the opcode is done. |
+| Terminates? | Whether the opcode ends its enclosing block on its own, the way `RETURN`/`TRAP` do (§4.5, §8.4). |
+| Call-shaped? | Whether the opcode invokes a procedure — and if so, which operand carries the resolved procedure-table index, and the callee's logical argument count, `N`. |
+
+A call-shaped extension opcode follows the same convention as `CALL`
+(§4.6, §6): only `max(N-1, 0)` of its arguments are expected on the stack,
+the last (if any) having already been placed in `acc`. Its call target is
+folded into the same call-graph accounting as an ordinary `CALL` for §8.2's
+acyclicity check and §8.3's stack-depth bound.
+
+A program containing an extension opcode with no matching effect
+declaration is rejected — an opcode the validator has no effect
+information for cannot be assumed to preserve §8's guarantees.
+
+### 11.3 Literal operands only
+
+Every extension opcode's operands are literal constants, resolved ahead of
+execution — register indices, procedure-table indices, small handle
+literals — never a value computed at runtime. This is what lets an
+ahead-of-time translator implement whatever an extension opcode abstracts
+away (a struct field access, a `*ptr++` read, a checksum-field patch-up)
+using ordinary target-native code, rather than requiring an interpreter
+loop: every operand it needs is already known at translation time.
+
+### 11.4 Header extension fields
+
+A procedure header's extension fields (§2.3) are opaque to the generic
+core — never read or interpreted by it — and carried through unchanged for
+whichever extension put them there to read back (e.g. selecting between an
+encoder and a decoder ABI for the same procedure shape).
+
+### 11.5 Call-name resolution
+
+Resolving a call-like syntax to a specific extension opcode (as opposed to
+a procedure-table `CALL`, §10.5) is an application-layer mechanism, out of
+scope for this document — the same way procedure-table resolution itself
+is.
+
+---
+
+## Appendix — Opcode Table
+
+The complete, literal expansion of §5.2/§5.3's range assignment — every
+byte value 0–127, derived mechanically from the formulas and orderings
+given there (arithmetic: `op*5 + mode`; comparison: `50 + op*4 + mode`;
+everything else a fixed offset). Exists so implementing an encoder/decoder
+never requires re-deriving a byte value from the formulas by hand — this
+table is not a separate source of truth, it's §5.2/§5.3 with the algebra
+already done. Every "trailing operand" entry, when not `—`, is unsigned
+LEB128 (§5.4) — no instruction's trailing data is encoded any other way.
+
+| Byte | Mnemonic | Trailing operand |
+|---|---|---|
+| `0` | `ADD REG_ACC` | register index |
+| `1` | `ADD REG_REG` | register index |
+| `2` | `ADD PEEK_PEEK` | — |
+| `3` | `ADD POP_ACC` | — |
+| `4` | `ADD IMM_EXT` | immediate value |
+| `5` | `SUB REG_ACC` | register index |
+| `6` | `SUB REG_REG` | register index |
+| `7` | `SUB PEEK_PEEK` | — |
+| `8` | `SUB POP_ACC` | — |
+| `9` | `SUB IMM_EXT` | immediate value |
+| `10` | `RSUB REG_ACC` | register index |
+| `11` | `RSUB REG_REG` | register index |
+| `12` | `RSUB PEEK_PEEK` | — |
+| `13` | `RSUB POP_ACC` | — |
+| `14` | `RSUB IMM_EXT` | immediate value |
+| `15` | `MUL REG_ACC` | register index |
+| `16` | `MUL REG_REG` | register index |
+| `17` | `MUL PEEK_PEEK` | — |
+| `18` | `MUL POP_ACC` | — |
+| `19` | `MUL IMM_EXT` | immediate value |
+| `20` | `AND REG_ACC` | register index |
+| `21` | `AND REG_REG` | register index |
+| `22` | `AND PEEK_PEEK` | — |
+| `23` | `AND POP_ACC` | — |
+| `24` | `AND IMM_EXT` | immediate value |
+| `25` | `OR REG_ACC` | register index |
+| `26` | `OR REG_REG` | register index |
+| `27` | `OR PEEK_PEEK` | — |
+| `28` | `OR POP_ACC` | — |
+| `29` | `OR IMM_EXT` | immediate value |
+| `30` | `XOR REG_ACC` | register index |
+| `31` | `XOR REG_REG` | register index |
+| `32` | `XOR PEEK_PEEK` | — |
+| `33` | `XOR POP_ACC` | — |
+| `34` | `XOR IMM_EXT` | immediate value |
+| `35` | `SHL REG_ACC` | register index |
+| `36` | `SHL REG_REG` | register index |
+| `37` | `SHL PEEK_PEEK` | — |
+| `38` | `SHL POP_ACC` | — |
+| `39` | `SHL IMM_EXT` | immediate value |
+| `40` | `SHR REG_ACC` | register index |
+| `41` | `SHR REG_REG` | register index |
+| `42` | `SHR PEEK_PEEK` | — |
+| `43` | `SHR POP_ACC` | — |
+| `44` | `SHR IMM_EXT` | immediate value |
+| `45` | `ASR REG_ACC` | register index |
+| `46` | `ASR REG_REG` | register index |
+| `47` | `ASR PEEK_PEEK` | — |
+| `48` | `ASR POP_ACC` | — |
+| `49` | `ASR IMM_EXT` | immediate value |
+| `50` | `EQ REG_ACC` | register index |
+| `51` | `EQ POP_ACC` | — |
+| `52` | `EQ IMM_SMALL (#0)` | — |
+| `53` | `EQ IMM_EXT` | immediate value |
+| `54` | `NE REG_ACC` | register index |
+| `55` | `NE POP_ACC` | — |
+| `56` | `NE IMM_SMALL (#0)` | — |
+| `57` | `NE IMM_EXT` | immediate value |
+| `58` | `LT_S REG_ACC` | register index |
+| `59` | `LT_S POP_ACC` | — |
+| `60` | `LT_S IMM_SMALL (#0)` | — |
+| `61` | `LT_S IMM_EXT` | immediate value |
+| `62` | `LE_S REG_ACC` | register index |
+| `63` | `LE_S POP_ACC` | — |
+| `64` | `LE_S IMM_SMALL (#0)` | — |
+| `65` | `LE_S IMM_EXT` | immediate value |
+| `66` | `GT_S REG_ACC` | register index |
+| `67` | `GT_S POP_ACC` | — |
+| `68` | `GT_S IMM_SMALL (#0)` | — |
+| `69` | `GT_S IMM_EXT` | immediate value |
+| `70` | `GE_S REG_ACC` | register index |
+| `71` | `GE_S POP_ACC` | — |
+| `72` | `GE_S IMM_SMALL (#0)` | — |
+| `73` | `GE_S IMM_EXT` | immediate value |
+| `74` | `LT_U REG_ACC` | register index |
+| `75` | `LT_U POP_ACC` | — |
+| `76` | `LT_U IMM_SMALL (#0)` | — |
+| `77` | `LT_U IMM_EXT` | immediate value |
+| `78` | `LE_U REG_ACC` | register index |
+| `79` | `LE_U POP_ACC` | — |
+| `80` | `LE_U IMM_SMALL (#0)` | — |
+| `81` | `LE_U IMM_EXT` | immediate value |
+| `82` | `GT_U REG_ACC` | register index |
+| `83` | `GT_U POP_ACC` | — |
+| `84` | `GT_U IMM_SMALL (#0)` | — |
+| `85` | `GT_U IMM_EXT` | immediate value |
+| `86` | `GE_U REG_ACC` | register index |
+| `87` | `GE_U POP_ACC` | — |
+| `88` | `GE_U IMM_SMALL (#0)` | — |
+| `89` | `GE_U IMM_EXT` | immediate value |
+| `90` | `NEG` | — |
+| `91` | `NOT` | — |
+| `92` | `CLZ` | — |
+| `93` | `REVBITS` | — |
+| `94` | `BLOCK_END` | — |
+| `95` | `LOOP` | — |
+| `96` | `BR_TABLE (1 case)` | — |
+| `97` | `BR_TABLE (2 cases)` | — |
+| `98` | `BR_TABLE-ext` | case count |
+| `99` | `CALL` | procedure index |
+| `100` | `RETURN` | — |
+| `101` | `TRAP (#0)` | — |
+| `102` | `TRAP-ext` | code |
+| `103` | `PUSH` | — |
+| `104` | `POP` | — |
+| `105` | `LOAD` | register index |
+| `106` | `STORE` | register index |
+| `107` | `CONST-ext` | value |
+| `108` | `CONST #0` | — |
+| `109` | `CONST #1` | — |
+| `110` | `CONST #2` | — |
+| `111` | `CONST #3` | — |
+| `112` | `CONST #4` | — |
+| `113` | `CONST #5` | — |
+| `114` | `CONST #6` | — |
+| `115` | `CONST #7` | — |
+| `116` | `CONST #8` | — |
+| `117` | `CONST #9` | — |
+| `118` | `CONST #10` | — |
+| `119` | `CONST #11` | — |
+| `120` | `CONST #12` | — |
+| `121` | `CONST #13` | — |
+| `122` | `CONST #14` | — |
+| `123` | `CONST #15` | — |
+| `124` | reserved | — |
+| `125` | reserved | — |
+| `126` | reserved | — |
+| `127` | reserved | — |
 
 ---
 

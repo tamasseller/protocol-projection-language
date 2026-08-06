@@ -1,5 +1,5 @@
 /**
- * @ppl/core/machine — Minimal Core VM
+ * @ppl/machine — Minimal Core VM
  *
  * A single-pass, structured-control-flow interpreter — no pre-scan, no
  * precomputed jump table. A live control stack of "open blocks" tells
@@ -9,12 +9,18 @@
  *
  * One call to `runProc` executes exactly one procedure: all its state (pc,
  * acc, registers, TOS, the control stack) is local to that call. A nested
- * `CALL` is therefore just a nested recursive call — not implemented yet
- * (needs a name → procedure resolution step this layer doesn't have), but
- * the shape is ready for it. `RETURN` and `TRAP` need no bookkeeping beyond
- * a plain `return`/`throw`: unwinding the JS call stack unwinds the control
- * stack with it, which is exactly the ISA's "a terminator closes its block
- * on its own" rule (isa-core.md §4.5, §7.2) for free.
+ * `CALL` is just a nested recursive call to `runProc` against
+ * `program.procedures[calleeIndex]` — `calleeIndex` is already a resolved
+ * table index by the time the VM sees it (lower.ts's job, ROADMAP.md item
+ * 2), so this layer never does any name resolution of its own. `RETURN`
+ * and `TRAP` need no bookkeeping beyond a plain `return`/`throw`:
+ * unwinding the JS call stack unwinds the control stack with it, which is
+ * exactly the ISA's "a terminator closes its block on its own" rule
+ * (isa-core.md §4.5, §7.2) for free. A cyclic call graph (isa-core.md §8.2
+ * forbids one, but that's checked by the whole-program validator, not
+ * built yet) recurses here exactly as a cyclic call would in any
+ * interpreter — there is no cycle guard at this layer, only `MAX_STEPS`
+ * bounding each individual procedure's own instruction loop.
  *
  * Designed as an oracle for testing — correctness and clarity over
  * performance. Malformed IR (a stray `BLOCK_END`, an unknown opcode) throws
@@ -24,6 +30,7 @@
 
 import assert from "assert"
 import type {RtlProgram, RtlProc, RtlInstr} from "./rtl"
+import type {Extension} from "./extension"
 
 const MAX_STEPS = 10_000_000
 
@@ -131,8 +138,9 @@ type BlockFrame =
     | {kind: "loopBody"; loopPc: number; entryTos: number}
 
 /** Run one procedure to completion. All VM state is local to this call —
- *  a nested CALL would just be a nested call to this function. */
-function runProc(proc: RtlProc, args: readonly number[]): {acc: number; steps: number}
+ *  a nested CALL is just a nested call to this function, against
+ *  `program`'s procedure table. */
+function runProc(program: RtlProgram, proc: RtlProc, args: readonly number[], extension?: Extension): {acc: number; steps: number}
 {
     const body = proc.body
     const regs: number[] = [...args]
@@ -141,6 +149,18 @@ function runProc(proc: RtlProc, args: readonly number[]): {acc: number; steps: n
     let pc = 0
     let steps = 0
     const ctrl: BlockFrame[] = []
+
+    // The state surface an extension's `exec` is allowed to touch — no pc,
+    // no control stack, since a generic extension op is straight-line by
+    // construction (isa-core.md §5.1).
+    const extState = {
+        get acc() {return acc},
+        set acc(v: number) {acc = v >>> 0},
+        push(value: number) {regs[tos++] = value >>> 0},
+        pop(): number {assert.ok(tos > 0, `EXT: pop with empty stack`); return regs[--tos] ?? 0},
+        reg(index: number): number {return regs[index] ?? 0},
+        setReg(index: number, value: number) {regs[index] = value >>> 0},
+    }
 
     function operand(i: RtlInstr): number
     {
@@ -273,11 +293,33 @@ function runProc(proc: RtlProc, args: readonly number[]): {acc: number; steps: n
                 break
             }
 
-            case "CALL":
-                // `i.callee` is a procedure name — there is no name →
-                // procedure resolution step yet, so a real recursive call
-                // can't be made here. Follow-up work, not this rewrite.
-                throw new Error(`CALL not implemented yet (needs procedure resolution)`)
+            case "CALL": {
+                const callee = program.procedures[i.calleeIndex]
+                if(!callee) throw new Error(`CALL ${i.calleeIndex}: no such procedure`)
+
+                // §4.6: the caller has already pushed the callee's first
+                // `stackArgs` arguments, in order — they become r0..r(N-2);
+                // the *last* argument (if any) is `acc` itself, becoming
+                // r(N-1) directly, no stack involvement. A 0-argument
+                // callee touches neither.
+                const stackArgs = Math.max(callee.argCount - 1, 0)
+                assert.ok(tos >= stackArgs,
+                    `CALL ${i.calleeIndex}: only ${tos} value(s) on the stack, need ${stackArgs}`)
+                tos -= stackArgs
+                const callArgs = callee.argCount === 0 ? [] : [...regs.slice(tos, tos + stackArgs), acc]
+
+                const result = runProc(program, callee, callArgs, extension)
+                acc = result.acc
+                steps += result.steps
+                pc++
+                break
+            }
+
+            case "EXT":
+                if(!extension?.exec) throw new Error(`EXT ${i.ext}: no extension registered to execute it`)
+                extension.exec(i, extState)
+                pc++
+                break
 
             default:
                 throw new Error(`unhandled opcode ${(i as {op: string}).op} at pc ${pc}`)
@@ -293,13 +335,13 @@ export interface VmResult
     steps: number
 }
 
-export function run(prog: RtlProgram): VmResult
+export function run(prog: RtlProgram, extension?: Extension): VmResult
 {
     if(prog.procedures.length === 0) throw new Error(`empty program`)
 
     try
     {
-        const {acc, steps} = runProc(prog.procedures[0], [])
+        const {acc, steps} = runProc(prog, prog.procedures[0], [], extension)
         return {acc, ok: true, trapCode: null, steps}
     }
     catch(e)

@@ -1,11 +1,11 @@
 /**
- * @ppl/core/test — Manual tiling performance probe
+ * @ppl/machine/test — Manual tiling performance probe
  *
  * Not part of `npm test` (not imported by run.ts) — measures `tileExpr`'s
  * wall-clock cost on wide balanced-sum expression trees, the shape that
  * previously blew up under the worklist-based search (see docs/ir-engine.md,
- * "Known gaps and open work"). Run directly: `npx ts-node --project
- * tsconfig.test.json test/bench.ts`.
+ * "Why these choices" — the Pareto-pruning rationale). Run directly:
+ * `npx ts-node --project tsconfig.test.json test/bench.ts`.
  *
  * Reports parse and tile time separately: `tileExpr` itself now stays flat
  * (single-digit ms) out to at least n=128, since Pareto-frontier pruning
@@ -19,10 +19,10 @@
  */
 
 import { ir } from "../src/ir"
-import { DEFAULT_RULESET } from "../src/machine/rules"
-import { tileExpr } from "../src/machine/orchestrator"
-import type { EastExpression } from "../src/machine/east"
-import type { ReturnStatement } from "../src/machine/ast"
+import { DEFAULT_RULESET } from "../src/rules"
+import { tileExpr } from "../src/orchestrator"
+import type { EastExpression } from "../src/east"
+import type { ReturnStatement } from "../src/ast"
 
 function exprOf(source: string): EastExpression
 {
