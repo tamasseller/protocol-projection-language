@@ -15,8 +15,8 @@ import { list, u8, union, unit, buildTypeGraph } from "@ppl/core"
 import { extInstr, bare, brTable, CONST, STORE, LOAD, opImm, validateProgram, run } from "@ppl/machine"
 import type { RtlProgram } from "@ppl/machine"
 
-import { createCodecExtension } from "../src/codec-extension"
-import type { Handle } from "../src/codec-extension"
+import { createCodecExtension } from "../src/engine/codec-extension"
+import type { Handle } from "../src/engine/codec-extension"
 
 const u8CodecBody = (direction: "encode" | "decode") =>
     direction === "encode"

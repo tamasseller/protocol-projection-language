@@ -1,13 +1,19 @@
 /**
  * @ppl/codecs — Barrel re-exports.
  *
- * The codec extension (`Extension` hook for `@ppl/machine`, ROADMAP.md
- * item 7), the generic codec-generation library built on top of it, and
- * a couple of specific, opt-in codecs (delta+LEB128 lists, encoder-only
- * pretty-printed JSON) demonstrating what it can do beyond plain binary.
+ * Grouped by docs/ARCHITECTURE.md's "Mappings" layering, not alphabetically:
+ * `engine/` is codec-domain infrastructure (stable, load-bearing — the
+ * `Extension` hook that makes a codec expressible at all, and the generic
+ * on-demand resolver that drives any `CodecRule` set over a semantic type
+ * graph); `components/` is a set of independent, swappable codec libraries
+ * built on that engine and privileged by none of it. An application chooses
+ * which component libraries to run, and in what order, via `buildCodec`'s
+ * `rules` argument — see `packages/example/compose.ts`.
  */
-export * from "./codec-extension"
-export * from "./rules"
-export * from "./builders"
-export * from "./delta-leb128"
-export * from "./json"
+export * from "./engine/codec-extension"
+export * from "./engine/resolver"
+export * from "./engine/builders"
+
+export * from "./components/binary-rules"
+export * from "./components/delta-leb128"
+export * from "./components/json"

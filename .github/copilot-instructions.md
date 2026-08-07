@@ -18,7 +18,7 @@ This project implements a two-phase, zero-allocation serialization compiler.
 3. **RESPECT THE TWO PHASES:** 
    * If it happens in standard TypeScript syntax, it happens at *compile-time*.
    * If it happens inside an `ir\`...\`` block, it happens at *run-time* on the embedded microcontroller. 
-4. **DO NOT FLATTEN THE IR STRINGS:** The `ir` tagged template function must *not* evaluate to a single concatenated string. It must parse the chunks and injected values into an in-memory IR Node tree (AST) for the C++ code generator to traverse later.
+4. **DO NOT FLATTEN THE IR STRINGS:** A real consumer (lowering, the C++ code generator) must never end up working against a flat string — `ir\`...\`` always resolves to genuine in-memory AST by the time anything downstream reads it. Parsing may be *deferred* (an `ir\`...\`` call builds up source text and a callee-reference map immediately but parses to AST lazily, on first access, so fragments that are only valid once spliced into a larger one — e.g. a bare `case N: ...` clause — can be assembled before anything tries to parse them standalone), but it must always actually happen, exactly once, before the fragment is treated as real IR.
 
 Here is the `copilot-instructions.md` file. This is designed to be ingested by the agent as its core system prompt or custom instructions file. It heavily front-loads the architectural constraints so the agent does not regress into writing standard Node.js web-backend code.
 

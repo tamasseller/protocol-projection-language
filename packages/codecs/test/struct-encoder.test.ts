@@ -20,8 +20,8 @@ import { struct, u8, u16, u32, buildTypeGraph } from "@ppl/core"
 import { extInstr, bare, validateProgram, run } from "@ppl/machine"
 import type { RtlProgram } from "@ppl/machine"
 
-import { createCodecExtension } from "../src/codec-extension"
-import type { Handle } from "../src/codec-extension"
+import { createCodecExtension } from "../src/engine/codec-extension"
+import type { Handle } from "../src/engine/codec-extension"
 
 const structType = struct({ x: u32, y: u16, flag: u8 })
 const graph = buildTypeGraph(structType)

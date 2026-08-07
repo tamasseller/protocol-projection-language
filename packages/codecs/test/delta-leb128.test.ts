@@ -8,16 +8,18 @@ import assert from "node:assert/strict"
 import { list, struct, u8, u32, buildTypeGraph } from "@ppl/core"
 import { validateProgram, run } from "@ppl/machine"
 
-import { buildDeltaLeb128ListCodec, deltaLeb128Rule } from "../src/delta-leb128"
-import { buildCodec } from "../src/builders"
-import { createCodecExtension } from "../src/codec-extension"
+import { buildDeltaLeb128ListCodec, deltaLeb128EncodeRule, deltaLeb128DecodeRule } from "../src/components/delta-leb128"
+import { buildCodec } from "../src/engine/builders"
+import { createCodecExtension } from "../src/engine/codec-extension"
+import { binaryEncodeRules, binaryDecodeRules } from "../src/components/binary-rules"
 
-const graph = buildTypeGraph(list(u32))
+const rootType = list(u32)
+const graph = buildTypeGraph(rootType) // TypeNode only needed for the runtime Handle below
 
 function encode(values: number[]): number[]
 {
     const buffer: number[] = []
-    const program = buildDeltaLeb128ListCodec(graph.root, "encode")
+    const program = buildDeltaLeb128ListCodec(rootType, "encode")
     const ext = createCodecExtension("encode", { container: { root: values }, key: "root", type: graph.root }, buffer)
     validateProgram(program, ext)
     assert.equal(run(program, ext).ok, true)
@@ -27,7 +29,7 @@ function encode(values: number[]): number[]
 function decode(buffer: number[]): unknown
 {
     const wrapper: Record<string, unknown> = {}
-    const program = buildDeltaLeb128ListCodec(graph.root, "decode")
+    const program = buildDeltaLeb128ListCodec(rootType, "decode")
     const ext = createCodecExtension("decode", { container: wrapper, key: "root", type: graph.root }, buffer)
     validateProgram(program, ext)
     assert.equal(run(program, ext).ok, true)
@@ -64,22 +66,25 @@ describe("delta-leb128 — List<u32>", () =>
 
     test("rejects a non-List<Integer> type", () =>
     {
-        const badGraph = buildTypeGraph(u32)
-        assert.throws(() => buildDeltaLeb128ListCodec(badGraph.root, "encode"), /expected a list type/)
+        assert.throws(() => buildDeltaLeb128ListCodec(u32, "encode"), /expected a list type/)
     })
 
-    test("composes as an extraRules entry — fires for a List<Integer> field nested inside a struct, not just a standalone root", () =>
+    test("composes as a rules entry — fires for a List<Integer> field nested inside a struct, not just a standalone root", () =>
     {
         // The whole point of making this a CodecRule instead of a one-off
         // top-level function: a caller can now opt a *specific field* into
-        // delta-LEB128 without buildCodec's own defaults ever knowing about
-        // it, and without needing to extract that field's TypeNode by hand.
+        // delta-LEB128 without the binary rules' own defaults ever knowing
+        // about it, and without needing to extract that field's type by
+        // hand.
         const t = struct({ id: u8, samples: list(u32) })
         const structGraph = buildTypeGraph(t)
 
         function run_(direction: "encode" | "decode", value: unknown, buffer: number[])
         {
-            const program = buildCodec(structGraph.root, direction, [deltaLeb128Rule])
+            const rules = direction === "encode"
+                ? [deltaLeb128EncodeRule, ...binaryEncodeRules]
+                : [deltaLeb128DecodeRule, ...binaryDecodeRules]
+            const program = buildCodec(t, rules, undefined)
             const container = direction === "encode" ? { root: value } : { root: {} }
             const ext = createCodecExtension(direction, { container, key: "root", type: structGraph.root }, buffer)
             validateProgram(program, ext)

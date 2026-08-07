@@ -14,9 +14,16 @@ via `${otherProc}` interpolation — as a call target from another
 `ir\`...\`` fragment; `ir()` splices the reference by its pre-minted
 synthetic name and records it in the fragment's `calls` map, resolved by
 object identity rather than a name the author keeps in sync by hand.
-`concat(...fragments)` combines independently-built fragments (e.g. one
-per element of a compile-time-computed collection) since names are
-identity-derived and never collide.
+`ir\`...\`` also splices an `IrFragment` or `IrFragment[]` value directly —
+inlining its `source` (recursively) and merging its `calls` — which is how
+independently-built fragments (e.g. one per element of a compile-time-
+computed collection) combine; names are identity-derived and never
+collide regardless of how many fragments end up referencing the same
+`Procedure`. `body` (the parsed AST) is computed lazily, on first access,
+specifically so a sub-fragment that isn't valid Program text on its own
+(e.g. a bare `case N: ...` clause, only meaningful once embedded in a
+`switch`) can still be built and spliced before anything tries to parse it
+standalone.
 
 ## 2. Call dispatch (lowering + VM)
 
@@ -135,7 +142,7 @@ which couldn't describe call sites invoking callees of different arity;
 header instead, matching §6.3's "argCount from the invoked codec's header"
 (this was always the documented intent, just not what the code did).
 
-`packages/codecs/src/codec-extension.ts` now implements 10 of §3's
+`packages/codecs/src/engine/codec-extension.ts` now implements 10 of §3's
 opcodes — everything except the stream-fork class (`HAS_NEXT`/
 `CLONE_RD`/`CLONE_WR`/`SEEK`, still open; nothing built so far needs more
 than one straight-through `i0`) — plus `codecRules()`, that same opcode
@@ -151,16 +158,18 @@ rules decline gracefully instead of throwing when a bare identifier isn't
 a local at all (reachable via any call-shaped node's unconstrained
 argument-tiling, matcher.ts:283-300, not just a codec callee reference).
 
-`packages/codecs/src/builders.ts`'s `buildCodec(root, direction, extraRules?)`
-is the metamodel-to-bytecode generation layer §5 always assumed would
-exist — and, per review, genuinely *rule-driven* now rather than a closed
-per-kind switch: an ordered `CodecRule<Direction>[]` (`./rules.ts`, pattern
-+ producer, reusing `@ppl/core`'s `TypePattern`/`matchType` vocabulary), a
-caller's own rules tried before the defaults so they can preempt any
-default for a specific type shape with no change to `builders.ts` itself.
-Resolution — on-demand, memoized, cycle-safe — is one small generic driver
-(`createCodecResolver`) both `buildCodec` and `json.ts` are built on, not
-two independently hand-rolled ones; `runRuleset` (`@ppl/core/projection.ts`)
+`packages/codecs/src/engine/builders.ts`'s `buildCodec(root, rules,
+initialCtx)` is the metamodel-to-bytecode generation layer §5 always
+assumed would exist — and, per review, genuinely *rule-driven* now rather
+than a closed per-kind switch: an ordered `CodecRule<Ctx>[]`
+(`./resolver.ts`, pattern + producer, reusing `@ppl/core`'s
+`TypePattern`/`matchType` vocabulary), with the rule list itself passed in
+by the caller rather than an implicit default `buildCodec` applies on its
+behalf — see below and docs/ARCHITECTURE.md's "Mappings" section for why
+that changed. Resolution — on-demand, memoized, cycle-safe — is one small
+generic driver (`createCodecResolver`) both `buildCodec` and
+`components/json.ts` are built on, not two independently hand-rolled ones;
+`runRuleset` (`@ppl/core/projection.ts`)
 was considered and passed over for this, since it fills its result map in
 one eager top-down pass with no way to hand a not-yet-finished child a
 reserved slot before a sibling embeds it into its own instruction stream —
@@ -170,19 +179,35 @@ optimization lives in the default struct rule — a union-typed field with
 few enough variants gets its tag *hoisted* into a shared leading bitmap
 instead of paying for a standalone tag byte.
 
+`Ctx` is not "the direction" — a rule's `produce` no longer takes a
+`TypeNode` or a direction value at all, and `resolve` takes a raw
+`SemanticType` (resolved by its own object identity, via
+`TypeGraph.nodeOf` internally) rather than a `TypeNode`. Per review: a
+resolver run already commits to one direction for its *entire* walk, so a
+single rule threading a runtime direction flag through every call and
+re-branching on it internally was pure ceremony; `components/binary-rules.ts`
+is two flat rule lists (`binaryEncodeRules`/`binaryDecodeRules`), not one
+list plus a threaded value, and no rule body branches on direction
+anywhere. `Ctx` stays generic because not every rule family is
+direction-shaped — `components/json.ts` uses it for nesting depth instead,
+where binary's rules use `void`.
+
 Two further codecs sit alongside the defaults, both real `CodecRule`s now
-rather than one-off top-level functions: `delta-leb128.ts` (§8.6's
-delta+LEB128 `List<Integer>` encoder, plus its decode mirror) composes as
-an `extraRules` entry — it can preempt the generic list rule for one
-specific field nested inside a larger struct, not just a standalone root —
-and `json.ts` (an encoder-only pretty-printed JSON serializer, proving
-direction is genuinely optional — nothing pairs it with a decoder) is
-regularized onto the same `createCodecResolver`, just with nesting depth
-as its context instead of `Direction`. A dedicated test
-(`iso8601-demo.test.ts`) demonstrates the rule mechanism can override
-representation entirely, not just add a leaf kind: a `Timestamp`-shaped
-struct field inside an otherwise length-prefixed/hoisted-tag binary wire
-format comes out as an embedded ASCII string instead of two raw integers.
+rather than one-off top-level functions: `components/delta-leb128.ts`
+(§8.6's delta+LEB128 `List<Integer>` encoder/decoder, as two rules —
+`deltaLeb128EncodeRule`/`deltaLeb128DecodeRule` — same split as
+binary-rules.ts, not one rule branching on direction) composes by being
+listed ahead of the defaults in `buildCodec`'s `rules` argument — it can
+preempt the generic list rule for one specific field nested inside a
+larger struct, not just a standalone root — and `components/json.ts` (an
+encoder-only pretty-printed JSON serializer, proving direction is
+genuinely optional — nothing pairs it with a decoder) is regularized onto
+the same `createCodecResolver`, just with nesting depth as its `Ctx`
+instead of `void`. A dedicated test (`iso8601-demo.test.ts`) demonstrates
+the rule mechanism can override representation entirely, not just add a
+leaf kind: a `Timestamp`-shaped struct field inside an otherwise
+length-prefixed/hoisted-tag binary wire format comes out as an embedded
+ASCII string instead of two raw integers.
 
 All of it proven against `packages/example`'s pre-existing,
 independently-authored `TelemetryPacket` schema (nested struct, a
@@ -201,6 +226,29 @@ expressible under this ISA, hand-built or DSL-authored; `codec-extension.md`
 §5's "dispatch calls... can resolve to the same codec again for a
 recursive type" describes a different, not-yet-built indirect-call
 mechanism, not what `call_codec`'s literal-operand calls (§3.3) do today.
+
+`@ppl/codecs` was reorganized (post-review) to keep this item's own
+three-way distinction — core, components, application,
+docs/ARCHITECTURE.md's "Mappings" section — visible at the package's
+module boundary instead of only in prose: `src/engine/` holds the codec
+`Extension` and the on-demand resolver (both layer 1, despite living here
+only because nothing else needs them yet); `src/components/` holds
+`binary-rules.ts` (the renamed default rule set, now two lists —
+`binaryEncodeRules`/`binaryDecodeRules`, see above), `delta-leb128.ts`, and
+`json.ts`, none privileged over another. `buildCodec` no longer applies
+`binary-rules.ts` implicitly — a caller passes the rule set it wants, e.g.
+`buildCodec(root, binaryEncodeRules, undefined)` or
+`[deltaLeb128EncodeRule, ...binaryEncodeRules]` — so a different binary
+format is a straightforward swap, not a patch on top of a permanent
+default. A further pass (also post-review) then dropped `direction`/`node`
+from every rule's `produce` and `TypeNode` from `resolve` entirely, per the
+`Ctx` note above — `buildCodec`'s own signature moved from `(root:
+TypeNode, direction, rules)` to `(root: SemanticType, rules, initialCtx)`
+accordingly, and `@ppl/core` gained `TypeGraph.nodeOf` plus richer match
+witnesses (`matcher.ts`'s `StructFieldsMatch`/`UnionFieldsMatch`/`ListMatch`
+etc. now carry each child's own `SemanticType`, not just its match) to make
+that possible without reimplementing `buildTypeGraph`'s own cycle-breaking
+a second time inside `@ppl/codecs`.
 
 Still open: the wire-level `codec` byte encoding (§6); §7.1/§7.2's
 validator extensions, below; and, within the builder itself, anything

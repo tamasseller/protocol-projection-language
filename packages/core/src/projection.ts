@@ -42,6 +42,35 @@ export interface Rule<C>
 }
 
 /**
+ * Build a `Rule<C>` with `produce`'s `match` narrowed to `MatchOf<P>` for
+ * this rule's own concrete pattern `P` — `IntegerMatch` for a `pInteger(...)`
+ * rule, `ListMatch` for a `pList(...)` rule, etc. — instead of the widened
+ * `MatchOf<TypePattern>` (effectively `TypeMatch`) a plain `{pattern,
+ * produce}` object literal against the `Rule<C>` interface gets stuck with.
+ *
+ * `matchType`/`MatchOf` already narrow correctly given a concrete pattern
+ * (matcher.ts's pattern constructors deliberately return their own literal
+ * interface for exactly this); `Rule<C>` itself can't express that inline
+ * because a ruleset is a *list* of rules with different `P`s, which needs
+ * `pattern`/`produce` erased back to the union at the point of storage —
+ * TypeScript has no way to type "a list where each element internally
+ * pairs its own P with its own correctly-typed handler." That erasure is
+ * unavoidable somewhere; this factory is where it happens — once, here,
+ * the same way `matchInteger`/`matchList`/etc. each end in one `as
+ * MatchOf<P>` (trusted because the surrounding control flow already
+ * proved the pattern/type pairing) — rather than every rule body paying
+ * for it separately via an unchecked cast back through `graph.nodes.get
+ * (nodeId)!.type`.
+ */
+export function rule<P extends TypePattern, C>(
+    pattern: P,
+    produce: (match: MatchOf<P>, nodeId: number, graph: TypeGraph, traits: TraitRegistry) => C,
+): Rule<C>
+{
+    return { pattern, produce } as Rule<C>
+}
+
+/**
  * Run a ruleset against the type graph.
  *
  * For each TypeNode (in id order, pre-order): if already covered by an
@@ -140,7 +169,7 @@ function deriveCoverage(
         for(const [name, subPattern] of Object.entries(pattern.fieldPatterns))
         {
             const childNode = child(node, {field: name})
-            if(childNode) deriveCoverage(childNode, subPattern as TypePattern, sm.fieldMatches[name], graph, covered)
+            if(childNode) deriveCoverage(childNode, subPattern as TypePattern, sm.fieldMatches[name].match, graph, covered)
         }
         return
     }
@@ -164,7 +193,7 @@ function deriveCoverage(
         for(const [name, subPattern] of Object.entries(pattern.variantPatterns))
         {
             const childNode = child(node, {variant: name})
-            if(childNode) deriveCoverage(childNode, subPattern as TypePattern, um.variantMatches[name], graph, covered)
+            if(childNode) deriveCoverage(childNode, subPattern as TypePattern, um.variantMatches[name].match, graph, covered)
         }
         return
     }

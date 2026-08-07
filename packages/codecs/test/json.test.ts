@@ -8,13 +8,13 @@ import assert from "node:assert/strict"
 import { struct, union, unit, list, i16, u8, buildTypeGraph } from "@ppl/core"
 import { validateProgram, run } from "@ppl/machine"
 
-import { buildJsonEncoder } from "../src/json"
-import { createCodecExtension } from "../src/codec-extension"
+import { buildJsonEncoder } from "../src/components/json"
+import { createCodecExtension } from "../src/engine/codec-extension"
 
 function toJsonText(rootType: Parameters<typeof buildTypeGraph>[0], value: unknown): string
 {
     const graph = buildTypeGraph(rootType)
-    const program = buildJsonEncoder(graph.root)
+    const program = buildJsonEncoder(rootType)
     const buffer: number[] = []
     const ext = createCodecExtension("encode", { container: { root: value }, key: "root", type: graph.root }, buffer)
     validateProgram(program, ext)

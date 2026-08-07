@@ -26,7 +26,7 @@
  */
 import {buildTypeGraph, extractTraits, TypeGraph, TraitRegistry} from "@ppl/core"
 import {projectCTypes, emitCHeader, CTypeDecl} from "@ppl/target-cpp"
-import {buildCodec, buildJsonEncoder, createCodecExtension, Handle} from "@ppl/codecs"
+import {buildCodec, buildJsonEncoder, createCodecExtension, binaryEncodeRules, binaryDecodeRules, Handle} from "@ppl/codecs"
 import {validateProgram, run, RtlProgram} from "@ppl/machine"
 import {projectTSTypes, emitTSDeclarations, TSTypeDecl} from "@ppl/target-js"
 
@@ -54,10 +54,12 @@ export const cHeader: string = emitCHeader(cTypes)
  * Real binary codecs generated from the schema — one program per
  * direction (docs/codec-extension.md §2.3: direction is a property of
  * the whole program, so an encoder and a decoder are two programs, never
- * one bidirectional call graph), sharing nothing but `graph.root`.
+ * one bidirectional call graph), sharing nothing but `TelemetryPacket`
+ * itself (which of `binaryEncodeRules`/`binaryDecodeRules` runs is what
+ * actually picks the direction now — see binary-rules.ts).
  */
-export const encodeProgram: RtlProgram = buildCodec(graph.root, "encode")
-export const decodeProgram: RtlProgram = buildCodec(graph.root, "decode")
+export const encodeProgram: RtlProgram = buildCodec(TelemetryPacket, binaryEncodeRules, undefined)
+export const decodeProgram: RtlProgram = buildCodec(TelemetryPacket, binaryDecodeRules, undefined)
 
 function runCodec(program: RtlProgram, ext: ReturnType<typeof createCodecExtension>): void
 {
@@ -103,7 +105,7 @@ export const decodedSample: unknown = decodeTelemetryPacket(encodedSample)
 /** Pretty-printed JSON of the same schema, from the same `graph.root` —
  *  encoder-only (json.ts's own file header), demonstrating the codec
  *  model isn't binary-only any more than it's bidirectional-only. */
-export const jsonProgram: RtlProgram = buildJsonEncoder(graph.root)
+export const jsonProgram: RtlProgram = buildJsonEncoder(TelemetryPacket)
 
 export function toJson(value: unknown): string
 {

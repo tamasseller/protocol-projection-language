@@ -1,20 +1,27 @@
 /**
  * @ppl/codecs — Codec extension (ROADMAP.md item 7, docs/codec-extension.md)
  *
+ * Layer 1 (docs/ARCHITECTURE.md's "Mappings" section) — domain
+ * infrastructure, not a codec: it doesn't encode anything by itself, it's
+ * what makes encoding *expressible* as `ir` text at all. It lives in
+ * `@ppl/codecs` rather than `@ppl/machine` only because `@ppl/machine` must
+ * stay protocol-agnostic (ROADMAP.md item 7); conceptually it's still core.
+ *
  * `createCodecExtension` implements `@ppl/machine`'s `Extension` hook
  * (packages/machine/src/extension.ts) for structs, unions, and lists —
  * `ENTER`, `ENTER_NEXT`, `LOAD_VAL`, `STORE_VAL`, `COUNT`, `TAG`,
  * `OPEN_LIST`, `READ`, `WRITE`, `CALL_CODEC`, `CALL_CODEC_NEXT` — plus
  * `codecRules()`, this same opcode set's `rules()` DSL surface (matching
  * `Extension["rules"]`, extension.ts:107), so codec bodies are authored as
- * real `ir\`...\`` text (`builders.ts`, `delta-leb128.ts`, `json.ts`)
- * instead of hand-built `RtlInstr[]` arrays. Still out of scope, tracked in
+ * real `ir\`...\`` text (`../engine/builders.ts`,
+ * `../components/delta-leb128.ts`, `../components/json.ts`) instead of
+ * hand-built `RtlInstr[]` arrays. Still out of scope, tracked in
  * codec-extension.md §3: `HAS_NEXT`/`CLONE_RD`/`CLONE_WR`/`SEEK` (stream
  * forks — nothing here needs more than one straight-through `i0`). Also
  * still out of scope: the wire-level `codec` byte layout (§6 says that's
  * deliberately unassigned until real codecs exist to measure against —
- * `builders.ts` is exactly that now, but the byte-layout design pass
- * itself is separate follow-on work).
+ * `../components/binary-rules.ts` is exactly that now, but the byte-layout
+ * design pass itself is separate follow-on work).
  *
  * Direction (§2.1/§2.3) is a property of the whole program, not of this
  * extension — `createCodecExtension` takes it as a constructor argument,
@@ -42,11 +49,12 @@ import { kindOf, SemanticTypeKinds } from "@ppl/core"
 export type Direction = "encode" | "decode"
 
 /** Smallest byte width that fits an integer type's declared range — the
- *  source of truth for both `builders.ts` (which byte count to `WRITE`/
- *  `READ`) and `toHostNumber` below (which bit is the sign bit). Lives
- *  here, not in builders.ts, so this file — the host-mapping layer —
- *  never has to import from the bytecode-*generation* layer built on top
- *  of it; `builders.ts` imports it from here instead. */
+ *  source of truth for both `../components/binary-rules.ts` (which byte
+ *  count to `WRITE`/`READ`) and `toHostNumber` below (which bit is the sign
+ *  bit). Lives here, not in `binary-rules.ts`, so this file — the
+ *  host-mapping layer — never has to import from the bytecode-*generation*
+ *  layer (a component) built on top of it; `binary-rules.ts` imports it
+ *  from here instead. */
 export function intWireSize(t: IntegerType): number
 {
     const range = t.max - t.min

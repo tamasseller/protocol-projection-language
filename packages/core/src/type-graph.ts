@@ -63,6 +63,14 @@ export interface TypeGraph
     readonly root: TypeNode
     /** Every node, keyed by id — the registry cross-ruleset queries use. */
     readonly nodes: ReadonlyMap<number, TypeNode>
+    /** Look up the TypeNode a given (possibly-thunk) SemanticType object was
+     *  materialized into — the identity map `buildTypeGraph` already builds
+     *  for cycle-breaking, exposed so a caller holding a raw SemanticType
+     *  (e.g. off a match witness) can navigate the graph without needing a
+     *  TypeNode passed to it directly. `type` must be the exact object (or
+     *  thunk) reference used somewhere in this graph's construction —
+     *  matches `TypeNode.source`'s own identity, not structural equality. */
+    nodeOf(type: SemanticType): TypeNode | undefined
 }
 
 /**
@@ -106,7 +114,7 @@ export function buildTypeGraph(rootType: SemanticType): TypeGraph
     }
 
     const root = build(rootType)
-    return {root, nodes}
+    return {root, nodes, nodeOf: (type: SemanticType) => byObject.get(type as object)}
 }
 
 /** Build the outgoing edges of a derefed (concrete) type. */

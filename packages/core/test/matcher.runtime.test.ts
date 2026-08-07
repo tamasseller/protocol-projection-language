@@ -80,7 +80,7 @@ test("struct: exact fields match", () => {
     const m = matchType(T, pStruct({a: pInteger(0, 1), b: pUnit()}))
     assert.equal(m?.kind, SemanticTypeKinds.Struct)
     assert.equal(
-        m?.kind === SemanticTypeKinds.Struct && m.fieldMatches["a"].kind,
+        m?.kind === SemanticTypeKinds.Struct && m.fieldMatches["a"].match.kind,
         SemanticTypeKinds.Integer,
     )
 })
@@ -103,7 +103,7 @@ test("union: exact variants match", () => {
     const T = union({ok: integer(0, 1), err: unit})
     const m = matchType(T, pUnion({ok: pInteger(0, 1), err: pUnit()}))
     assert.equal(
-        m?.kind === SemanticTypeKinds.Union && m.variantMatches["err"].kind,
+        m?.kind === SemanticTypeKinds.Union && m.variantMatches["err"].match.kind,
         SemanticTypeKinds.Unit,
     )
 })
@@ -303,6 +303,6 @@ test("star: nested under pUnion marks the value variant as a hole", () => {
     const T = Optional(integer(0, 255))
     const m = matchType(T, pUnion({value: pStar(), empty: pUnit()})) as any
     assert.equal(m?.kind, SemanticTypeKinds.Union)
-    assert.equal(m?.variantMatches?.value?.kind, "star")
-    assert.equal(m?.variantMatches?.empty?.kind, SemanticTypeKinds.Unit)
+    assert.equal(m?.variantMatches?.value?.match.kind, "star")
+    assert.equal(m?.variantMatches?.empty?.match.kind, SemanticTypeKinds.Unit)
 })

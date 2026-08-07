@@ -15,8 +15,8 @@ import { struct, union, unit, u8, list, buildTypeGraph } from "@ppl/core"
 import { ir, proc, lowerProgram, validateProgram, run } from "@ppl/machine"
 import type { RtlProgram } from "@ppl/machine"
 
-import { createCodecExtension, codecRules } from "../src/codec-extension"
-import type { Handle, Direction } from "../src/codec-extension"
+import { createCodecExtension, codecRules } from "../src/engine/codec-extension"
+import type { Handle, Direction } from "../src/engine/codec-extension"
 
 function numberCodec(direction: Direction, width: number)
 {

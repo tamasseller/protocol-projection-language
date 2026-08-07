@@ -16,7 +16,7 @@
  * Pure compile-time host machinery. No IR impact.
  */
 import {TypeGraph, TypeNode, child} from "@ppl/core"
-import {Rule, runRuleset} from "@ppl/core"
+import {Rule, rule, runRuleset} from "@ppl/core"
 import {TraitRegistry, TypeNameTrait} from "@ppl/core"
 import {
     pInteger,
@@ -153,57 +153,57 @@ export function cppRules(): ReadonlyArray<Rule<TypeDecl>>
 {
     return [
         // 1. Integers → fixed-width C++ types (catch-all: any integer range)
-        {pattern: pInteger(-Infinity, Infinity),
-         produce: (_m, nodeId, graph) => ({ref: integerRef(graph.nodes.get(nodeId)!.type as IntegerType), deps: []})},
+        rule(pInteger(-Infinity, Infinity),
+             (match) => ({ref: integerRef(match), deps: []})),
 
         // 2. Unit → std::monostate
-        {pattern: pUnit(),
-         produce: () => ({ref: "std::monostate", deps: []})},
+        rule(pUnit(),
+             () => ({ref: "std::monostate", deps: []})),
 
         // 3. Optional: union({value:T, empty:unit}) → std::optional<T>
-        {pattern: pUnion({value: pStar(), empty: pUnit()}),
-         produce: (_m, nodeId, graph, traits) => {
-             const valueNode = child(graph.nodes.get(nodeId)!, {variant: "value"})!
-             return {ref: `std::optional<${refOf(valueNode, graph, traits)}>`, deps: [valueNode.id]}
-         }},
+        rule(pUnion({value: pStar(), empty: pUnit()}),
+             (_m, nodeId, graph, traits) => {
+                 const valueNode = child(graph.nodes.get(nodeId)!, {variant: "value"})!
+                 return {ref: `std::optional<${refOf(valueNode, graph, traits)}>`, deps: [valueNode.id]}
+             }),
 
         // 4. Struct → C++ struct with named fields
-        {pattern: pStructFields(pStar()),
-         produce: (_m, nodeId, graph, traits) => {
-             const node = graph.nodes.get(nodeId)!
-             const name = nameOf(nodeId, traits)
-             const fieldLines = node.edges.map(e => {
-                 const fieldName = "field" in e.step ? e.step.field : "_"
-                 return `    ${refOf(e.target, graph, traits)} ${fieldName};`
-             })
-             return {
-                 ref: name,
-                 forward: `struct ${name};`,
-                 decl: `struct ${name} {\n${fieldLines.join("\n")}\n};`,
-                 deps: node.edges.map(e => e.target.id),
-             }
-         }},
+        rule(pStructFields(pStar()),
+             (_m, nodeId, graph, traits) => {
+                 const node = graph.nodes.get(nodeId)!
+                 const name = nameOf(nodeId, traits)
+                 const fieldLines = node.edges.map(e => {
+                     const fieldName = "field" in e.step ? e.step.field : "_"
+                     return `    ${refOf(e.target, graph, traits)} ${fieldName};`
+                 })
+                 return {
+                     ref: name,
+                     forward: `struct ${name};`,
+                     decl: `struct ${name} {\n${fieldLines.join("\n")}\n};`,
+                     deps: node.edges.map(e => e.target.id),
+                 }
+             }),
 
         // 5. Generic union → C++ struct wrapping std::variant
-        {pattern: pUnionFields(pStar()),
-         produce: (_m, nodeId, graph, traits) => {
-             const node = graph.nodes.get(nodeId)!
-             const name = nameOf(nodeId, traits)
-             const variantTypes = node.edges.map(e => refOf(e.target, graph, traits))
-             return {
-                 ref: name,
-                 forward: `struct ${name};`,
-                 decl: `struct ${name} { std::variant<${variantTypes.join(", ")}> data; };`,
-                 deps: node.edges.map(e => e.target.id),
-             }
-         }},
+        rule(pUnionFields(pStar()),
+             (_m, nodeId, graph, traits) => {
+                 const node = graph.nodes.get(nodeId)!
+                 const name = nameOf(nodeId, traits)
+                 const variantTypes = node.edges.map(e => refOf(e.target, graph, traits))
+                 return {
+                     ref: name,
+                     forward: `struct ${name};`,
+                     decl: `struct ${name} { std::variant<${variantTypes.join(", ")}> data; };`,
+                     deps: node.edges.map(e => e.target.id),
+                 }
+             }),
 
         // 6. List → std::vector<T>
-        {pattern: pList(pStar()),
-         produce: (_m, nodeId, graph, traits) => {
-             const elemNode = child(graph.nodes.get(nodeId)!, {element: true})!
-             return {ref: `std::vector<${refOf(elemNode, graph, traits)}>`, deps: [elemNode.id]}
-         }},
+        rule(pList(pStar()),
+             (_m, nodeId, graph, traits) => {
+                 const elemNode = child(graph.nodes.get(nodeId)!, {element: true})!
+                 return {ref: `std::vector<${refOf(elemNode, graph, traits)}>`, deps: [elemNode.id]}
+             }),
     ]
 }
 

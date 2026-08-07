@@ -48,25 +48,29 @@ export interface ListPattern<E extends TypePattern = TypePattern>
 
 export const isListPattern = (P: TypePattern): P is ListPattern => P.kind === SemanticTypeKinds.List
 
-export interface ListMatch<E extends TypeMatch = TypeMatch> 
+export interface ListMatch<E extends TypeMatch = TypeMatch>
 {
     kind: SemanticTypeKinds.List
+    /** The element's raw (possibly-thunk) SemanticType — resolvable
+     *  by identity, e.g. by a codec resolver, without needing a TypeNode. */
+    elementType: SemanticType
     elementMatch: E
     capacity?: number
 }
 
-export const matchList = <P extends ListPattern>(T: ListType, P: P): MatchOf<P> | undefined => 
+export const matchList = <P extends ListPattern>(T: ListType, P: P): MatchOf<P> | undefined =>
 {
-    if(P.capacityMax === undefined || T.capacity !== undefined && T.capacity <= P.capacityMax) 
+    if(P.capacityMax === undefined || T.capacity !== undefined && T.capacity <= P.capacityMax)
     {
         const e = matchType(T.elementType, P.elementPattern);
         if(e !== undefined)
         {
             return {
                 kind: SemanticTypeKinds.List,
+                elementType: T.elementType,
                 elementMatch: e,
                 capacity: T.capacity
-            } as MatchOf<P>   
+            } as MatchOf<P>
         }
     }
 }
@@ -82,17 +86,28 @@ export interface StructPattern<F extends {[name: string]: TypePattern} = {[name:
 
 export const isStructPattern = (P: TypePattern): P is StructPattern => P.kind === SemanticTypeKinds.Struct && (P as StructPattern).fields === "named"
 
-export interface StructMatch<F extends {[name: string]: TypePattern} = {[name: string]: TypePattern}> 
+/** One named field's witness: its declaration-order position (the wire-
+ *  level `ref` a codec's `enter`/`call_codec` addresses it by), its raw
+ *  (possibly-thunk) SemanticType, and its match. */
+export interface FieldWitness<M = TypeMatch>
 {
-    kind: SemanticTypeKinds.Struct
-    fieldMatches: {[K in keyof F]: MatchOf<F[K]>}
+    readonly index: number
+    readonly type: SemanticType
+    readonly match: M
 }
 
-export const matchStruct = <P extends StructPattern>(T: StructType, P: P): MatchOf<P> | undefined => 
+export interface StructMatch<F extends {[name: string]: TypePattern} = {[name: string]: TypePattern}>
+{
+    kind: SemanticTypeKinds.Struct
+    fieldMatches: {[K in keyof F]: FieldWitness<MatchOf<F[K]>>}
+}
+
+export const matchStruct = <P extends StructPattern>(T: StructType, P: P): MatchOf<P> | undefined =>
 {
     const requiredFields = new Map<string, TypePattern>(Object.entries(P.fieldPatterns))
-    const matchedFields = new Map<string, TypeMatch>()
+    const matchedFields = new Map<string, FieldWitness>()
 
+    let index = 0
     for(const [name, type] of T.fields.entries())
     {
         const pattern = requiredFields.get(name)
@@ -102,8 +117,9 @@ export const matchStruct = <P extends StructPattern>(T: StructType, P: P): Match
         if(m === undefined) return undefined;
 
         if(matchedFields.has(name)) throw new Error("?")
-        matchedFields.set(name, m)
+        matchedFields.set(name, {index, type, match: m})
         requiredFields.delete(name)
+        index++
     }
 
     if(requiredFields.size === 0)
@@ -137,18 +153,21 @@ export const isStructFieldsPattern = (P: TypePattern): P is StructFieldsPattern 
 export interface StructFieldsMatch<E extends TypeMatch = TypeMatch>
 {
     kind: SemanticTypeKinds.Struct
-    fieldMatches: Array<{name: string, match: E}>
+    /** `type` is the field's raw (possibly-thunk) SemanticType — resolvable
+     *  by identity, e.g. by a codec resolver, without needing a TypeNode.
+     *  Array position is the field's declaration-order index. */
+    fieldMatches: Array<{name: string, type: SemanticType, match: E}>
 }
 
-export const matchStructFields = <P extends StructFieldsPattern>(T: StructType, P: P): MatchOf<P> | undefined => 
+export const matchStructFields = <P extends StructFieldsPattern>(T: StructType, P: P): MatchOf<P> | undefined =>
 {
-    const fieldMatches: Array<{name: string, match: TypeMatch}> = []
+    const fieldMatches: Array<{name: string, type: SemanticType, match: TypeMatch}> = []
 
     for(const [name, type] of T.fields.entries())
     {
         const m = matchType(type, P.elementPattern)
         if(m === undefined) return undefined;
-        fieldMatches.push({name, match: m})
+        fieldMatches.push({name, type, match: m})
     }
 
     return {kind: SemanticTypeKinds.Struct, fieldMatches} as MatchOf<P>
@@ -167,14 +186,15 @@ export const isUnionPattern = (P: TypePattern): P is UnionPattern => P.kind === 
 export interface UnionMatch<V extends {[name: string]: TypePattern} = {[name: string]: TypePattern}>
 {
     kind: SemanticTypeKinds.Union
-    variantMatches: {[K in keyof V]: MatchOf<V[K]>}
+    variantMatches: {[K in keyof V]: FieldWitness<MatchOf<V[K]>>}
 }
 
-export const matchUnion = <P extends UnionPattern>(T: UnionType, P: P): MatchOf<P> | undefined => 
+export const matchUnion = <P extends UnionPattern>(T: UnionType, P: P): MatchOf<P> | undefined =>
 {
     const requiredVariants = new Map<string, TypePattern>(Object.entries(P.variantPatterns))
-    const matchedVariants = new Map<string, TypeMatch>()
+    const matchedVariants = new Map<string, FieldWitness>()
 
+    let index = 0
     for(const [name, type] of T.variants.entries())
     {
         const pattern = requiredVariants.get(name)
@@ -184,8 +204,9 @@ export const matchUnion = <P extends UnionPattern>(T: UnionType, P: P): MatchOf<
         if(m === undefined) return undefined;
 
         if(matchedVariants.has(name)) throw new Error("?")
-        matchedVariants.set(name, m)
+        matchedVariants.set(name, {index, type, match: m})
         requiredVariants.delete(name)
+        index++
     }
 
     if(requiredVariants.size === 0)
@@ -217,18 +238,21 @@ export const isUnionFieldsPattern = (P: TypePattern): P is UnionFieldsPattern =>
 export interface UnionFieldsMatch<E extends TypeMatch = TypeMatch>
 {
     kind: SemanticTypeKinds.Union
-    variantMatches: Array<{name: string, match: E}>
+    /** `type` is the variant's raw (possibly-thunk) SemanticType — resolvable
+     *  by identity, e.g. by a codec resolver, without needing a TypeNode.
+     *  Array position is the variant's declaration-order index (the tag). */
+    variantMatches: Array<{name: string, type: SemanticType, match: E}>
 }
 
 export const matchUnionFields = <P extends UnionFieldsPattern>(T: UnionType, P: P): MatchOf<P> | undefined =>
 {
-    const variantMatches: Array<{name: string, match: TypeMatch}> = []
+    const variantMatches: Array<{name: string, type: SemanticType, match: TypeMatch}> = []
 
     for(const [name, type] of T.variants.entries())
     {
         const m = matchType(type, P.elementPattern)
         if(m === undefined) return undefined;
-        variantMatches.push({name, match: m})
+        variantMatches.push({name, type, match: m})
     }
 
     return {kind: SemanticTypeKinds.Union, variantMatches} as MatchOf<P>

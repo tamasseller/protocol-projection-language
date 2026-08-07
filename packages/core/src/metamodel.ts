@@ -49,6 +49,19 @@ export interface UnionType
 
 export const kindOf = (t: SemanticType): SemanticTypeKinds | "reference" => typeof t === "function" ? "reference" : t.kind
 
+/** Follow reference thunks through to the concrete type they name — the
+ *  same dereferencing `matchType`/`buildTypeGraph` each do internally,
+ *  exposed here so any caller holding a possibly-thunk `SemanticType`
+ *  (e.g. a child pulled off a match witness) can get its real kind/shape
+ *  without re-deriving thunk-unwrapping itself. Recurses in case a thunk
+ *  returns another thunk. */
+export const derefType = (t: SemanticType): ConcreteSemanticType =>
+    typeof t === "function" ? derefType(t()) : t
+
+/** `kindOf`, but following reference thunks first — never returns
+ *  `"reference"`. */
+export const concreteKindOf = (t: SemanticType): SemanticTypeKinds => derefType(t).kind
+
 export const isUnit = (t: SemanticType): t is UnitType => kindOf(t) === SemanticTypeKinds.Unit
 export const isInteger = (t: SemanticType): t is IntegerType => kindOf(t) === SemanticTypeKinds.Integer
 export const isList = (t: SemanticType): t is ListType => kindOf(t) === SemanticTypeKinds.List

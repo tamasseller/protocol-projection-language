@@ -2,10 +2,12 @@
  * @ppl/machine — Barrel re-exports.
  *
  * The generic, protocol-agnostic bytecode compiler and VM (docs/isa-core.md):
- * IR authoring (`ir`/`proc`/`concat`), the AST/EAST layers, the pattern-
- * rewrite lowering ruleset and orchestrator, the RTL instruction set, the
- * lowerer, the whole-program validator, the VM, the wire codec, and the
- * generic extension hook.
+ * IR authoring (`ir`/`proc` — `ir\`...\`` splices `Procedure`, `IrFragment`,
+ * and `IrFragment[]` values natively, so composing fragments built
+ * independently never needs a separate concatenation helper), the AST/EAST
+ * layers, the pattern-rewrite lowering ruleset and orchestrator, the RTL
+ * instruction set, the lowerer, the whole-program validator, the VM, the
+ * wire codec, and the generic extension hook.
  */
 export * from "./ast"
 export * from "./east"

@@ -1,24 +1,46 @@
 /**
  * @ppl/machine — `ir\`...\`` tagged template literal
  *
- * The authoring entry point. Parses a C-subset source string (per
- * isa-core.md Part VI) into an {@link IrFragment} — a sequence of parsed
- * AST statements that later layers (stitching, lowering) consume.
+ * The authoring entry point. Builds an {@link IrFragment} from a C-subset
+ * source string (per isa-core.md Part VI) plus interpolated values, for
+ * later layers (stitching, lowering) to consume as parsed AST statements.
  *
- * Interpolated values (`${…}`) are stringified and spliced into the source
- * before parsing, handling the common metaprogramming cases: numbers,
- * identifiers, small expressions. For example:
+ * Interpolated values (`${…}`) are handled by kind, not uniformly
+ * stringified:
+ * - A {@link Procedure} splices as its pre-minted synthetic name (see
+ *   below) and is recorded in `calls`.
+ * - An {@link IrFragment} splices as its own `source` text directly —
+ *   recursively, since that source may itself contain further splices —
+ *   and its `calls` are merged in. This is what lets a metaprogram build
+ *   sub-fragments that are *not* independently valid Program text on their
+ *   own (e.g. a bare `case N: ...` clause, only meaningful once embedded in
+ *   a `switch`) and combine them before anything ever tries to parse them
+ *   standalone — see `body`'s laziness below.
+ * - An array of `IrFragment`s splices each one's `source` in sequence
+ *   (newline-joined), `calls` merged across all of them — the dynamic-arity
+ *   case (`${node.edges.map(e => ir\`...\`)}`) that a fixed-arity tagged
+ *   template can't otherwise express.
+ * - Everything else is stringified with plain `String()` (numbers,
+ *   identifiers, small expressions).
  *
  * ```ts
  * const n = 3
  * const frag = ir`u32 count = ${n};`
- * //   parses "u32 count = 3;" → IrFragment { body: [VariableDeclaration...] }
+ * //   → IrFragment; frag.body (parsed on access) is [VariableDeclaration...]
  * ```
  *
- * Per the Golden Rule (copilot-instructions.md §4): the `ir` tag must NOT
- * evaluate to a single concatenated string. It parses the spliced source
- * into an in-memory AST tree. The raw `source` is retained only for
- * debugging and error messages.
+ * Per the Golden Rule (copilot-instructions.md §4): `ir` must never leave a
+ * flat string as the thing a real consumer (lowering, the C++ generator)
+ * ends up working against — `body` is always genuine parsed AST by the time
+ * anything downstream reads it. What's deliberately relaxed is *when* that
+ * parse happens: `body` is computed lazily, on first access, rather than
+ * eagerly at every `ir\`...\`` call — which is exactly what makes splicing
+ * non-standalone sub-fragments (the `case N: ...` example above) possible,
+ * since nothing tries to parse them until they're embedded somewhere valid.
+ * The cost is that a syntax error surfaces at the point `body` is finally
+ * read (against the fully-assembled source), not at the specific `ir` call
+ * that introduced it — `source` is kept in full for exactly this case, so
+ * the error message still shows real, if less locally-pinpointed, context.
  */
 
 import { parse, SyntaxError as PegSyntaxError } from "./parser"
@@ -27,22 +49,31 @@ import type { Statement } from "./ast"
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * The output of an `ir\`...\`` block. Wraps a parsed statement sequence
- * (the fragment's contribution to a procedure body) that will be stitched
- * with other fragments and lowered to IR bytecode.
+ * The output of an `ir\`...\`` block. Wraps a statement sequence (the
+ * fragment's contribution to a procedure body) that will be stitched with
+ * other fragments and lowered to IR bytecode.
  */
 export interface IrFragment
 {
     readonly type: "IrFragment"
-    /** Parsed statements — the fragment body. */
+    /** Parsed statements — the fragment body. Computed lazily, on first
+     *  access, and memoized: `ir\`...\`` does not parse eagerly, so a
+     *  fragment that's only valid once spliced into a larger one (e.g. a
+     *  bare `case N: ...` clause) can exist and be combined with others
+     *  before anything tries to parse it standalone. Throws the underlying
+     *  {@link SyntaxError} if `source` was never actually valid once
+     *  assembled. */
     readonly body: readonly Statement[]
-    /** The reconstructed source string (chunks + interpolated values).
-     *  Retained for error messages and debugging only. */
+    /** The reconstructed source string (chunks + interpolated values) —
+     *  not just for error messages: this *is* the fragment's real content
+     *  until `body` is first read, and what a splice of this fragment into
+     *  another `ir\`...\`` template actually inlines. */
     readonly source: string
     /** Maps each synthetic callee name this fragment's source was spliced
      *  with (see {@link ir}'s handling of {@link Procedure} values) back to
      *  the `Procedure` it refers to. Empty for fragments that reference no
-     *  other procedure. */
+     *  other procedure. Merged in from any spliced sub-fragment's own
+     *  `calls`, so nesting never loses a reference. */
     readonly calls: ReadonlyMap<string, Procedure>
 }
 
@@ -117,22 +148,26 @@ export function defineProc(target: Procedure, fragment: IrFragment): void
 const isProcedure = (v: unknown): v is Procedure =>
     typeof v === "object" && v !== null && (v as { type?: unknown }).type === "Procedure"
 
+const isIrFragment = (v: unknown): v is IrFragment =>
+    typeof v === "object" && v !== null && (v as { type?: unknown }).type === "IrFragment"
+
+/** Merge `from`'s `calls` into `into`, in place. Safe to call repeatedly
+ *  across several sources: {@link proc} mints each `Procedure`'s `name`
+ *  once, at creation, so the same `Procedure` reached via several spliced
+ *  fragments always merges to one entry, and distinct `Procedure`s never
+ *  collide. */
+function mergeCalls(into: Map<string, Procedure>, from: ReadonlyMap<string, Procedure>): void
+{
+    for (const [name, referenced] of from) into.set(name, referenced)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Parse a C-subset source string into an {@link IrFragment}.
- *
- * An interpolated {@link Procedure} (`${otherProc}`) is not stringified —
- * it is spliced as its pre-minted `name` (parsed as an ordinary
- * `CallExpression` callee when followed by `(...)`, per grammer.pegjs's
- * existing `Identifier "(" ArgumentList? ")"` rule) and recorded in the
- * returned fragment's `calls` map, so the reference is resolved by object
- * identity rather than by a name the author must keep in sync by hand.
- * Every other interpolated value keeps the plain `String()` splice used for
- * numbers, identifiers, and raw source snippets.
- *
- * @throws {@link PegSyntaxError} if the source is not valid C-subset.
- *    The error carries source-location info via `grammarSource`.
+ * Build an {@link IrFragment} from a C-subset source template (see the file
+ * header for how each kind of interpolated value is handled). Parsing is
+ * deferred to `body`'s first access — this call itself never throws on bad
+ * syntax, only assembles `source`/`calls`.
  */
 export function ir(
     strings: TemplateStringsArray,
@@ -151,6 +186,16 @@ export function ir(
             text = value.name
             calls.set(text, value)
         }
+        else if (isIrFragment(value))
+        {
+            text = value.source
+            mergeCalls(calls, value.calls)
+        }
+        else if (Array.isArray(value) && value.every(isIrFragment))
+        {
+            text = (value as IrFragment[]).map(f => f.source).join("\n")
+            for (const f of value as IrFragment[]) mergeCalls(calls, f.calls)
+        }
         else
         {
             text = String(value)
@@ -158,40 +203,16 @@ export function ir(
         source += text + strings[i + 1]
     }
 
-    const program = parse(source, { grammarSource: "ir`...`" })
+    let cachedBody: readonly Statement[] | undefined
     return {
         type: "IrFragment",
-        body: program.body,
         source,
         calls,
+        get body(): readonly Statement[]
+        {
+            return cachedBody ??= parse(source, { grammarSource: "ir`...`" }).body
+        },
     }
-}
-
-/**
- * Concatenate `IrFragment`s built independently — e.g. one per element of
- * a compile-time-computed (TS-execution-time) collection, where the count
- * of statements or procedure references isn't known until that collection
- * is walked and so can't be expressed as a single `ir\`...\`` template
- * with a fixed number of `${…}` holes. Bodies concatenate in argument
- * order; `calls` union safely because {@link proc} mints each
- * `Procedure`'s `name` once, at creation — the same `Procedure` referenced
- * by several of the fragments being concatenated always maps to the same
- * name, and distinct `Procedure`s never collide.
- */
-export function concat(...fragments: readonly IrFragment[]): IrFragment
-{
-    const body: Statement[] = []
-    const calls = new Map<string, Procedure>()
-    let source = ""
-
-    for (const fragment of fragments)
-    {
-        body.push(...fragment.body)
-        for (const [name, referenced] of fragment.calls) calls.set(name, referenced)
-        source += fragment.source
-    }
-
-    return { type: "IrFragment", body, source, calls }
 }
 
 // Re-export the parser's SyntaxError so callers can `catch (e) { if (e

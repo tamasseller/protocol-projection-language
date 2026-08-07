@@ -19,6 +19,7 @@ import {
     TypeNode,
     child,
     Rule,
+    rule,
     runRuleset,
 } from "@ppl/core"
 import {
@@ -131,142 +132,132 @@ export function cTypeRules(): ReadonlyArray<Rule<CTypeDecl>>
 {
     return [
         // 1. Integer → fixed-width C type
-        {
-            pattern: pInteger(-Infinity, Infinity),
-            produce: (_m, nodeId, graph) => ({
-                ref: cIntType(graph.nodes.get(nodeId)!.type as IntegerType),
-                deps: [],
-            }),
-        },
+        rule(pInteger(-Infinity, Infinity), (match) => ({
+            ref: cIntType(match),
+            deps: [],
+        })),
 
         // 2. Unit → void
-        {
-            pattern: pUnit(),
-            produce: () => ({ref: "void", deps: []}),
-        },
+        rule(pUnit(), () => ({ref: "void", deps: []})),
 
         // 3. Union with EXACT named variants — tagged union.
         //    When ALL variants are unit, emit just a tag byte (no data union).
-        {
-            pattern: pUnion({}),
-            produce: (_m, nodeId, graph, traits) => {
-                const node = graph.nodes.get(nodeId)!
-                const name = nameOf(nodeId, traits)
-                const allUnit = node.edges.every(e => isUnit(e.target.type))
+        rule(pUnion({}), (_m, nodeId, graph, traits) => {
+            const node = graph.nodes.get(nodeId)!
+            const name = nameOf(nodeId, traits)
+            const allUnit = node.edges.every(e => isUnit(e.target.type))
 
-                if (allUnit)
-                {
-                    // Purely symbolic enum — just a tag byte, no payload.
-                    const tagComment = node.edges
-                        .map((e, i) => `    // ${i}: ${"variant" in e.step ? e.step.variant : "?"}`)
-                        .join("\n")
-                    return {
-                        ref: name,
-                        forward: `typedef struct ${name} ${name};`,
-                        decl: `typedef struct ${name} {\n    uint8_t tag;\n${tagComment}\n} ${name};`,
-                        deps: [],
-                    }
-                }
-
-                // Mixed-payload tagged union.
-                const variantFields = node.edges.map(e => {
-                    const vName = "variant" in e.step ? e.step.variant : "_"
-                    const vType = cRefOf(e.target, traits)
-                    return `        ${vType} ${vName};`
-                })
+            if (allUnit)
+            {
+                // Purely symbolic enum — just a tag byte, no payload.
+                const tagComment = node.edges
+                    .map((e, i) => `    // ${i}: ${"variant" in e.step ? e.step.variant : "?"}`)
+                    .join("\n")
                 return {
                     ref: name,
                     forward: `typedef struct ${name} ${name};`,
-                    decl:
-                        `typedef struct ${name} {\n` +
-                        `    uint8_t tag;\n` +
-                        `    union {\n${variantFields.join("\n")}\n` +
-                        `    } data;\n` +
-                        `} ${name};`,
-                    deps: node.edges.map(e => e.target.id),
+                    decl: `typedef struct ${name} {\n    uint8_t tag;\n${tagComment}\n} ${name};`,
+                    deps: [],
                 }
-            },
-        },
+            }
+
+            // Mixed-payload tagged union.
+            const variantFields = node.edges.map(e => {
+                const vName = "variant" in e.step ? e.step.variant : "_"
+                const vType = cRefOf(e.target, traits)
+                return `        ${vType} ${vName};`
+            })
+            return {
+                ref: name,
+                forward: `typedef struct ${name} ${name};`,
+                decl:
+                    `typedef struct ${name} {\n` +
+                    `    uint8_t tag;\n` +
+                    `    union {\n${variantFields.join("\n")}\n` +
+                    `    } data;\n` +
+                    `} ${name};`,
+                deps: node.edges.map(e => e.target.id),
+            }
+        }),
 
         // 4. Homogeneous-variants union (pUnionFields) — fallback for
         //    unions where we don't enumerate every variant name.
-        {
-            pattern: pUnionFields(pStar()),
-            produce: (_m, nodeId, graph, traits) => {
-                const node = graph.nodes.get(nodeId)!
-                const name = nameOf(nodeId, traits)
-                const allUnit = node.edges.every(e => isUnit(e.target.type))
+        rule(pUnionFields(pStar()), (_m, nodeId, graph, traits) => {
+            const node = graph.nodes.get(nodeId)!
+            const name = nameOf(nodeId, traits)
+            const allUnit = node.edges.every(e => isUnit(e.target.type))
 
-                if (allUnit)
-                {
-                    return {
-                        ref: name,
-                        forward: `typedef struct ${name} ${name};`,
-                        decl: `typedef struct ${name} {\n    uint8_t tag;\n} ${name};`,
-                        deps: [],
-                    }
-                }
-
-                const variantFields = node.edges.map(e => {
-                    const vName = "variant" in e.step ? e.step.variant : "_"
-                    const vType = cRefOf(e.target, traits)
-                    return `        ${vType} ${vName};`
-                })
+            if (allUnit)
+            {
                 return {
                     ref: name,
                     forward: `typedef struct ${name} ${name};`,
-                    decl:
-                        `typedef struct ${name} {\n` +
-                        `    uint8_t tag;\n` +
-                        `    union {\n${variantFields.join("\n")}\n` +
-                        `    } data;\n` +
-                        `} ${name};`,
-                    deps: node.edges.map(e => e.target.id),
+                    decl: `typedef struct ${name} {\n    uint8_t tag;\n} ${name};`,
+                    deps: [],
                 }
-            },
-        },
+            }
+
+            const variantFields = node.edges.map(e => {
+                const vName = "variant" in e.step ? e.step.variant : "_"
+                const vType = cRefOf(e.target, traits)
+                return `        ${vType} ${vName};`
+            })
+            return {
+                ref: name,
+                forward: `typedef struct ${name} ${name};`,
+                decl:
+                    `typedef struct ${name} {\n` +
+                    `    uint8_t tag;\n` +
+                    `    union {\n${variantFields.join("\n")}\n` +
+                    `    } data;\n` +
+                    `} ${name};`,
+                deps: node.edges.map(e => e.target.id),
+            }
+        }),
 
         // 5. Struct — each field emitted directly. List fields become
         //    fixed array + count.
-        {
-            pattern: pStructFields(pStar()),
-            produce: (_m, nodeId, graph, traits) => {
-                const node = graph.nodes.get(nodeId)!
-                const name = nameOf(nodeId, traits)
-                const fieldLines: string[] = []
-                const deps: number[] = []
+        rule(pStructFields(pStar()), (_m, nodeId, graph, traits) => {
+            const node = graph.nodes.get(nodeId)!
+            const name = nameOf(nodeId, traits)
+            const fieldLines: string[] = []
+            const deps: number[] = []
 
-                for (const edge of node.edges)
+            for (const edge of node.edges)
+            {
+                const fName = "field" in edge.step ? edge.step.field : "_"
+
+                if (isList(edge.target.type))
                 {
-                    const fName = "field" in edge.step ? edge.step.field : "_"
+                    // List → fixed array + count field. Not the struct
+                    // rule's own matched pattern (that's pStructFields) —
+                    // this is a nested, ad hoc check on a *child* edge, so
+                    // there's no rule-level match witness for it to come
+                    // from; a real cast against the raw type is the only
+                    // option here.
+                    const lt = edge.target.type as ListType
+                    const elemNode = child(edge.target, {element: true})!
+                    const elemType = cRefOf(elemNode, traits)
+                    const cap = lt.capacity ?? 255
 
-                    if (isList(edge.target.type))
-                    {
-                        // List → fixed array + count field
-                        const lt = edge.target.type as ListType
-                        const elemNode = child(edge.target, {element: true})!
-                        const elemType = cRefOf(elemNode, traits)
-                        const cap = lt.capacity ?? 255
-
-                        fieldLines.push(`    ${elemType} ${fName}[${cap}];`)
-                        fieldLines.push(`    uint8_t ${fName}_count;`)
-                        deps.push(elemNode.id)
-                    }
-                    else
-                    {
-                        fieldLines.push(`    ${cRefOf(edge.target, traits)} ${fName};`)
-                        deps.push(edge.target.id)
-                    }
+                    fieldLines.push(`    ${elemType} ${fName}[${cap}];`)
+                    fieldLines.push(`    uint8_t ${fName}_count;`)
+                    deps.push(elemNode.id)
                 }
-
-                return {
-                    ref: name,
-                    forward: `typedef struct ${name} ${name};`,
-                    decl: `typedef struct ${name} {\n${fieldLines.join("\n")}\n} ${name};`,
-                    deps,
+                else
+                {
+                    fieldLines.push(`    ${cRefOf(edge.target, traits)} ${fName};`)
+                    deps.push(edge.target.id)
                 }
-            },
-        },
+            }
+
+            return {
+                ref: name,
+                forward: `typedef struct ${name} ${name};`,
+                decl: `typedef struct ${name} {\n${fieldLines.join("\n")}\n} ${name};`,
+                deps,
+            }
+        }),
     ]
 }
 

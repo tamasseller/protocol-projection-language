@@ -11,12 +11,14 @@
  * never `call_codec` — because a delta is a computed register value, not
  * an object handle (§3.3).
  *
- * A real `CodecRule<Direction>` (`deltaLeb128Rule`, matching
- * `List<Integer>`), not a standalone one-off function — it composes with
- * `buildCodec`'s `extraRules` seam exactly like any other rule, so it can
- * preempt the generic list rule for one specific field nested inside a
- * larger struct, not just a standalone root. `buildDeltaLeb128ListCodec`
- * remains as a thin, backward-compatible wrapper over that.
+ * A real pair of `CodecRule<void>`s (`deltaLeb128EncodeRule`/
+ * `deltaLeb128DecodeRule`, both matching `List<Integer>`), not a standalone
+ * one-off function — each composes into a `rules` array exactly like any
+ * other rule, so it can preempt the generic list rule for one specific
+ * field nested inside a larger struct, not just a standalone root.
+ * `buildDeltaLeb128ListCodec` remains as a thin, backward-compatible
+ * wrapper over that, picking whichever rule matches its own `direction`
+ * argument.
  *
  * Faithful to §8.6 as specified: the delta is fed straight into unsigned
  * LEB128, no zigzag step. That means it's a genuine win only for
@@ -29,11 +31,11 @@
 
 import type { IrFragment, Procedure, RtlProgram } from "@ppl/machine"
 import { ir, declareProc, defineProc } from "@ppl/machine"
-import type { TypeNode } from "@ppl/core"
-import { kindOf, SemanticTypeKinds, pList, pInteger } from "@ppl/core"
-import type { Direction } from "./codec-extension"
-import type { CodecRule } from "./rules"
-import { buildCodec } from "./builders"
+import type { SemanticType, ListType, ListPattern, IntegerPattern } from "@ppl/core"
+import { concreteKindOf, derefType, SemanticTypeKinds, pList, pInteger } from "@ppl/core"
+import type { Direction } from "../engine/codec-extension"
+import { buildCodec } from "../engine/builders"
+import { codecRule } from "../engine/resolver"
 
 // ── leb128_encode(value) — §8.3, as an ir` ` fragment ────────────────────
 
@@ -134,33 +136,45 @@ function deltaDecodeBody(leb128: Procedure): IrFragment
 }
 
 /**
- * `List<Integer>` -> delta+LEB128, one direction at a time. A fresh
- * `leb128_encode`/`leb128_decode` helper `Procedure` per `produce()` call —
- * this rule doesn't memoize the helper across multiple matching fields in
- * the same program, matching the granularity `buildDeltaLeb128ListCodec`
- * already had as a standalone one-shot builder.
+ * `List<Integer>` -> delta+LEB128 — two rules, not one branching on a
+ * threaded direction (see binary-rules.ts for why: a resolver run already
+ * commits to one direction for its whole walk, so there's nothing for a
+ * runtime flag to select between within a single `produce` call). Each
+ * mints its own fresh `leb128_encode`/`leb128_decode` helper `Procedure`
+ * per `produce()` call — neither rule memoizes the helper across multiple
+ * matching fields in the same program, matching the granularity
+ * `buildDeltaLeb128ListCodec` already had as a standalone one-shot builder.
  */
-export const deltaLeb128Rule: CodecRule<Direction> = {
-    pattern: pList(pInteger(-Infinity, Infinity)),
-    produce: (_m, _node, direction) =>
-    {
-        const leb128 = declareProc(direction === "encode" ? ["value"] : [])
-        defineProc(leb128, direction === "encode" ? leb128EncodeBody() : leb128DecodeBody())
-        return direction === "encode" ? deltaEncodeBody(leb128) : deltaDecodeBody(leb128)
-    },
-}
+const LIST_OF_INTEGER = pList(pInteger(-Infinity, Infinity))
+
+export const deltaLeb128EncodeRule = codecRule<ListPattern<IntegerPattern>, void>(LIST_OF_INTEGER, () =>
+{
+    const leb128 = declareProc(["value"])
+    defineProc(leb128, leb128EncodeBody())
+    return deltaEncodeBody(leb128)
+})
+
+export const deltaLeb128DecodeRule = codecRule<ListPattern<IntegerPattern>, void>(LIST_OF_INTEGER, () =>
+{
+    const leb128 = declareProc([])
+    defineProc(leb128, leb128DecodeBody())
+    return deltaDecodeBody(leb128)
+})
 
 /** Build the self-contained delta+LEB128 program for a `List<Integer>`,
- *  one direction at a time. `node` must be a list of an integer element
- *  type. A thin wrapper over `buildCodec`'s `extraRules` seam — the rule
- *  itself (`deltaLeb128Rule`) is the reusable, composable piece. */
-export function buildDeltaLeb128ListCodec(node: TypeNode, direction: Direction): RtlProgram
+ *  one direction at a time. `root` must be a list of an integer element
+ *  type. A thin wrapper picking whichever of `deltaLeb128EncodeRule`/
+ *  `deltaLeb128DecodeRule` matches `direction` — those rules are the
+ *  reusable, composable pieces. */
+export function buildDeltaLeb128ListCodec(root: SemanticType, direction: Direction): RtlProgram
 {
-    if(kindOf(node.type) !== SemanticTypeKinds.List)
-        throw new Error(`buildDeltaLeb128ListCodec: expected a list type, got "${kindOf(node.type)}"`)
-    const elementKind = kindOf(node.edges[0]!.target.type)
+    if(concreteKindOf(root) !== SemanticTypeKinds.List)
+        throw new Error(`buildDeltaLeb128ListCodec: expected a list type, got "${concreteKindOf(root)}"`)
+    const elementKind = concreteKindOf((derefType(root) as ListType).elementType)
     if(elementKind !== SemanticTypeKinds.Integer)
         throw new Error(`buildDeltaLeb128ListCodec: expected List<Integer>, element is "${elementKind}"`)
 
-    return buildCodec(node, direction, [deltaLeb128Rule])
+    return direction === "encode"
+        ? buildCodec(root, [deltaLeb128EncodeRule], undefined)
+        : buildCodec(root, [deltaLeb128DecodeRule], undefined)
 }

@@ -9,7 +9,7 @@
 import { describe, test } from "node:test"
 import assert from "node:assert/strict"
 
-import { ir, proc, concat } from "../src/ir"
+import { ir, proc } from "../src/ir"
 import { lowerProc, lowerProgram } from "../src/lower"
 import { run } from "../src/vm"
 import {RtlProgram} from "../src/rtl"
@@ -714,16 +714,16 @@ describe("Multi-procedure programs (ROADMAP.md item 2)", () =>
         assert.equal(program.procedures.length, 2)
     })
 
-    test("a procedure body assembled via concat (ir.ts's computed-arity pattern) is callable like any other", () =>
+    test("a procedure body assembled via spliced IrFragment[] (ir.ts's computed-arity pattern) is callable like any other", () =>
     {
         const step = (n: number) => proc(["acc"], ir`return acc + ${n};`)
         const steps = [1, 2, 3].map(step)
 
-        const body = concat(
-            ir`u32 acc = 0;`,
-            ...steps.map(s => ir`acc = ${s}(acc);`),
-            ir`return acc;`,
-        )
+        const body = ir`
+            u32 acc = 0;
+            ${steps.map(s => ir`acc = ${s}(acc);`)}
+            return acc;
+        `
         const entry = proc([], body)
 
         const { acc, ok, program } = runProgram(entry)

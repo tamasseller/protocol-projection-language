@@ -1,9 +1,9 @@
 /**
  * @ppl/codecs/test — builders.ts: the generic codec-generation library
  *
- * Unit-level coverage per `TypeNode` kind, plus the two things that make
- * this a *library* rather than a one-off: memoizing shared `TypeNode`s to
- * one codec, and the struct-level union-tag hoisting optimization.
+ * Unit-level coverage per semantic-type kind, plus the two things that make
+ * this a *library* rather than a one-off: memoizing shared types to one
+ * codec, and the struct-level union-tag hoisting optimization.
  * `packages/example`'s rewritten integration test is the "does this hold
  * up against a real, independently-authored schema" proof; this file is
  * the focused, per-feature one.
@@ -12,26 +12,35 @@
 import { describe, test } from "node:test"
 import assert from "node:assert/strict"
 
-import type { SemanticType } from "@ppl/core"
+import type { SemanticType, UnitPattern } from "@ppl/core"
 import { struct, union, unit, u8, u16, i8, i16, i32, list, pUnit, buildTypeGraph } from "@ppl/core"
 import { ir, validateProgram, run } from "@ppl/machine"
 
-import { buildCodec } from "../src/builders"
-import { createCodecExtension } from "../src/codec-extension"
-import type { CodecRule } from "../src/rules"
-import type { Direction } from "../src/codec-extension"
+import { buildCodec } from "../src/engine/builders"
+import { createCodecExtension } from "../src/engine/codec-extension"
+import type { CodecRule } from "../src/engine/resolver"
+import { codecRule } from "../src/engine/resolver"
+import { binaryEncodeRules, binaryDecodeRules } from "../src/components/binary-rules"
 
-function roundTrip(rootType: Parameters<typeof buildTypeGraph>[0], value: unknown, extraRules: readonly CodecRule<Direction>[] = [])
+function roundTrip(
+    rootType: SemanticType,
+    value: unknown,
+    extra: { encode?: readonly CodecRule<void>[], decode?: readonly CodecRule<void>[] } = {},
+)
 {
+    // `buildCodec` itself only ever needs `rootType` — the TypeGraph here
+    // is purely to get a `TypeNode` for the runtime `Handle` below, which
+    // is the codec *extension*'s (codec-extension.ts) own concern, unaffected
+    // by this file's rewrite.
     const graph = buildTypeGraph(rootType)
 
-    const encodeProgram = buildCodec(graph.root, "encode", extraRules)
+    const encodeProgram = buildCodec(rootType, [...(extra.encode ?? []), ...binaryEncodeRules], undefined)
     const buffer: number[] = []
     const encodeExt = createCodecExtension("encode", { container: { root: value }, key: "root", type: graph.root }, buffer)
     validateProgram(encodeProgram, encodeExt)
     assert.equal(run(encodeProgram, encodeExt).ok, true)
 
-    const decodeProgram = buildCodec(graph.root, "decode", extraRules)
+    const decodeProgram = buildCodec(rootType, [...(extra.decode ?? []), ...binaryDecodeRules], undefined)
     // Pre-seed the root slot with an empty object: essential for a
     // struct-rooted decode (fields mutate an existing object in place,
     // never get "instantiated" the way a list/union does) and harmless
@@ -106,11 +115,10 @@ describe("buildCodec — structs: field order, sharing, and union-tag hoisting",
         assert.deepEqual(roundTrip(t, { x: 1, y: 2 }).buffer, [1, 2, 0])
     })
 
-    test("two fields of the same shared TypeNode resolve to one codec, not two", () =>
+    test("two fields of the same shared type resolve to one codec, not two", () =>
     {
         const t = struct({ a: u8, b: u8 }) // `u8` is the same exported singleton object
-        const graph = buildTypeGraph(t)
-        const program = buildCodec(graph.root, "encode")
+        const program = buildCodec(t, binaryEncodeRules, undefined)
         assert.equal(program.procedures.length, 2) // struct + one shared u8 codec
     })
 
@@ -163,17 +171,18 @@ describe("buildCodec — extensibility and recursive types", () =>
 {
     test("a caller-supplied rule wins over the matching default for the same type shape", () =>
     {
-        // The default `unit` rule (builders.ts) writes nothing at all — a
-        // custom rule can still preempt it and write an explicit marker
+        // The default `unit` rule (binary-rules.ts) writes nothing at all —
+        // a custom rule can still preempt it and write an explicit marker
         // byte instead, purely by being listed first; no change to
-        // builders.ts itself.
-        const markerUnitRule: CodecRule<Direction> = {
-            pattern: pUnit(),
-            produce: (_m, _node, direction) =>
-                direction === "encode" ? ir`255; write(0, 1); return;` : ir`read(0, 1); return;`,
-        }
+        // binary-rules.ts itself. Two rules, not one branching on
+        // direction — same reasoning as binary-rules.ts's own split.
+        const markerUnitEncodeRule = codecRule<UnitPattern, void>(pUnit(), () => ir`255; write(0, 1); return;`)
+        const markerUnitDecodeRule = codecRule<UnitPattern, void>(pUnit(), () => ir`read(0, 1); return;`)
 
-        const { buffer } = roundTrip(unit, undefined, [markerUnitRule])
+        const { buffer } = roundTrip(unit, undefined, {
+            encode: [markerUnitEncodeRule],
+            decode: [markerUnitDecodeRule],
+        })
         assert.deepEqual(buffer, [255])
     })
 
@@ -185,7 +194,7 @@ describe("buildCodec — extensibility and recursive types", () =>
         // TypeNode graph, not just a deeply-nested finite tree. The two-
         // phase `Procedure` construction (declareProc/defineProc, ir.ts) is
         // what lets `resolve()` even *reach* this without infinite
-        // recursion during generation (see rules.test.ts's driver-level
+        // recursion during generation (see resolver.test.ts's driver-level
         // version of the same thing) — but isa-core.md §8.2 forbids a
         // recursive call graph outright (bounded-stack-depth guarantee),
         // and `validateProgram` enforces that regardless of how the
@@ -199,7 +208,7 @@ describe("buildCodec — extensibility and recursive types", () =>
         node = chainType
 
         const graph = buildTypeGraph(chainType)
-        const program = buildCodec(graph.root, "encode") // must not hang or stack-overflow
+        const program = buildCodec(chainType, binaryEncodeRules, undefined) // must not hang or stack-overflow
         const ext = createCodecExtension("encode", { container: { root: undefined }, key: "root", type: graph.root }, [])
         assert.throws(
             () => validateProgram(program, ext),
