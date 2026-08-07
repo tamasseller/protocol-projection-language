@@ -102,17 +102,48 @@ function unaryNode(child: RtlNode, output: OutputLocation[], fragment: RtlInstr[
 
 // ── Leaf rules ──────────────────────────────────────────────────────────────
 
+/**
+ * `identifier:acc`/`identifier:tos` are tried opportunistically against
+ * *every* bare identifier `tileNode` ever reaches — including one a
+ * call-shaped node's own argument-tiling attempts eagerly, before anyone
+ * has checked whether that identifier was ever meant to be a local at all
+ * (`matchAllEast`'s `"Call"` case, matcher.ts:283-300, tiles every argument
+ * of *any* call-shaped node unconditionally, since it has no way to know in
+ * advance that a sibling `BuiltinCallPattern` rule — e.g. a codec
+ * extension's `call_codec(${proc}, ...)`, where the first argument is a
+ * callee-reference identifier, never a value — is the one that will
+ * actually win). `resolveLocal` throwing hard on an unresolvable name is
+ * correct and valuable everywhere else it's called directly against a
+ * *fixed* pattern position the author explicitly wrote as "this names a
+ * local" (`regOperandRules`/`assignmentRules`/etc.) — but here, reachable
+ * from unconstrained tiling, the same throw would abort matching for the
+ * *whole* enclosing expression over an identifier this rule was only ever
+ * opportunistically trying. Catching it and declining (no candidate) is
+ * this pair's own, narrowly-scoped exception to "resolveLocal throws" —
+ * everywhere else keeps the hard failure.
+ */
 function leafRules(resolveLocal: (name: string) => number): Rule[]
 {
+    const tryResolveLocal = (name: string): number | undefined =>
+    {
+        try { return resolveLocal(name) } catch { return undefined }
+    }
+
     return [
         rule("literal:acc", pLiteral(), m =>
             leafNode(["acc"], [CONST(m.value)], [], 0, 0)),
         rule("literal:tos", pLiteral(), m =>
             leafNode(["tos"], [CONST(m.value), PUSH()], ["acc"], 1, 1)),
         rule("identifier:acc", pIdentifier(), m =>
-            leafNode(["acc"], [LOAD(resolveLocal(m.name))], [], 0, 0)),
+        {
+            const idx = tryResolveLocal(m.name)
+            return idx === undefined ? undefined : leafNode(["acc"], [LOAD(idx)], [], 0, 0)
+        }),
         rule("identifier:tos", pIdentifier(), m =>
-            leafNode(["tos"], [LOAD(resolveLocal(m.name)), PUSH()], ["acc"], 1, 1)),
+        {
+            const idx = tryResolveLocal(m.name)
+            return idx === undefined ? undefined : leafNode(["tos"], [LOAD(idx), PUSH()], ["acc"], 1, 1)
+        }),
     ]
 }
 
@@ -179,11 +210,11 @@ function builtinCallRules(): Rule[]
     return [
         ...BUILTIN_UNARY_CALLS.map(({name, isa}) =>
             rule(`builtin:${name}`, pBuiltinCall(name, pRtl("acc")), m =>
-                unaryNode(m.argumentMatch.node, ["acc"],
-                    [...m.argumentMatch.node.fragment, bare(isa)]))),
+                unaryNode(m.argumentMatches[0].node, ["acc"],
+                    [...m.argumentMatches[0].node.fragment, bare(isa)]))),
 
         rule("builtin:trap", pBuiltinCall("trap", pLiteral()), m =>
-            leafNode(["acc"], [trap(m.argumentMatch.value)], [], 0, 0)),
+            leafNode(["acc"], [trap(m.argumentMatches[0].value)], [], 0, 0)),
     ]
 }
 

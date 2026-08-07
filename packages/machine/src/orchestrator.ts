@@ -46,7 +46,7 @@ function collectRtlNodes(m: EastMatch): RtlNode[]
         case "Unary": return collectRtlNodes(m.argumentMatch)
         case "Assign": return collectRtlNodes(m.rightMatch)
         case "Call": return m.argNodes
-        case "BuiltinCall": return collectRtlNodes(m.argumentMatch)
+        case "BuiltinCall": return [...m.argumentMatches.flatMap(collectRtlNodes), ...(m.tailNodes ?? [])]
         default: return [] // Literal, Identifier — no RTL children
     }
 }

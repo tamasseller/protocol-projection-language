@@ -40,6 +40,21 @@ encoding space and validation surface for zero benefit. A loop that would
 `break` early folds the early-exit test into its condition block instead
 of jumping out mid-body.
 
+**`TRAP` is one generic opcode, not a per-domain family.** Any consumer of
+this ISA needs a way to stop execution and report a reason — a codec
+validating a checksum, a filter rejecting malformed input, anything else
+built on top. The *reasons* are always domain-specific, but the *action*
+(stop, report a code, let the host decide what happens next) isn't, and
+encoding "abort" as a degenerate loop or jump-to-nowhere would violate the
+structured-control-flow invariant above for no benefit. So `TRAP #code`
+(spec §4.5) lives in the generic core, with an opaque error-code space
+partitioned by convention — `0` reserved, the rest host-defined — rather
+than by ISA-enforced semantics: there's no stream cleanup or handle
+teardown to layer on top, since the host owns all of that and decides the
+response. Precedent is uniform across real ISAs that made the same call:
+x86 `INT`, ARM `BKPT`/`SVC`, RISC-V `EBREAK`, Wasm `unreachable`, eBPF
+exit-with-non-zero are all generic, not domain-specific traps.
+
 **TOS-hybrid accumulator + register file, sharing one address space.**
 Keeping the operand stack and the register file as the *same* logical
 array (indexed by TOS on one side, by name on the other) means a value

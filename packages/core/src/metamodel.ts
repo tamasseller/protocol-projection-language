@@ -58,8 +58,14 @@ export const isReference = (t: SemanticType): t is UnionType => kindOf(t) === "r
 
 export const integer = (min: number, max: number): IntegerType => ({kind: SemanticTypeKinds.Integer, min, max})
 
-export const signedInteger = (bits: number): IntegerType => integer(-1 << (bits - 1), (1 << (bits - 1)) - 1)
-export const unsignedInteger = (bits: number): IntegerType => integer(0, (1 << bits) - 1)
+// `2 ** n`, not `1 << n`: JS's `<<` operates on signed 32-bit ints (shift
+// amount mod 32, result sign-interpreted), which silently breaks exactly
+// at bits=32 — `1 << 32 === 1` (shift-by-32 wraps to shift-by-0), and
+// `1 << 31` is already negative — giving `i32`/`u32` nonsense ranges
+// (`u32` collapsed to `integer(0, 0)`). `2 ** n` is ordinary double
+// arithmetic, correct for every width this is ever called with.
+export const signedInteger = (bits: number): IntegerType => integer(-(2 ** (bits - 1)), 2 ** (bits - 1) - 1)
+export const unsignedInteger = (bits: number): IntegerType => integer(0, 2 ** bits - 1)
 
 export const i8 = signedInteger(8)
 export const i16 = signedInteger(16)

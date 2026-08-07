@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@ppl/core": "*",
+    "@ppl/machine": "*",
     "@ppl/codecs": "*",
     "@ppl/target-cpp": "*",
     "@ppl/target-js": "*"

@@ -4,10 +4,14 @@
 > the codec extension's opcodes, calling convention, and encoding rules the
 > way isa-core.md specifies the generic core, and plugs into the core purely
 > through the mechanism isa-core.md §11 defines (opcode range ≥128, effect
-> declarations, literal-only operands). For the design history and rationale
-> behind the choices below, see
-> [codec-extension-draft.md](./codec-extension-draft.md) — the original
-> design log this document supersedes as the normative reference.
+> declarations, literal-only operands). Unlike isa-core.md, it carries its
+> own rationale inline, section by section, rather than deferring to a
+> companion doc — there is no ir-engine.md-style pairing for this document.
+> An earlier recovered draft briefly served that role
+> (`codec-extension-draft.md`, since retired); its one piece of rationale
+> that didn't end up redundant with this document — why abnormal
+> termination is a generic-core concern, not a codec-specific one — moved to
+> [ir-engine.md](./ir-engine.md), its proper home by topic.
 >
 > Nothing below exists as code yet. `packages/machine/src/extension.ts`'s
 > `Extension` interface is the shape an implementation registers against;
@@ -129,11 +133,16 @@ recovers TOS depth, never by consulting extra per-instruction data. There
 is therefore no `type_ref` operand anywhere in this instruction set, and no
 per-procedure "referenced-types list" it would index into.
 
-A procedure header may still need to *declare* which metamodel types it
-touches for reasons that have nothing to do with instruction decoding —
-e.g. serializing codec-referenced semantic types, ROADMAP.md item 8's
-still-undesigned header-encoding half — but that is header metadata a wire
-format might need, not something any opcode's operands select from.
+A procedure header still needs exactly *one* piece of type metadata that
+has nothing to do with instruction decoding: the entry procedure's own
+object type, the root the walk above starts from. That is the only type a
+wire image needs to name explicitly — every other handle's type is
+derived, never declared, by the same structural walk a translator already
+performs for TOS depth. There is no per-procedure "referenced-types list"
+alongside it; ROADMAP.md item 8 sketches where that single root-type
+reference and the semantic type tree it points into actually live —
+an image-level concern above this procedure header, not per-procedure
+metadata.
 
 ---
 
@@ -356,17 +365,49 @@ isa-core.md §6); the `call` field is what folds the callee into the same
 
 ## 7. Static Validation — Open Design
 
-Not yet designed (ROADMAP.md item 7), deliberately left open until there's
-a real extension to design it against:
+Not yet implemented (ROADMAP.md item 7). Both questions below now have a
+concrete mechanism rather than just being open — documented here, not in
+isa-core.md, since both ride on codec-extension concepts (handle
+provenance, named resources) the generic core has no notion of.
 
-- Whether the validator should let an extension delegate custom,
-  non-peak-shaped invariants into the same walk it already does for §8 (e.g.
-  "a handle must be entered before it's read").
-- Whether per-extension resource-peak statistics (e.g. maximum concurrent
-  stream-iterator or object-handle counts) should generalize the existing
-  stack-depth machinery (isa-core.md §8.3) to track named resources beyond
-  the real TOS, getting the same per-procedure/tight-cross-call-site
-  treatment for free.
+### 7.1 Handle type and bounds checking
+
+§2.4 establishes that every handle's type is statically derivable from its
+provenance. That means the validator can reconstruct it too, for free,
+during the same call-graph DFS `validate.ts` already runs for isa-core.md
+§8.2/§8.3 — threading "current handle's type" through the walk alongside
+the existing TOS-depth accumulator. Two checks fall out:
+
+- **Local bounds/kind check** — at every `ENTER`/`CALL_CODEC`/
+  `CALL_CODEC_NEXT`, `src`'s type kind (struct/union/list) must support the
+  op per §2.2's disambiguation table, and `ref` must be in range for that
+  type's field/variant table. This is the concrete answer to "a handle
+  must be entered before it's read," and its sharper sibling: entered
+  against the right kind, at an index that exists.
+- **Cross-procedure consistency** — at every `CALL_CODEC`/
+  `CALL_CODEC_NEXT`, the callee's own declared object type (its `o0` type,
+  fixed at the callee's build time, pinned the same way as any other
+  handle's — §2.4) must equal `child(src, ref)`'s statically-derived type.
+  This is the check that actually earns its keep: a struct field typed
+  `Foo` delegating to a codec built for `Bar` is a silent-corruption bug,
+  not a decode-time error, and nothing about §8.2's acyclicity or §8.3's
+  depth bound would ever catch it.
+
+Neither check needs new validator machinery beyond a semantic type tree to
+walk against — see ROADMAP.md item 8 for where that tree lives at the wire
+level.
+
+### 7.2 Resource-peak statistics
+
+Per-resource peaks (maximum concurrent stream iterators, maximum
+concurrent object handles) generalize a mechanism isa-core.md §8.3 now
+provides in its own right: maximum call depth, the control-stack sizing
+figure isa-core.md §8.3 computes alongside — and distinctly from — its
+operand-stack depth bound (see isa-core.md §8.3 for why the two diverge).
+Iterator/handle-count peaks are the extension-specific instances of that
+same generic pattern, not a parallel mechanism: same bottom-up DFS, one
+more named resource tracked alongside call depth and TOS depth, with the
+same per-procedure/tight-cross-call-site treatment falling out for free.
 
 ---
 

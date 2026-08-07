@@ -114,19 +114,107 @@ Depends on (6). The actual codec stream-I/O and codec-invocation opcodes,
 likely implemented as an `Extension` (§11) inside `@ppl/codecs` — codec
 semantics have no business living inside `@ppl/machine`, which stays
 generic and protocol-agnostic by design (5). Specified in
-`docs/codec-extension.md` (design spec, not yet implemented; supersedes
-`docs/codec-extension-draft.md` as the normative reference — that file is
-now rationale-only, ir-engine.md's role relative to isa-core.md).
+`docs/codec-extension.md`. It carries its own rationale inline rather than
+deferring to a companion doc; `docs/codec-extension-draft.md`, the
+recovered early draft that briefly served that role, has been retired now
+that its one non-redundant piece of content (the "abnormal termination
+belongs to the generic core, not codec semantics" rationale) moved to
+ir-engine.md, its proper home by topic — the rest of the draft's content
+had been superseded by codec-extension.md without remainder.
 
-Also worth designing once there's a real extension to design it against,
-deferred from (6) for exactly that reason (`codec-extension.md` §7):
-whether the validator should let an extension delegate custom,
-non-peak-shaped invariants (e.g. a handle must be entered before it's read)
-into the same walk it already does, and whether per-extension resource-peak
-statistics (e.g. maximum concurrent stream/object-handle counts) should
-generalize the existing stack-depth (§8.3) machinery to track named
-resources beyond the real TOS, getting the same per-procedure/tight-cross-
-call-site treatment for free.
+**Partially implemented.** Two prerequisite gaps in `@ppl/machine` itself,
+needed by any extension with multi-operand or call-shaped opcodes, not
+codec-specific: `matcher.ts`'s builtin-call pattern generalized from
+exactly one argument to N positional arguments plus an optional variadic
+real-calling-convention tail (`pBuiltinCallN`); `ExecState.callProc`
+(extension.ts) lets a call-shaped extension op actually invoke its
+resolved callee — `vm.ts`'s `EXT` case had no such capability before.
+Also fixed: `ExtOpEffect.call` carried a static per-opcode-name `argCount`,
+which couldn't describe call sites invoking callees of different arity;
+`validate.ts` now derives it from the resolved callee's own `argCount`
+header instead, matching §6.3's "argCount from the invoked codec's header"
+(this was always the documented intent, just not what the code did).
+
+`packages/codecs/src/codec-extension.ts` now implements 10 of §3's
+opcodes — everything except the stream-fork class (`HAS_NEXT`/
+`CLONE_RD`/`CLONE_WR`/`SEEK`, still open; nothing built so far needs more
+than one straight-through `i0`) — plus `codecRules()`, that same opcode
+set's `rules()` DSL surface (`Extension["rules"]`, extension.ts:107), so
+codec bodies are authored as real `ir\`...\`` text instead of hand-built
+`RtlInstr[]` arrays. That surface only became viable once `@ppl/machine`
+gained two-phase `Procedure` construction (`declareProc`/`defineProc`,
+ir.ts) — minting a `Procedure`'s identity before its fragment exists, so a
+self- or mutually-recursive reference can be spliced into `ir\`...\`` text
+before the thing it refers to is fully built — and a `leafRules` fix
+(rules.ts) making the generic `identifier:acc`/`identifier:tos` tiling
+rules decline gracefully instead of throwing when a bare identifier isn't
+a local at all (reachable via any call-shaped node's unconstrained
+argument-tiling, matcher.ts:283-300, not just a codec callee reference).
+
+`packages/codecs/src/builders.ts`'s `buildCodec(root, direction, extraRules?)`
+is the metamodel-to-bytecode generation layer §5 always assumed would
+exist — and, per review, genuinely *rule-driven* now rather than a closed
+per-kind switch: an ordered `CodecRule<Direction>[]` (`./rules.ts`, pattern
++ producer, reusing `@ppl/core`'s `TypePattern`/`matchType` vocabulary), a
+caller's own rules tried before the defaults so they can preempt any
+default for a specific type shape with no change to `builders.ts` itself.
+Resolution — on-demand, memoized, cycle-safe — is one small generic driver
+(`createCodecResolver`) both `buildCodec` and `json.ts` are built on, not
+two independently hand-rolled ones; `runRuleset` (`@ppl/core/projection.ts`)
+was considered and passed over for this, since it fills its result map in
+one eager top-down pass with no way to hand a not-yet-finished child a
+reserved slot before a sibling embeds it into its own instruction stream —
+a materially different execution model from what codec generation needs,
+not a superset `runRuleset` could be stretched to cover. One real generic
+optimization lives in the default struct rule — a union-typed field with
+few enough variants gets its tag *hoisted* into a shared leading bitmap
+instead of paying for a standalone tag byte.
+
+Two further codecs sit alongside the defaults, both real `CodecRule`s now
+rather than one-off top-level functions: `delta-leb128.ts` (§8.6's
+delta+LEB128 `List<Integer>` encoder, plus its decode mirror) composes as
+an `extraRules` entry — it can preempt the generic list rule for one
+specific field nested inside a larger struct, not just a standalone root —
+and `json.ts` (an encoder-only pretty-printed JSON serializer, proving
+direction is genuinely optional — nothing pairs it with a decoder) is
+regularized onto the same `createCodecResolver`, just with nesting depth
+as its context instead of `Direction`. A dedicated test
+(`iso8601-demo.test.ts`) demonstrates the rule mechanism can override
+representation entirely, not just add a leaf kind: a `Timestamp`-shaped
+struct field inside an otherwise length-prefixed/hoisted-tag binary wire
+format comes out as an embedded ASCII string instead of two raw integers.
+
+All of it proven against `packages/example`'s pre-existing,
+independently-authored `TelemetryPacket` schema (nested struct, a
+capacity-16 list of structs, a 3-variant all-unit union the hoisting
+optimization picks up automatically), not just hand-picked demo types —
+see `packages/example/test/codec.test.ts` and its rewritten `compose.ts`,
+which generates real codecs where the retired `wire-format.ts` placeholder
+used to sit.
+
+One deliberate, discovered-not-designed limit: a genuinely self-referential
+`TypeNode` graph resolves fine at generation time (the two-phase
+`Procedure` split handles it), but `validateProgram` correctly rejects the
+resulting recursive call graph (isa-core.md §8.2's static, bounded-stack-
+depth guarantee) — a codec for a truly recursive type was never
+expressible under this ISA, hand-built or DSL-authored; `codec-extension.md`
+§5's "dispatch calls... can resolve to the same codec again for a
+recursive type" describes a different, not-yet-built indirect-call
+mechanism, not what `call_codec`'s literal-operand calls (§3.3) do today.
+
+Still open: the wire-level `codec` byte encoding (§6); §7.1/§7.2's
+validator extensions, below; and, within the builder itself, anything
+beyond a basic hoisting heuristic (≤4-variant unions, one shared bitmap,
+no cross-optimization with e.g. presence-bitmap-style optionality, §8.5).
+
+The validator-extension question deferred from (6) for exactly this reason
+now has a concrete shape (`codec-extension.md` §7.1–§7.2, still not
+implemented): reconstructing a handle's type during the same call-graph
+DFS `validate.ts` already runs, to check `ENTER`/`CALL_CODEC` accesses
+against the right type kind and in-bounds refs, plus cross-procedure type
+consistency at delegation sites; and generalizing isa-core.md §8.3's new
+call-depth figure to other named resources (stream-iterator/object-handle
+peaks).
 
 ## 8. Remaining wire framing and codec-referenced-type serdes
 
@@ -139,7 +227,12 @@ below don't actually share a prerequisite:
   program-level framing (a procedure count? a table of offsets? decode-by-
   structural-bracket-matching, the way the VM itself finds a procedure's
   end?). Not blocked on anything above; ready to design now that (1)–(2)
-  give it a real multi-procedure program to frame.
+  give it a real multi-procedure program to frame. Procedure bodies are
+  already self-framing (structured control flow means bracket-matching
+  finds a body's end with no length prefix needed), so this envelope is
+  plausibly just a count plus concatenated bodies — it stays
+  `@ppl/machine`-generic scope regardless of how the second bullet below
+  resolves, since it has no notion of semantic types.
 - **Procedure header encoding, and codec-referenced semantic types.**
   §2.3's procedure header is `{arg_count, ...extension fields}`; encoding
   those extension fields needs a concrete extension's header shape to
@@ -148,6 +241,31 @@ below don't actually share a prerequisite:
   procedure headers will also need to reference semantic types from the
   metamodel (`metamodel.ts`/`type-graph.ts`) — those need their own
   serialization format, not yet designed either.
+
+  Current sketch (not a design yet, just a shape to refine): a **codec
+  image** — the actual application-facing artifact, living above
+  `@ppl/machine`'s bare procedure-list envelope and probably above
+  `@ppl/codecs` too, since neither layer currently owns "one shared type
+  tree plus two directional programs built against it" — with three
+  sections:
+  - the **semantic type tree**: a single type definition (the root type)
+    plus everything it transitively references, walked both by the
+    validator (codec-extension.md §7.1) and by any target-mapping/codegen
+    step that needs a handle's real shape to emit or validate accessor
+    code against it;
+  - an **encoder program** section and a **decoder program** section, each
+    independently a complete multi-procedure program per the bullet above
+    (own stats, own procedure list, procedure 0 = the entry codec for the
+    root type) — never one call graph between them, since
+    codec-extension.md §2.3's directionality rule forbids an encoder and a
+    decoder from ever sharing one.
+
+  Open sub-question this sketch doesn't resolve: `GENERIC`-ABI helpers
+  (codec-extension.md §4.1's `leb128_encode`) are direction-agnostic by
+  construction. If both directional programs need one, does each carry its
+  own copy (simplest — every program section stays fully self-contained),
+  or is there a third, shared `GENERIC`-only procedure pool between them?
+  Not decided.
 
 ## 9. Core shakedown
 
@@ -163,10 +281,55 @@ to shake out issues against, not before.
 
 ## 10. Real target codegens
 
-Depends on everything above. `packages/target-cpp` and `packages/target-js`
-currently contain rushed example stubs, not production codegen — redo
-them once the platform underneath them (procedures, validation,
-extensions, codecs) is actually stable.
+Depends on everything above for the codec-specific pieces — `packages/
+target-cpp` and `packages/target-js` currently contain rushed example
+stubs, not production codegen, and redoing those for real needs (7)-(9)
+stable underneath them. The generic reconstruction layer both targets sit
+on doesn't share that dependency, though, so it's sketched ahead of the
+rest below, same pattern as (5)/(6).
+
+**Sketched, not yet verified** (`packages/machine/src/raise.ts`) —
+`raiseProgram`/`raiseProc`, the structural inverse of `lower.ts`: turns a
+flat `RtlProc.body` back into a nested `Stmt`/`Expr` tree (`dispatch`/
+`loop`/`assign`/`return`/`trap` statements; `const`/`slot`/`binary`/
+`unary`/`call`/`ext` expressions) that `target-cpp` and `target-js` can
+both walk instead of each independently re-deriving block structure from
+the flat instruction stream. Lives in `@ppl/machine`, not either target
+package, because none of it is target-language-specific — it only
+consumes fields `RtlInstr` already exposes generically (`op`/`combo`/
+`target`/`imm`/`calleeIndex`), so reconstructing the tree once here means
+a bug found fixing it doesn't need independently rediscovering in the
+other target. What's left to each target individually is purely
+rendering (operator/declaration syntax, integer signedness/wraparound,
+procedure signatures/ABI) plus the buffer/extension glue neither target
+shares with the other anyway. The reconstruction is total over any
+validated program for the same reason `lower.ts`'s own output is
+well-formed to begin with — the ISA's no-`goto` invariant (ir-engine.md)
+means every `BR_TABLE`/`LOOP` shape maps back to exactly one `dispatch`/
+`loop` shape, never an ambiguous one.
+
+The one substantive design decision: every stack write (`PUSH`, or the
+write side of a register combo) is materialized into a named slot
+immediately, never forwarded/inlined at its eventual use site — a
+deferred textual substitution is only sound if nothing between the write
+and its use mutates a slot the deferred expression reads, and proving
+that generically is a real interference analysis this module doesn't
+attempt. Materializing every write uniformly is trivially correct (it's
+the array-of-slots machine's own snapshot semantics, just named instead
+of indexed) and costs nothing a target compiler's own copy propagation
+won't fold back away wherever it's actually safe to.
+
+Two gaps, not yet resolved:
+- `EXT` can only be raised approximately, from a generic `ExtOpEffect`:
+  it declares a net `tosDelta`, not an input/output arity split, so an op
+  with multiple discrete inputs *and* outputs at once can't be
+  decomposed correctly — only the common one-value-in-or-out shapes raise
+  exactly right. Doing better needs a richer per-op contract than
+  `extension.ts` currently declares.
+- Unverified against real fixtures — written and reasoned through by
+  hand against `rtl.ts`/`vm.ts`'s own semantics, not yet run against
+  `packages/machine/test`'s existing lowering fixtures or exercised by
+  any actual `target-cpp`/`target-js` consumer.
 
 ---
 

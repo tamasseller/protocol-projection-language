@@ -160,6 +160,18 @@ function runProc(program: RtlProgram, proc: RtlProc, args: readonly number[], ex
         pop(): number {assert.ok(tos > 0, `EXT: pop with empty stack`); return regs[--tos] ?? 0},
         reg(index: number): number {return regs[index] ?? 0},
         setReg(index: number, value: number) {regs[index] = value >>> 0},
+        // Mirrors the "CALL" case below exactly — resolve by table index,
+        // run to completion in a fresh nested frame, fold its step count
+        // into this call's own so MAX_STEPS still bounds total work
+        // through a call-shaped extension op.
+        callProc(calleeIndex: number, callArgs: readonly number[]): number
+        {
+            const callee = program.procedures[calleeIndex]
+            if(!callee) throw new Error(`EXT callProc: no such procedure ${calleeIndex}`)
+            const result = runProc(program, callee, callArgs, extension)
+            steps += result.steps
+            return result.acc
+        },
     }
 
     function operand(i: RtlInstr): number

@@ -6,5 +6,5 @@
  * over this project's schema via compose.ts, produces correct output.
  */
 import "./c-target.test"
-import "./wire-format.test"
+import "./codec.test"
 import "./ts-target.test"

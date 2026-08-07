@@ -170,15 +170,22 @@ function walkProcedure(
 
                 if(effect.call)
                 {
-                    const { calleeOperandIndex, argCount } = effect.call
+                    const { calleeOperandIndex } = effect.call
                     const calleeIndex = instr.operands[calleeOperandIndex]
                     if(calleeIndex === undefined)
                         fail(pc, `EXT ${instr.ext}: call effect references operand ${calleeOperandIndex}, but only ${instr.operands.length} present`)
-                    if(!program.procedures[calleeIndex]) fail(pc, `EXT ${instr.ext}: no such procedure ${calleeIndex}`)
-                    const stackArgs = stackArgsOf(argCount)
+                    const callee = program.procedures[calleeIndex]
+                    if(!callee) fail(pc, `EXT ${instr.ext}: no such procedure ${calleeIndex}`)
+                    // The resolved callee's own argCount header decides the
+                    // pop count — never a static per-opcode number — since
+                    // different call sites of the same call-shaped op can
+                    // target callees of different arity (mirrors the plain
+                    // CALL case below exactly).
+                    const stackArgs = stackArgsOf(callee.argCount)
                     if(tos - stackArgs < entryTos)
                         fail(pc, `EXT ${instr.ext}: only ${tos - entryTos} value(s) pushed, needs ${stackArgs}`)
                     callSites.push({ calleeIndex, tos })
+                    tos -= stackArgs
                 }
 
                 tos += effect.tosDelta

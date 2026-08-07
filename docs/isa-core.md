@@ -488,6 +488,23 @@ unrelated local peak reached elsewhere in its body. A program whose bound
 exceeds a target's resources is rejected by the backend (the ISA imposes no
 numeric limit itself).
 
+A second figure falls out of the same bottom-up DFS: **maximum call
+depth** — the largest number of simultaneously active frames on any path,
+computed the same way (each call site's depth is 1 + the callee's own
+worst-case depth; the whole-program figure is the max over the acyclic
+call graph). This is a different quantity from the stack-depth bound
+above: a long, shallow call chain (many frames, each pushing little) has a
+small TOS bound but a large call-depth figure, and a short chain with one
+operand-heavy frame is the reverse. The stack-depth bound sizes a
+backend's *operand* storage; call depth sizes whatever a backend uses to
+remember "resume here" across a call — irrelevant to one that implements
+`CALL`/`RETURN` via native recursion (the host call stack does that job
+for free), but load-bearing for one that threads procedure invocation
+through an explicit, non-recursive loop instead, where an array of return
+records has to be sized up front. Both figures are validator return values
+computed once per validation run; neither is written into the wire-format
+program image.
+
 ### 8.4 Dead-code rejection
 
 Any instruction unreachable on every control-flow path is a validation

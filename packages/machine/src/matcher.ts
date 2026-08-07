@@ -75,22 +75,33 @@ export interface AssignPattern<V extends EastPattern = EastPattern>
 export interface CallPattern { kind: "Call" }
 
 /**
- * Builtin-call pattern: `name(arg)` — the DSL's function-call-like syntax
- * for a fixed-lowering built-in (isa-core.md §10.5, e.g. `clz(x)`,
- * `revbits(x)`, `trap(code)`), distinct from `CallPattern`'s
- * real-procedure-call shape. There's exactly one argument, matched by
- * position against a sub-pattern (like `UnaryPattern`'s `argument`) rather
- * than always tiled to a fixed tag the way `CallPattern`'s arguments
- * always go to `"tos"` — `clz`/`revbits` want `pRtl("acc")` (tile the
- * argument, demand it land in `acc`), while `trap` wants `pLiteral()` (the
- * argument must itself be a compile-time literal, since it's encoded
- * directly into `TRAP #code`'s immediate, not computed at runtime).
+ * Builtin-call pattern: `name(arg0, arg1, ...)` — the DSL's function-call-
+ * like syntax for a fixed-lowering built-in (isa-core.md §10.5, e.g.
+ * `clz(x)`, `revbits(x)`, `trap(code)`), distinct from `CallPattern`'s
+ * real-procedure-call shape. `arguments` matches each position against its
+ * own sub-pattern (like `UnaryPattern`'s `argument`) rather than always
+ * tiled to a fixed tag the way `CallPattern`'s arguments always go to
+ * `"tos"` — `clz`/`revbits` want `pRtl("acc")` (tile the argument, demand it
+ * land in `acc`), `trap` wants `pLiteral()` (the argument must itself be a
+ * compile-time literal, since it's encoded directly into `TRAP #code`'s
+ * immediate, not computed at runtime).
+ *
+ * `variadicTail`, when set, lets a builtin take a fixed literal-operand
+ * prefix (the positional `arguments` above) plus a variable number of real
+ * runtime-value arguments after it — an extension's call-shaped op (e.g.
+ * the codec extension's `CALL_CODEC`, docs/codec-extension.md §3.3, §4)
+ * needs exactly this shape: literal operands selecting *what* to call,
+ * followed by the ordinary value arguments being passed to it. The tail is
+ * tiled exactly like `CallPattern`'s own arguments (all but the last to
+ * `"tos"`, the last to `"acc"`) rather than against a sub-pattern of its
+ * own, since there's no fixed count of them to have individual patterns for.
  */
-export interface BuiltinCallPattern<A extends EastPattern = EastPattern>
+export interface BuiltinCallPattern<A extends readonly EastPattern[] = readonly EastPattern[]>
 {
     kind: "BuiltinCall"
     name: string
-    argument: A
+    arguments: A
+    variadicTail?: boolean
 }
 
 // 2. Match interfaces
@@ -132,10 +143,14 @@ export interface CallMatch
     argNodes: RtlNode[]
 }
 
-export interface BuiltinCallMatch<AM extends EastMatch = EastMatch>
+export interface BuiltinCallMatch<AM extends readonly EastMatch[] = readonly EastMatch[]>
 {
     kind: "BuiltinCall"
-    argumentMatch: AM
+    argumentMatches: AM
+    /** Present (possibly empty) exactly when the pattern set `variadicTail`
+     *  — one already-tiled `RtlNode` per trailing runtime argument, in the
+     *  same last-arg-in-acc/rest-in-tos shape `CallMatch.argNodes` uses. */
+    tailNodes?: readonly RtlNode[]
 }
 
 // 3. Union types
@@ -174,8 +189,15 @@ export type MatchOf<P extends EastPattern> =
       ? AssignMatch<MatchOf<V>>
   : P extends CallPattern          ? CallMatch
   : P extends BuiltinCallPattern<infer A>
-      ? BuiltinCallMatch<MatchOf<A>>
+      ? BuiltinCallMatch<MatchOfTuple<A>>
   : never
+
+/** Maps each pattern in a fixed-length tuple to its `MatchOf`, preserving
+ *  tuple position — what lets e.g. `pBuiltinCall(name, pLiteral())`'s match
+ *  type `argumentMatches[0]` narrow to a `LiteralMatch` directly, the same
+ *  way a single `argument: A` field used to. */
+type MatchOfTuple<T extends readonly EastPattern[]> =
+    { readonly [K in keyof T]: T[K] extends EastPattern ? MatchOf<T[K]> : never }
 
 // 5. matchAllEast — single dispatcher, inlines all per-kind matching
 //
@@ -281,9 +303,39 @@ export function matchAllEast<P extends EastPattern>(
         {
             if (!isEastCall(N)) return []
             if (N.callee.type !== "Identifier" || N.callee.name !== P.name) return []
-            if (N.arguments.length !== 1) return []
-            return matchAllEast(N.arguments[0]!, P.argument, tile)
-                .map(argumentMatch => ({ kind: "BuiltinCall", argumentMatch } as MatchOf<P>))
+            const fixedCount = P.arguments.length
+            if (P.variadicTail ? N.arguments.length < fixedCount : N.arguments.length !== fixedCount)
+                return []
+
+            // Fixed positional prefix, matched by sub-pattern (cross product
+            // across positions) — mirrors "Binary"'s left/right combination.
+            const perFixed = P.arguments.map((pat, i) => matchAllEast(N.arguments[i]!, pat, tile))
+            if (perFixed.some(cands => cands.length === 0)) return []
+            let fixedCombos: EastMatch[][] = [[]]
+            for (const cands of perFixed)
+                fixedCombos = fixedCombos.flatMap(prefix => cands.map(c => [...prefix, c]))
+
+            if (!P.variadicTail)
+                return fixedCombos.map(argumentMatches =>
+                    ({ kind: "BuiltinCall", argumentMatches } as unknown as MatchOf<P>))
+
+            // Variadic tail: remaining arguments tile exactly like a real
+            // call's own calling convention ("Call", above) — all but the
+            // last to "tos", the last to "acc".
+            const tailArgs = N.arguments.slice(fixedCount)
+            const lastTail = tailArgs.length - 1
+            const perTail = tailArgs.map((arg, i) =>
+                tile(arg).filter(c => outputHas(c.output, i === lastTail ? "acc" : "tos")))
+            if (perTail.some(cands => cands.length === 0)) return []
+            let tailCombos: RtlNode[][] = [[]]
+            for (const cands of perTail)
+                tailCombos = tailCombos.flatMap(prefix => cands.map(c => [...prefix, c]))
+
+            const out: MatchOf<P>[] = []
+            for (const argumentMatches of fixedCombos)
+                for (const tailNodes of tailCombos)
+                    out.push({ kind: "BuiltinCall", argumentMatches, tailNodes } as unknown as MatchOf<P>)
+            return out
         }
     }
 }
@@ -317,5 +369,17 @@ export const pAssign = <V extends EastPattern>(
 
 export const pCall = (): CallPattern => ({ kind: "Call" })
 
-export const pBuiltinCall = <A extends EastPattern>(name: string, argument: A): BuiltinCallPattern<A> =>
-    ({ kind: "BuiltinCall", name, argument })
+/** The 1-ary case — `clz(x)`/`revbits(x)`/`trap(code)`'s own shape. */
+export const pBuiltinCall = <A extends EastPattern>(name: string, argument: A): BuiltinCallPattern<readonly [A]> =>
+    ({ kind: "BuiltinCall", name, arguments: [argument] })
+
+/** The general N-ary case, with an optional variadic runtime-value tail —
+ *  what a call-shaped extension op (e.g. `CALL_CODEC`) needs: a fixed
+ *  literal-operand prefix, matched positionally, plus zero or more real
+ *  arguments tiled by the ordinary calling convention. */
+export const pBuiltinCallN = <A extends readonly EastPattern[]>(
+    name: string,
+    args: A,
+    opts?: { variadicTail?: boolean },
+): BuiltinCallPattern<A> =>
+    ({ kind: "BuiltinCall", name, arguments: args, variadicTail: opts?.variadicTail })

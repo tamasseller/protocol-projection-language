@@ -68,7 +68,7 @@ export interface Procedure
     /** Parameter names, in order — become `r0..r(argCount-1)` in the
      *  callee's frame (isa-core.md §2.5). */
     readonly args: readonly string[]
-    readonly fragment: IrFragment
+    fragment: IrFragment
     /** Extension-owned header data (isa-core.md §2.3's extension fields —
      *  e.g. the codec extension's ABI-kind selector), carried through
      *  `lowerProgram` into the resulting `RtlProc.header` untouched. Opaque
@@ -83,6 +83,35 @@ let procCounter = 0
 export function proc(args: readonly string[], fragment: IrFragment, header?: unknown): Procedure
 {
     return { type: "Procedure", id: Symbol(), name: `__proc${procCounter++}`, args, fragment, header }
+}
+
+const UNDEFINED_FRAGMENT: IrFragment = undefined as unknown as IrFragment
+
+/**
+ * Two-phase construction: mint a `Procedure`'s identity (`id`/`name`) without
+ * its `fragment` yet. Needed for a self- or mutually-recursive reference —
+ * `ir\`...\`` splices an interpolated `Procedure`'s `.name` into source text
+ * immediately (so it can be parsed *now*), but a cyclic pair A/B can't each
+ * have a fully-parsed `fragment` before the other's `name` exists to
+ * interpolate. `declareProc` breaks the cycle: mint both identities first,
+ * build each fragment (referencing the other's already-minted name), then
+ * {@link defineProc} each once. `proc()` remains the right choice for every
+ * non-recursive fragment — the common case — where the eager one-call form
+ * is simpler.
+ */
+export function declareProc(args: readonly string[], header?: unknown): Procedure
+{
+    return { type: "Procedure", id: Symbol(), name: `__proc${procCounter++}`, args, fragment: UNDEFINED_FRAGMENT, header }
+}
+
+/** Attach the parsed fragment to a `Procedure` minted via {@link declareProc}.
+ *  Exactly once — a second call (or a call on a `proc()`-built, already-
+ *  complete `Procedure`) is a bug in the caller, not a case to accommodate. */
+export function defineProc(target: Procedure, fragment: IrFragment): void
+{
+    if(target.fragment !== UNDEFINED_FRAGMENT)
+        throw new Error(`defineProc: "${target.name}" already has a fragment`)
+    target.fragment = fragment
 }
 
 const isProcedure = (v: unknown): v is Procedure =>

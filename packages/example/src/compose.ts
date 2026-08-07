@@ -8,9 +8,9 @@
  *   ┌─────────────┐   cTypeRules    (@ppl/target-cpp)    ┌──────────────┐
  *   │  schema.ts  │ ──────────────────────────────────▶ │  C header    │
  *   │ (semantic)  │                                      │  (embedded)  │
- *   │             │   wireFormatRules (@ppl/codecs)      ├──────────────┤
- *   │             │ ──────────────────────────────────▶ │  wire shapes │
- *   │             │                                      ├──────────────┤
+ *   │             │   buildCodec      (@ppl/codecs)      ├──────────────┤
+ *   │             │ ──────────────────────────────────▶ │  encode/     │
+ *   │             │                                      │  decode      │
  *   │             │   tsTypeRules    (@ppl/target-js)    │  TS decls    │
  *   │             │ ──────────────────────────────────▶ │  (desktop)   │
  *   └─────────────┘                                      └──────────────┘
@@ -26,7 +26,8 @@
  */
 import {buildTypeGraph, extractTraits, TypeGraph, TraitRegistry} from "@ppl/core"
 import {projectCTypes, emitCHeader, CTypeDecl} from "@ppl/target-cpp"
-import {projectWireFormat, WireShape} from "@ppl/codecs"
+import {buildCodec, buildJsonEncoder, createCodecExtension, Handle} from "@ppl/codecs"
+import {validateProgram, run, RtlProgram} from "@ppl/machine"
 import {projectTSTypes, emitTSDeclarations, TSTypeDecl} from "@ppl/target-js"
 
 import {TelemetryPacket} from "./schema"
@@ -49,8 +50,70 @@ export const traits: TraitRegistry = extractTraits(graph)
 export const cTypes: Map<number, CTypeDecl> = projectCTypes(graph, traits)
 export const cHeader: string = emitCHeader(cTypes)
 
-/** Binary wire-format shapes projected from the schema. */
-export const wireShapes: Map<number, WireShape> = projectWireFormat(graph)
+/**
+ * Real binary codecs generated from the schema — one program per
+ * direction (docs/codec-extension.md §2.3: direction is a property of
+ * the whole program, so an encoder and a decoder are two programs, never
+ * one bidirectional call graph), sharing nothing but `graph.root`.
+ */
+export const encodeProgram: RtlProgram = buildCodec(graph.root, "encode")
+export const decodeProgram: RtlProgram = buildCodec(graph.root, "decode")
+
+function runCodec(program: RtlProgram, ext: ReturnType<typeof createCodecExtension>): void
+{
+    validateProgram(program, ext)
+    const result = run(program, ext)
+    if(!result.ok) throw new Error(`codec run failed — trap code ${result.trapCode}`)
+}
+
+export function encodeTelemetryPacket(value: unknown): number[]
+{
+    const buffer: number[] = []
+    const root: Handle = {container: {root: value}, key: "root", type: graph.root}
+    runCodec(encodeProgram, createCodecExtension("encode", root, buffer))
+    return buffer
+}
+
+export function decodeTelemetryPacket(buffer: readonly number[]): unknown
+{
+    const wrapper: Record<string, unknown> = {root: {}} // pre-seed — the root type is a struct
+    const root: Handle = {container: wrapper, key: "root", type: graph.root}
+    runCodec(decodeProgram, createCodecExtension("decode", root, [...buffer]))
+    return wrapper.root
+}
+
+/** A representative packet, round-tripped through the generated codecs —
+ *  the same schema exercising nested struct (`timestamp`), a capacity-16
+ *  list of structs (`readings`), and a 3-variant all-unit union
+ *  (`SensorKind`) at once, none of it authored with this integration in
+ *  mind (schema.ts predates the codec extension entirely). */
+export const sampleTelemetryPacket = {
+    deviceId: 42,
+    timestamp: {secs: 1_700_000_000, nanos: 123_456_789},
+    readings: [
+        {sensor: {variant: "temperature", value: undefined}, value: 235, unit: 1},
+        {sensor: {variant: "humidity", value: undefined}, value: 55, unit: 2},
+    ],
+    status: 0,
+}
+
+export const encodedSample: number[] = encodeTelemetryPacket(sampleTelemetryPacket)
+export const decodedSample: unknown = decodeTelemetryPacket(encodedSample)
+
+/** Pretty-printed JSON of the same schema, from the same `graph.root` —
+ *  encoder-only (json.ts's own file header), demonstrating the codec
+ *  model isn't binary-only any more than it's bidirectional-only. */
+export const jsonProgram: RtlProgram = buildJsonEncoder(graph.root)
+
+export function toJson(value: unknown): string
+{
+    const buffer: number[] = []
+    const root: Handle = {container: {root: value}, key: "root", type: graph.root}
+    runCodec(jsonProgram, createCodecExtension("encode", root, buffer))
+    return Buffer.from(buffer).toString("ascii")
+}
+
+export const jsonSample: string = toJson(sampleTelemetryPacket)
 
 /** TypeScript declarations (desktop/server) projected from the schema. */
 export const tsTypes: Map<number, TSTypeDecl> = projectTSTypes(graph, traits)

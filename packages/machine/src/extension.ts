@@ -41,25 +41,42 @@ export interface ExtOpEffect
      *  DSL-level terminating call-shaped extension op is future work, not
      *  needed by this hook itself. */
     terminates?: boolean
-    /** Set when this op is call-shaped (like the codec draft's fused
-     *  `CALL_CODEC`) — which `operands` index carries the resolved callee's
-     *  procedure-table index, and the callee's total logical `argCount`.
-     *  Lets validate.ts's §8.2/§8.3 call-graph walk fold it into the same
+    /** Set when this op is call-shaped (like the codec extension's fused
+     *  `CALL_CODEC`, docs/codec-extension.md §3.3) — which `operands` index
+     *  carries the resolved callee's procedure-table index. Lets
+     *  validate.ts's §8.2/§8.3 call-graph walk fold it into the same
      *  `callSites` bookkeeping as a plain `CALL`, without knowing the op's
-     *  name — including `CALL`'s own last-arg-in-`acc` convention (rtl.ts's
-     *  `call` doc comment): only `argCount - 1` values (0 for `argCount`
-     *  0 or 1) are expected to actually be on the stack. This is a
-     *  validator-only concern — the VM's own execution of a call-shaped
-     *  extension op (actually invoking the callee) is the extension's own
-     *  responsibility; `ExecState` below deliberately does not expose
-     *  procedure dispatch. */
-    call?: { calleeOperandIndex: number; argCount: number }
+     *  name: the callee's own `argCount` header decides how many values the
+     *  call site pops — never a static number here, since different sites
+     *  of the same call-shaped op can target callees of different arity
+     *  (codec-extension.md §6.3: "argCount from the invoked codec's
+     *  header") — mirroring `CALL`'s own last-arg-in-`acc` convention
+     *  exactly (rtl.ts's `call` doc comment): only `argCount - 1` values (0
+     *  for `argCount` 0 or 1) are expected to actually be on the stack.
+     *  `ExecState.callProc` is the matching VM-side capability — the
+     *  extension's own `exec` decides *when* to call it and what to bind
+     *  first (e.g. a codec's object handle), but the invocation itself runs
+     *  through the same machinery a plain `CALL` does. */
+    call?: { calleeOperandIndex: number }
 }
 
 /** The subset of VM state one extension opcode's `exec` is allowed to
  *  touch — accumulator and stack/register access, nothing about control
  *  flow (no pc, no block stack) since a generic extension op is
- *  straight-line by construction (isa-core.md §5.1). */
+ *  straight-line by construction (isa-core.md §5.1).
+ *
+ *  `callProc` is the one exception to "straight-line": it's what a
+ *  call-shaped op (`ExtOpEffect.call`, e.g. the codec extension's
+ *  `CALL_CODEC`) uses to actually invoke the callee `validate.ts` already
+ *  folded into its call-graph bookkeeping — mirroring `vm.ts`'s own `CALL`
+ *  case exactly (resolve the callee by table index, run it to completion,
+ *  return its `acc`). Invoking it is nested, synchronous, and returns
+ *  before `exec` does, so it doesn't reintroduce control flow into the
+ *  op's own execution — the callee runs in its own fresh frame, entirely
+ *  managed by `vm.ts`, and any state an extension needs to rebind across
+ *  that call (e.g. a codec's object handle) is the extension's own
+ *  responsibility to push/pop around this call, not something `vm.ts`
+ *  tracks. */
 export interface ExecState
 {
     acc: number
@@ -67,6 +84,7 @@ export interface ExecState
     pop(): number
     reg(index: number): number
     setReg(index: number, value: number): void
+    callProc(calleeIndex: number, args: readonly number[]): number
 }
 
 export interface ExtCodec
