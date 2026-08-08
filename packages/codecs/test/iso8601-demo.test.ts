@@ -33,13 +33,13 @@ import { struct, u8, u32, buildTypeGraph } from "@ppl/core"
 import { pStruct, pInteger } from "@ppl/core"
 import { ir, declareProc, defineProc, validateProgram, run } from "@ppl/machine"
 
-import { buildCodec } from "../src/engine/builders"
+import { buildCodec } from "../src/engine/resolver"
 import { createCodecExtension } from "../src/engine/codec-extension"
 import { binaryEncodeRules, binaryDecodeRules } from "../src/components/binary-rules"
 import { codecRule } from "../src/engine/resolver"
 
 const emitLiteral = (s: string): string =>
-    Array.from(s).map(ch => `${ch.codePointAt(0)}; write(0, 1);\n`).join("")
+    Array.from(s).map(ch => `write(0, 1, ${ch.codePointAt(0)});\n`).join("")
 
 const TIMESTAMP_SHAPE = pStruct({ secs: pInteger(-Infinity, Infinity), nanos: pInteger(-Infinity, Infinity) })
 
@@ -60,11 +60,9 @@ const iso8601EncodeRule = codecRule(TIMESTAMP_SHAPE, (match, _ctx: void) =>
         u32 rem = value;
         while (rem >= 10) { rem = rem - 10; tens = tens + 1; }
         tens = tens + 48;
-        tens;
-        write(0, 1);
+        write(0, 1, tens);
         rem = rem + 48;
-        rem;
-        write(0, 1);
+        write(0, 1, rem);
         return;
     `)
 

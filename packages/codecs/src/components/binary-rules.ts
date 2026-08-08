@@ -4,8 +4,8 @@
  * Layer 2 (docs/ARCHITECTURE.md's "Mappings" section): a concrete, opinionated
  * pair of `CodecRule<void>[]` — length-prefixed lists, a leading-tag byte for
  * a standalone union, per-field struct delegation with union-tag hoisting —
- * built entirely on `engine/builders.ts`'s generic driver and
- * `engine/resolver.ts`'s generic resolution primitive, neither of which know
+ * built entirely on `engine/resolver.ts`'s generic resolution primitive
+ * (`createCodecResolver`) and its `buildCodec` driver, neither of which know
  * this library exists. Neither list has any special standing with
  * `buildCodec`: a caller passes `binaryEncodeRules`/`binaryDecodeRules` (or
  * doesn't) exactly like any other `CodecRule<void>[]` — see
@@ -18,12 +18,14 @@
  * `direction === "encode"` internally was pure ceremony — every `produce`
  * body below is a flat, non-branching description of exactly what its own
  * direction does. `unitRule` is the one rule genuinely shared by both lists
- * (`return;` either way), so it's just one object referenced from both.
+ * (nothing to encode/decode either way), so it's just one object referenced
+ * from both.
  *
  * One real generic optimization lives here: a struct's union-typed field
- * with few enough variants to need only a couple of bits gets its tag
- * *hoisted* into one shared leading bitmap instead of paying for its own
- * standalone tag byte — see `structEncodeRule`/`structDecodeRule`.
+ * cheap enough to tag in fewer bits than a standalone tag byte would cost
+ * gets its tag *hoisted* into one shared leading bitmap instead of paying
+ * for its own standalone tag byte — see `structEncodeRule`/
+ * `structDecodeRule`, and `HOIST_MAX_VARIANTS` for the break-even point.
  */
 
 import type { IrFragment } from "@ppl/machine"
@@ -39,15 +41,15 @@ import { codecRule } from "../engine/resolver"
 
 // `Ctx` (void here) has nothing to infer it from on rules whose produce
 // doesn't take it at all — explicit type arguments instead.
-const integerEncodeRule = codecRule<IntegerPattern, void>(pInteger(-Infinity, Infinity), (match) =>
-    ir`load_val(0); write(0, ${intWireSize(match)}); return;`)
+const integerEncodeRule = codecRule(pInteger(-Infinity, Infinity), (match, _ctx: void) =>
+    ir`write(0, ${intWireSize(match)}, load_val(0));`)
 
-const integerDecodeRule = codecRule<IntegerPattern, void>(pInteger(-Infinity, Infinity), (match) =>
-    ir`read(0, ${intWireSize(match)}); store_val(0); return;`)
+const integerDecodeRule = codecRule(pInteger(-Infinity, Infinity), (match, _ctx: void) =>
+    ir`store_val(0, read(0, ${intWireSize(match)}));`)
 
 // ── Unit — genuinely direction-agnostic, shared by both lists ───────────
 
-const unitRule = codecRule<UnitPattern, void>(pUnit(), () => ir`return;`)
+const unitRule = codecRule(pUnit(), (_match, _ctx: void) => ir``)
 
 // ── Lists — length-prefixed ──────────────────────────────────────────────
 
@@ -60,53 +62,67 @@ function countPrefixWidth(capacity: number | undefined): number
 }
 
 const listEncodeRule = codecRule(pList(pStar()), (match, _ctx: void, resolve) =>
-{
-    const elem = resolve(match.elementType, undefined)
-    const width = countPrefixWidth(match.capacity)
-
-    return ir`
-        u32 left = 0;
-        left = count(0);
-        write(0, ${width});
-        while (left != 0) { call_codec_next(${elem}, 0); left = left - 1; }
-        return;
-    `
-})
+ir`
+    u32 left = 0;
+    left = count(0);
+    write(0, ${countPrefixWidth(match.capacity)}, left);
+    while (left != 0)
+    {
+        call_codec_next(${resolve(match.elementType, undefined)}, 0); left = left - 1;
+    }
+`)
 
 const listDecodeRule = codecRule(pList(pStar()), (match, _ctx: void, resolve) =>
-{
-    const elem = resolve(match.elementType, undefined)
-    const width = countPrefixWidth(match.capacity)
+ir`
+    u32 left = 0;
+    left = read(0, ${countPrefixWidth(match.capacity)});
+    open_list(0);
+    while (left != 0)
+    {
+        call_codec_next(${resolve(match.elementType, undefined)}, 0); left = left - 1;
+    }
+`)
 
-    return ir`
-        u32 left = 0;
-        left = read(0, ${width});
-        open_list(0);
-        while (left != 0) { call_codec_next(${elem}, 0); left = left - 1; }
-        return;
-    `
-})
-
-// ── Unions — standalone (no hoisting available to the caller) ──────────
-
-/** Tag width for a standalone union — 1 byte, up to 256 variants. Struct
+/** Byte width of a standalone union's tag, sized to its actual variant
+ *  count (mirrors `countPrefixWidth` above — same reasoning, a discrete
+ *  count instead of an optional capacity). A tag is a variant *index*
+ *  (0..variantCount-1), so it's `variantCount` itself, not `variantCount -
+ *  1`, that has to fit the width: exactly 256 variants' worst-case index
+ *  (255) still fits one byte. The `> 2**32` branch is unreachable in
+ *  practice (no real schema gets anywhere near four billion variants) but
+ *  costs nothing to state — better a loud build-time throw than silently
+ *  handing `WRITE`/`READ` a width no tag could ever need past. Struct
  *  fields that qualify for hoisting (`structEncodeRule`/`structDecodeRule`,
  *  below) never reach this rule at all; this is for a union reached any
  *  other way (the root type itself, or through a list element). */
+function unionTagWidth(variantCount: number): number
+{
+    if(variantCount > 2 ** 32)
+        throw new Error(`binary-rules: union has ${variantCount} variants — no tag width can address that many`)
+    return variantCount <= 0x100 ? 1 : variantCount <= 0x10000 ? 2 : 4
+}
+
 const unionEncodeRule = codecRule(pUnionFields(pStar()), (match, _ctx: void, resolve) =>
 {
-    const cases = match.variantMatches.map((v, k) =>
+    const width = unionTagWidth(match.variantMatches.length)
+    const cases: IrFragment[] = match.variantMatches.map((v, k) =>
         ir`case ${k}: call_codec(${resolve(v.type, undefined)}, 0, ${k});`)
 
-    return ir`tag(0); write(0, 1); switch (tag(0)) { ${cases} } return;`
+    return ir`
+        write(0, ${width}, tag(0));
+        switch (tag(0)) { ${cases} }
+    `
 })
 
 const unionDecodeRule = codecRule(pUnionFields(pStar()), (match, _ctx: void, resolve) =>
 {
-    const cases = match.variantMatches.map((v, k) =>
+    const width = unionTagWidth(match.variantMatches.length)
+    const cases: IrFragment[] = match.variantMatches.map((v, k) =>
         ir`case ${k}: call_codec(${resolve(v.type, undefined)}, 0, ${k});`)
 
-    return ir`switch (read(0, 1)) { ${cases} } return;`
+    return ir`
+        switch (read(0, ${width})) { ${cases} }
+    `
 })
 
 // ── Structs — per-field delegation, with union-tag hoisting ─────────────
@@ -123,7 +139,11 @@ interface HoistedField
     readonly variantTypes: readonly SemanticType[]
 }
 
-const HOIST_MAX_VARIANTS = 4 // needs ≤2 bits — the "basic" cutoff
+// A standalone union always costs exactly 1 byte (8 bits) for its tag
+// (`unionTagWidth` below, ≤256 variants), so hoisting a field only ever
+// pays for itself when its own tag costs *less* than that — 128 variants
+// (7 bits) is the actual break-even point, not an arbitrary round number.
+const HOIST_MAX_VARIANTS = 128
 const BITMAP_MAX_BITS = 32   // one register's worth (vm.ts's ALU is 32-bit)
 
 const bitsFor = (variantCount: number): number =>
@@ -163,81 +183,60 @@ const structEncodeRule = codecRule(pStructFields(pStar()), (match, _ctx: void, r
     const bitmapBytes = Math.ceil(totalBits / 8)
     const O_FIELD = 1 // scratch handle slot for whichever field is being processed
 
-    const stmts: IrFragment[] = []
-
-    if(hoisted.size > 0)
-    {
-        // Read every hoisted field's active-variant index (the same
-        // computation TAG does, just folded into a shared local instead of
-        // its own opcode) and pack it in. Has to happen — and be written to
-        // the wire — *before* any field's payload, since the payloads are
-        // written by nested delegate calls below and the stream is
-        // strictly append-only.
-        stmts.push(ir`u32 bitmap = 0;`)
-        for(const h of hoisted.values())
-            stmts.push(ir`
+    return ir`
+        ${hoisted.size === 0 
+            ? ir`` 
+            : ir`
+            u32 bitmap = 0;
+            ${[...hoisted.values()].map(h => ir`
                 enter(${O_FIELD}, 0, ${h.fieldIndex});
                 bitmap = bitmap | (tag(${O_FIELD}) << ${h.bitOffset});
-            `)
-        stmts.push(ir`bitmap; write(0, ${bitmapBytes});`)
-    }
-
-    // Per field, in declaration order (§8.1).
-    match.fieldMatches.forEach((f, fieldIndex) =>
-    {
-        const hoist = hoisted.get(fieldIndex)
-        if(!hoist)
-        {
-            stmts.push(ir`call_codec(${resolve(f.type, undefined)}, 0, ${fieldIndex});`)
-            return
+            `)}
+            write(0, ${bitmapBytes}, bitmap);
+            `
         }
+        ${match.fieldMatches.map((f, fieldIndex) =>
+        {
+            const hoist = hoisted.get(fieldIndex)
+            if(!hoist)
+                return ir`call_codec(${resolve(f.type, undefined)}, 0, ${fieldIndex});`
 
-        // Hoisted union field: get the tag from TAG (cheap to recompute,
-        // avoids a second local just to remember it from the bitmap pass
-        // above), then dispatch straight to the matching variant's payload
-        // codec — no separate TAG opcode here, no standalone union codec.
-        const cases = hoist.variantTypes.map((v, k) => ir`case ${k}: call_codec(${resolve(v, undefined)}, ${O_FIELD}, ${k});`)
-        stmts.push(ir`enter(${O_FIELD}, 0, ${fieldIndex}); switch (tag(${O_FIELD})) { ${cases} }`)
-    })
-
-    stmts.push(ir`return;`)
-    return ir`${stmts}`
+            const cases = hoist.variantTypes.map((v, k) => ir`case ${k}: call_codec(${resolve(v, undefined)}, ${O_FIELD}, ${k});`)
+            return ir`enter(${O_FIELD}, 0, ${fieldIndex}); switch (tag(${O_FIELD})) { ${cases} }`
+        })}
+    `
 })
 
 const structDecodeRule = codecRule(pStructFields(pStar()), (match, _ctx: void, resolve) =>
 {
+    // ── Meta: pure JS bookkeeping, no DSL text yet ──────────────────────
     const hoisted = classifyHoistableFields(match.fieldMatches)
     const totalBits = [...hoisted.values()].reduce((sum, h) => sum + h.bits, 0)
     const bitmapBytes = Math.ceil(totalBits / 8)
     const O_FIELD = 1
 
-    const stmts: IrFragment[] = []
-
-    if(hoisted.size > 0)
-        stmts.push(ir`u32 bitmap = 0; bitmap = read(0, ${bitmapBytes});`)
-
-    match.fieldMatches.forEach((f, fieldIndex) =>
-    {
-        const hoist = hoisted.get(fieldIndex)
-        if(!hoist)
-        {
-            stmts.push(ir`call_codec(${resolve(f.type, undefined)}, 0, ${fieldIndex});`)
-            return
+    // ── DSL: the whole body, assembled in one place ─────────────────────
+    return ir`
+        ${hoisted.size === 0 
+            ? ir`` 
+            : ir`u32 bitmap = 0; bitmap = read(0, ${bitmapBytes});`
         }
 
-        // `enter` (struct → field) is direction-agnostic — it only produces
-        // a plain, not-yet-variant-selected handle; the union's own variant
-        // gets set by `call_codec`'s `ref`, inside each case, not by this.
-        // One `enter` ahead of the switch covers every case, so only the
-        // discriminant expression (unpacked from the bitmap here, vs. a
-        // fresh TAG read on the encode side) depends on direction.
-        const cases = hoist.variantTypes.map((v, k) => ir`case ${k}: call_codec(${resolve(v, undefined)}, ${O_FIELD}, ${k});`)
-        const discriminant = `(bitmap >> ${hoist.bitOffset}) & ${hoist.mask}`
-        stmts.push(ir`enter(${O_FIELD}, 0, ${fieldIndex}); switch (${discriminant}) { ${cases} }`)
-    })
+        ${match.fieldMatches.map((f, fieldIndex) =>
+        {
+            const hoist = hoisted.get(fieldIndex)
 
-    stmts.push(ir`return;`)
-    return ir`${stmts}`
+            return hoist 
+                ? (ir`
+                    enter(${O_FIELD}, 0, ${fieldIndex}); 
+                    switch (${`(bitmap >> ${hoist.bitOffset}) & ${hoist.mask}`}) 
+                    { 
+                        ${hoist.variantTypes.map((v, k) => ir`case ${k}: call_codec(${resolve(v, undefined)}, ${O_FIELD}, ${k});`)} 
+                    }
+                `)
+                : ir`call_codec(${resolve(f.type, undefined)}, 0, ${fieldIndex});`
+        })}
+    `
 })
 
 /** The default binary wire-format library — one pair of `CodecRule<void>[]`

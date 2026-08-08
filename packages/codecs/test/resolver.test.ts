@@ -1,7 +1,8 @@
 /**
  * @ppl/codecs/test — createCodecResolver(): the one generic on-demand
- * SemanticType -> Procedure resolver both `buildCodec` (engine/builders.ts)
- * and `buildJsonEncoder` (components/json.ts) are built on top of.
+ * SemanticType -> Procedure resolver both `buildCodec` (this same file,
+ * engine/resolver.ts) and `buildJsonEncoder` (components/json.ts) are
+ * built on top of.
  *
  * Deliberately independent of the codec extension's own opcodes — these
  * rules just return plain `ir` fragments computing ordinary values via

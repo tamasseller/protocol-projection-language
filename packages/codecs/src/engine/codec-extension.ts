@@ -1,50 +1,29 @@
 /**
  * @ppl/codecs — Codec extension (ROADMAP.md item 7, docs/codec-extension.md)
  *
- * Layer 1 (docs/ARCHITECTURE.md's "Mappings" section) — domain
- * infrastructure, not a codec: it doesn't encode anything by itself, it's
- * what makes encoding *expressible* as `ir` text at all. It lives in
- * `@ppl/codecs` rather than `@ppl/machine` only because `@ppl/machine` must
- * stay protocol-agnostic (ROADMAP.md item 7); conceptually it's still core.
+ * Implements `@ppl/machine`'s `Extension` hook for all 15 opcodes
+ * `./opcodes.ts` names (§2/§3), plus `codecRules()`, their `ir\`...\`` DSL
+ * surface. Lives here rather than `@ppl/machine` because that package must
+ * stay protocol-agnostic; conceptually it's still core infrastructure, not
+ * a codec itself. Still out of scope: the wire-level `codec` byte layout
+ * (§6 — deliberately deferred, ROADMAP.md item 8).
  *
- * `createCodecExtension` implements `@ppl/machine`'s `Extension` hook
- * (packages/machine/src/extension.ts) for structs, unions, and lists —
- * `ENTER`, `ENTER_NEXT`, `LOAD_VAL`, `STORE_VAL`, `COUNT`, `TAG`,
- * `OPEN_LIST`, `READ`, `WRITE`, `CALL_CODEC`, `CALL_CODEC_NEXT` — plus
- * `codecRules()`, this same opcode set's `rules()` DSL surface (matching
- * `Extension["rules"]`, extension.ts:107), so codec bodies are authored as
- * real `ir\`...\`` text (`../engine/builders.ts`,
- * `../components/delta-leb128.ts`, `../components/json.ts`) instead of
- * hand-built `RtlInstr[]` arrays. Still out of scope, tracked in
- * codec-extension.md §3: `HAS_NEXT`/`CLONE_RD`/`CLONE_WR`/`SEEK` (stream
- * forks — nothing here needs more than one straight-through `i0`). Also
- * still out of scope: the wire-level `codec` byte layout (§6 says that's
- * deliberately unassigned until real codecs exist to measure against —
- * `../components/binary-rules.ts` is exactly that now, but the byte-layout
- * design pass itself is separate follow-on work).
- *
- * Direction (§2.1/§2.3) is a property of the whole program, not of this
- * extension — `createCodecExtension` takes it as a constructor argument,
- * matching the "one Extension instance per direction per program" shape
- * ROADMAP.md item 8's image-format sketch describes (an encoder and a
- * decoder for the same type are two separate programs sharing only the
- * semantic type, not one bidirectional call graph). It's read by
- * `computeChild`'s union branch (decode instantiates a variant; encode
- * only navigates one, checked against the value's already-active variant)
- * — every other opcode's behavior falls out of which handle/value it's
- * pointed at, not the direction flag itself. Nothing here enforces the
- * *rest* of direction-correctness (e.g. rejecting `STORE_VAL` while
- * encoding) — that's the validator work codec-extension.md §7.1 still has
- * open.
+ * Direction (§2.1/§2.3) is a whole-program property, passed in once here.
+ * It's read by `computeChild`'s union branch (decode instantiates a
+ * variant; encode only navigates one) and by `i0`'s own initial stream
+ * capability (§2.1: read-only for a decoder, write-only for an encoder) —
+ * every other opcode's behavior follows from which handle/iterator it's
+ * pointed at.
  */
 
 import type { Extension, ExecState, ExtOpEffect } from "@ppl/machine"
 import type { ExtInstr } from "@ppl/machine"
 import type { Rule } from "@ppl/machine"
-import type { EastMatch, LiteralMatch, IdentifierMatch } from "@ppl/machine"
-import { rule, leafNode, extInstr, pBuiltinCallN, pLiteral, pIdentifier } from "@ppl/machine"
+import { rule, leafNode, unaryNode, extInstr, pBuiltinCall, pConst, pIdentifier, pRtl } from "@ppl/machine"
 import type { IntegerType, TypeNode } from "@ppl/core"
 import { kindOf, SemanticTypeKinds } from "@ppl/core"
+import type { CodecOpcode } from "./opcodes"
+import { isCodecOpcode, assertNever } from "./opcodes"
 
 export type Direction = "encode" | "decode"
 
@@ -147,7 +126,7 @@ function ensureDecodedStructExists(handle: Handle, direction: Direction): Handle
  *  returns. */
 type Frame = Handle[]
 
-const EFFECTS: Readonly<Record<string, ExtOpEffect>> = {
+const EFFECTS: Readonly<Record<CodecOpcode, ExtOpEffect>> = {
     ENTER:      { tosDelta: 0, maxTransient: 0 },
     ENTER_NEXT: { tosDelta: 0, maxTransient: 0 },
     LOAD_VAL:   { tosDelta: 0, maxTransient: 0 },
@@ -157,6 +136,10 @@ const EFFECTS: Readonly<Record<string, ExtOpEffect>> = {
     OPEN_LIST:  { tosDelta: 0, maxTransient: 0 },
     READ:       { tosDelta: 0, maxTransient: 0 },
     WRITE:      { tosDelta: 0, maxTransient: 0 },
+    HAS_NEXT:   { tosDelta: 0, maxTransient: 0 },
+    CLONE_RD:   { tosDelta: 0, maxTransient: 0 },
+    CLONE_WR:   { tosDelta: 0, maxTransient: 0 },
+    SEEK:       { tosDelta: 0, maxTransient: 0 },
     // §3.3/§4: CALL_CODEC codec_idx, src, ref, [args...] — validate.ts
     // derives the actual pop count from the resolved callee's own
     // argCount header (extension.ts's `ExtOpEffect.call` doc comment), so
@@ -166,66 +149,114 @@ const EFFECTS: Readonly<Record<string, ExtOpEffect>> = {
     CALL_CODEC_NEXT: { tosDelta: 0, maxTransient: 0, call: { calleeOperandIndex: 0 } },
 }
 
-const literalArgs = (arity: number) => Array.from({ length: arity }, () => pLiteral())
-const litValue = (m: EastMatch): number => (m as LiteralMatch).value
-
-/** One opcode per literal-operand-only op in `EFFECTS` above (everything but
- *  the two call-shaped ones) — each just splices its arguments straight
- *  into an `ExtInstr`'s `operands`, the way `trap(code)` splices its one
- *  literal argument into `TRAP #code` (machine/rules.ts:185-186). None of
- *  these need `"acc"` to actually hold anything meaningful afterward (some
- *  read it, e.g. `WRITE`/`STORE_VAL`; some ignore it entirely, e.g.
- *  `ENTER`) — declaring `["acc"]` regardless is the same harmless
- *  over-statement `trap`'s own rule already makes (it never returns either),
- *  and is required for `lowerStatementExpr` to accept the call as a bare
- *  statement at all (an empty `output: []` fails its "any non-`tos`
- *  location" filter — orchestrator.ts:243-247). */
-const LITERAL_OPS: readonly { name: string; ext: string; arity: number }[] = [
-    { name: "enter", ext: "ENTER", arity: 3 },
-    { name: "enter_next", ext: "ENTER_NEXT", arity: 2 },
-    { name: "load_val", ext: "LOAD_VAL", arity: 1 },
-    { name: "store_val", ext: "STORE_VAL", arity: 1 },
-    { name: "count", ext: "COUNT", arity: 1 },
-    { name: "tag", ext: "TAG", arity: 1 },
-    { name: "open_list", ext: "OPEN_LIST", arity: 1 },
-    { name: "read", ext: "READ", arity: 2 },
-    { name: "write", ext: "WRITE", arity: 2 },
-]
-
-/**
- * `call_codec`/`call_codec_next` DSL syntax: `call_codec(${codecProc}, src, ref)`.
- * The callee-reference argument is matched with `pIdentifier()` — a pure
- * structural check (matcher.ts:236-239) — and resolved via `resolveCallee`,
- * exactly like a real procedure call (`callNode`, machine/rules.ts:395-411).
- * This never touches the generic value-tiling path at all, which is why the
- * previous pass's `${helper}` splice into a builtin-call *argument* crashed:
- * it used a `pRtl(...)` sub-pattern there instead of `pIdentifier()`.
- */
-function callShapedRule(name: string, ext: string, tailArity: number, resolveCallee: (name: string) => number | undefined): Rule
-{
-    return rule(`codec:${name}`, pBuiltinCallN(name, [pIdentifier(), ...literalArgs(tailArity)]), m =>
-    {
-        const [calleeMatch, ...tail] = m.argumentMatches
-        const calleeIndex = resolveCallee((calleeMatch as IdentifierMatch).name)
-        if(calleeIndex === undefined) return undefined
-        return leafNode(["acc"], [extInstr(ext, [calleeIndex, ...tail.map(litValue)])], [], 0, 0)
-    })
-}
-
 /** The codec extension's `Extension.rules` — lets codec bodies be authored
  *  as `ir\`...\`` text (builders.ts and friends) instead of hand-built
  *  `RtlInstr[]` arrays. Matches `Extension["rules"]`'s signature
  *  (extension.ts:107) exactly; `resolveLocal` is unused (no codec opcode
  *  reads/writes a named local — every operand is either a literal or a
- *  callee reference resolved via `resolveCallee`). */
+ *  callee reference resolved via `resolveCallee`).
+ *
+ *  Every non-call rule below declares `output: ["acc"]`, regardless of
+ *  whether its own opcode actually leaves anything meaningful there
+ *  (`ENTER`/`ENTER_NEXT`/`OPEN_LIST` don't) — the same harmless
+ *  over-statement `trap`'s own rule already makes (it never returns
+ *  either), required for `lowerStatementExpr` to accept the call as a bare
+ *  statement at all (an empty `output: []` fails its "any non-`tos`
+ *  location" filter — orchestrator.ts:243-247).
+ *
+ *  Every argument is a plain rest argument to `pBuiltinCall` — `enter`'s
+ *  three literals, `write`'s two literals plus a trailing `pRtl("acc")`,
+ *  `call_codec`'s callee identifier plus its literal operands — all typed
+ *  positionally by rest-parameter inference, so each rule's `m
+ *  .argumentMatches` destructures straight into exactly-typed locals with
+ *  no manual cast anywhere below.
+ *
+ *  `write`/`store_val` are the two ops whose real semantics *read* `acc` as
+ *  an input (`stream[i].write(acc, w)`, `handle.value = acc`), so their
+ *  last argument is a real `pRtl("acc")` demand instead of a literal, and
+ *  their builder splices that argument's own tiled fragment in ahead of
+ *  the opcode (`unaryNode`) rather than assuming the value is already
+ *  sitting in `acc` by the time the call runs.
+ *
+ *  `call_codec`/`call_codec_next` (`call_codec(${codecProc}, src, ref)`)
+ *  are call-shaped rather than value-shaped: their first argument is the
+ *  callee reference, matched with `pIdentifier()` — a pure structural check
+ *  (matcher.ts:236-239) — and resolved via `resolveCallee`, exactly like a
+ *  real procedure call (`callNode`, machine/rules.ts:395-411), never
+ *  touching the generic value-tiling path at all. Neither currently uses
+ *  `pBuiltinCall`'s `pTail(...)` marker — both take a fixed number of
+ *  operands today — but it's exactly what would carry `CALL_CODEC`'s
+ *  still-unimplemented optional runtime value args (docs/codec-
+ *  extension.md §3.3, §4: `codec_idx, src, ref, [args…]`) whenever that
+ *  lands. */
 export function codecRules(_resolveLocal: (name: string) => number, resolveCallee: (name: string) => number | undefined): Rule[]
 {
     return [
-        ...LITERAL_OPS.map(({ name, ext, arity }) =>
-            rule(`codec:${name}`, pBuiltinCallN(name, literalArgs(arity)), m =>
-                leafNode(["acc"], [extInstr(ext, m.argumentMatches.map(litValue))], [], 0, 0))),
-        callShapedRule("call_codec", "CALL_CODEC", 2, resolveCallee),
-        callShapedRule("call_codec_next", "CALL_CODEC_NEXT", 1, resolveCallee),
+        rule("codec:enter", pBuiltinCall("enter", pConst(), pConst(), pConst()), m =>
+            leafNode(["acc"], [extInstr("ENTER", m.argumentMatches.map(a => a.value))], [], 0, 0)),
+
+        rule("codec:enter_next", pBuiltinCall("enter_next", pConst(), pConst()), m =>
+            leafNode(["acc"], [extInstr("ENTER_NEXT", m.argumentMatches.map(a => a.value))], [], 0, 0)),
+
+        rule("codec:load_val", pBuiltinCall("load_val", pConst()), m =>
+            leafNode(["acc"], [extInstr("LOAD_VAL", m.argumentMatches.map(a => a.value))], [], 0, 0)),
+
+        rule("codec:count", pBuiltinCall("count", pConst()), m =>
+            leafNode(["acc"], [extInstr("COUNT", m.argumentMatches.map(a => a.value))], [], 0, 0)),
+
+        rule("codec:tag", pBuiltinCall("tag", pConst()), m =>
+            leafNode(["acc"], [extInstr("TAG", m.argumentMatches.map(a => a.value))], [], 0, 0)),
+
+        rule("codec:open_list", pBuiltinCall("open_list", pConst()), m =>
+            leafNode(["acc"], [extInstr("OPEN_LIST", m.argumentMatches.map(a => a.value))], [], 0, 0)),
+
+        rule("codec:read", pBuiltinCall("read", pConst(), pConst()), m =>
+            leafNode(["acc"], [extInstr("READ", m.argumentMatches.map(a => a.value))], [], 0, 0)),
+
+        rule("codec:write", pBuiltinCall("write", pConst(), pConst(), pRtl("acc")), m =>
+        {
+            const [iter, width, value] = m.argumentMatches
+            return unaryNode(value.node, ["acc"], [...value.node.fragment, extInstr("WRITE", [iter.value, width.value])])
+        }),
+
+        rule("codec:store_val", pBuiltinCall("store_val", pConst(), pRtl("acc")), m =>
+        {
+            const [src, value] = m.argumentMatches
+            return unaryNode(value.node, ["acc"], [...value.node.fragment, extInstr("STORE_VAL", [src.value])])
+        }),
+
+        rule("codec:has_next", pBuiltinCall("has_next", pConst()), m =>
+            leafNode(["acc"], [extInstr("HAS_NEXT", m.argumentMatches.map(a => a.value))], [], 0, 0)),
+
+        rule("codec:clone_rd", pBuiltinCall("clone_rd", pConst(), pConst()), m =>
+            leafNode(["acc"], [extInstr("CLONE_RD", m.argumentMatches.map(a => a.value))], [], 0, 0)),
+
+        rule("codec:clone_wr", pBuiltinCall("clone_wr", pConst(), pConst()), m =>
+            leafNode(["acc"], [extInstr("CLONE_WR", m.argumentMatches.map(a => a.value))], [], 0, 0)),
+
+        // `pConst()` alone is enough for a *negative* delta too: `-4` parses
+        // as `UnaryExpression("-", Literal(4))` (matcher.ts), but
+        // rules.ts's `fold:unary:-` — an ordinary Rule, tried like any
+        // other — resolves it to a plain constant wherever a `pConst()`
+        // position asks, so no second rule is needed for the negative case.
+        rule("codec:seek", pBuiltinCall("seek", pConst(), pConst()), m =>
+            leafNode(["acc"], [extInstr("SEEK", m.argumentMatches.map(a => a.value))], [], 0, 0)),
+
+        rule("codec:call_codec", pBuiltinCall("call_codec", pIdentifier(), pConst(), pConst()), m =>
+        {
+            const [callee, src, ref] = m.argumentMatches
+            const calleeIndex = resolveCallee(callee.name)
+            if(calleeIndex === undefined) return undefined
+            return leafNode(["acc"], [extInstr("CALL_CODEC", [calleeIndex, src.value, ref.value])], [], 0, 0)
+        }),
+
+        rule("codec:call_codec_next", pBuiltinCall("call_codec_next", pIdentifier(), pConst()), m =>
+        {
+            const [callee, src] = m.argumentMatches
+            const calleeIndex = resolveCallee(callee.name)
+            if(calleeIndex === undefined) return undefined
+            return leafNode(["acc"], [extInstr("CALL_CODEC_NEXT", [calleeIndex, src.value])], [], 0, 0)
+        }),
     ]
 }
 
@@ -321,27 +352,51 @@ function computeNext(frame: Frame, srcId: number, direction: Direction): Handle
         direction)
 }
 
+/** One stream iterator's live state (§2.1). `capability` is fixed at
+ *  creation — `i0`'s from the program's `direction`, a fork's from which of
+ *  `CLONE_RD`/`CLONE_WR` made it, independent of its source (§2.1) — and
+ *  never changes. `overwriteOnly` is `CLONE_WR`'s own restriction: only
+ *  `i0` ever appends past the buffer's current end; every `CLONE_WR` fork
+ *  may only overwrite bytes an earlier `i0` write already established. */
+interface StreamIter
+{
+    pos: number
+    capability: "read" | "write"
+    overwriteOnly: boolean
+}
+
 /**
  * @param direction encoder or decoder — see the file header.
  * @param root      the handle the entry procedure's `o0` is bound to.
- * @param buffer    the wire byte sequence — `i0` (§2.1). Appended to by
- *                   `WRITE` (encode), read sequentially by `READ` (decode).
- *                   This pass supports only `i0`, so `buffer`/its cursor
- *                   are shared, run-wide, un-reset-by-frame state — exactly
- *                   what §2.1 requires ("`i0`... established once... never
- *                   rebound"), unlike the per-frame handle table above.
+ * @param buffer    the wire byte sequence. Iterator 0 (`i0`) is seeded here
+ *                   at position 0 with `direction`'s capability; `iters`, like
+ *                   `buffer`, is shared, run-wide, un-reset-by-frame state —
+ *                   §2.1 requires this for `i0`, and a fork's whole point
+ *                   (§8.4's checksum-with-fixup) is to stay live across
+ *                   whatever the frame does next — unlike the per-frame
+ *                   handle table above.
  */
 export function createCodecExtension(direction: Direction, root: Handle, buffer: number[]): Extension
 {
     const frames: Frame[] = [[root]]
-    let pos = 0
+    const iters: StreamIter[] = [{ pos: 0, capability: direction === "encode" ? "write" : "read", overwriteOnly: false }]
     const top = (): Frame => frames[frames.length - 1]!
+
+    function iterAt(id: number): StreamIter
+    {
+        const it = iters[id]
+        if(!it) throw new Error(`codec extension: no stream iterator ${id} (CLONE_RD/CLONE_WR before use?)`)
+        return it
+    }
 
     function exec(instr: ExtInstr, state: ExecState): void
     {
         const frame = top()
 
-        switch(instr.ext)
+        if(!isCodecOpcode(instr.ext)) throw new Error(`codec extension: unhandled opcode EXT ${instr.ext}`)
+        const op: CodecOpcode = instr.ext
+
+        switch(op)
         {
             case "ENTER":
             {
@@ -410,23 +465,61 @@ export function createCodecExtension(direction: Direction, root: Handle, buffer:
 
             case "READ":
             {
-                const [, width] = instr.operands as readonly [number, number]
+                const [iterId, width] = instr.operands as readonly [number, number]
+                const it = iterAt(iterId)
+                if(it.capability !== "read") throw new Error(`codec extension: READ on write-only iterator ${iterId}`)
                 let value = 0
                 for(let byte = 0; byte < width; byte++)
-                    value |= (buffer[pos++] ?? 0) << (8 * byte)
+                    value |= (buffer[it.pos++] ?? 0) << (8 * byte)
                 state.acc = value >>> 0
                 return
             }
 
             case "WRITE":
             {
-                const [, width] = instr.operands as readonly [number, number]
+                const [iterId, width] = instr.operands as readonly [number, number]
+                const it = iterAt(iterId)
+                if(it.capability !== "write") throw new Error(`codec extension: WRITE on read-only iterator ${iterId}`)
+                if(it.overwriteOnly && it.pos + width > buffer.length)
+                    throw new Error(`codec extension: iterator ${iterId} (a CLONE_WR fork) can't append — only i0 appends (§2.1)`)
                 let value = state.acc
                 for(let byte = 0; byte < width; byte++)
                 {
-                    buffer[pos++] = value & 0xFF
+                    buffer[it.pos++] = value & 0xFF
                     value >>>= 8
                 }
+                return
+            }
+
+            case "HAS_NEXT":
+            {
+                const [iterId] = instr.operands as readonly [number]
+                const it = iterAt(iterId)
+                if(it.capability !== "read") throw new Error(`codec extension: HAS_NEXT on write-only iterator ${iterId}`)
+                state.acc = it.pos < buffer.length ? 1 : 0
+                return
+            }
+
+            case "CLONE_RD":
+            {
+                const [src, dst] = instr.operands as readonly [number, number]
+                iters[dst] = { pos: iterAt(src).pos, capability: "read", overwriteOnly: false }
+                return
+            }
+
+            case "CLONE_WR":
+            {
+                const [src, dst] = instr.operands as readonly [number, number]
+                iters[dst] = { pos: iterAt(src).pos, capability: "write", overwriteOnly: true }
+                return
+            }
+
+            case "SEEK":
+            {
+                const [iterId, delta] = instr.operands as readonly [number, number]
+                const it = iterAt(iterId)
+                if(it.pos + delta < 0) throw new Error(`codec extension: SEEK would move iterator ${iterId} before the stream's start`)
+                it.pos += delta
                 return
             }
 
@@ -451,9 +544,10 @@ export function createCodecExtension(direction: Direction, root: Handle, buffer:
             }
 
             default:
-                throw new Error(`codec extension: unhandled opcode EXT ${instr.ext}`)
+                return assertNever(op)
         }
     }
 
     return { effects: EFFECTS, exec }
 }
+

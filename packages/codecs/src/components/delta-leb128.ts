@@ -1,7 +1,7 @@
 /**
  * @ppl/codecs — delta-encoded `List<Integer>`, LEB128 (codec-extension.md §8.6)
  *
- * A specific, *opt-in* optimization — not one of `builders.ts`'s defaults,
+ * A specific, *opt-in* optimization — not one of `binary-rules.ts`'s defaults,
  * since "this list's values are close enough to their neighbors that
  * delta-coding pays for itself" is a judgment call about the *data*, not
  * something a type alone tells you. First element encoded as-is, every
@@ -20,13 +20,32 @@
  * wrapper over that, picking whichever rule matches its own `direction`
  * argument.
  *
- * Faithful to §8.6 as specified: the delta is fed straight into unsigned
- * LEB128, no zigzag step. That means it's a genuine win only for
- * non-negative (or very mildly negative) deltas — a negative one wraps to
- * its 32-bit two's-complement value first (still round-trips correctly,
- * decode's own `+` unwraps it exactly the same way), which unsigned LEB128
- * then spends up to 5 bytes on instead of 1. Worth knowing before reaching
- * for this on data that isn't monotonic-ish.
+ * Diverges from §8.6's own worked example (illustration only, not a
+ * mandate) in one deliberate way: every value actually handed to
+ * `leb128_encode`/`leb128_decode` — the first element as well as every
+ * later delta — is zigzag-transformed first (`(v << 1) ^ -((v &
+ * 0x80000000) != 0)` on the way in, `(v >> 1) ^ -(v & 1)` on the way out —
+ * `-(bool)` turns a 0/1 comparison result into an all-0s/all-1s mask), not
+ * fed straight through. The sign test is a bitwise top-bit check
+ * (`json.ts`'s own `jsonIntegerBody` uses the same idiom), not `v < 0`:
+ * this DSL's `<` is only ever `LT_U` (rules.ts's `OP_TABLE`) — unsigned —
+ * so `v < 0` is trivially always false, never what you want here; the
+ * signed comparison opcodes (`LT_S` etc.) exist in the ISA but, like
+ * `ASR` below, were never wired to a DSL token. §8.6's own unsigned-only
+ * version wraps a negative value to its 32-bit two's-complement pattern
+ * before LEB128 sees it — round-trips fine, but unsigned LEB128 then
+ * spends up to 5 bytes on what zigzag turns into a small, cheap-to-encode
+ * unsigned number instead (exactly why protobuf's `sint32`/`sint64` do
+ * the same transform ahead of their own varint encoding). Chosen over
+ * "true" SLEB128 (DWARF/WASM's sign-extend-the-last-byte convention)
+ * specifically because it needs nothing this ISA doesn't already have:
+ * `leb128_encode`/`leb128_decode` stay genuinely unsigned and untouched,
+ * and the zigzag step itself only needs ops already reachable from the
+ * DSL (`<<`, `&`, `!=`, `>>` i.e. `SHR` logical shift, unary `-`) — a real
+ * SLEB128 encoder's own `value >>= 7` convergence step needs an
+ * *arithmetic* shift, which this DSL doesn't expose (`ASR` is a real,
+ * fully-implemented ISA opcode — isa-core.md §4.2/the encoding table —
+ * just never wired to grammar syntax; a future addition, not needed here).
  */
 
 import type { IrFragment, Procedure, RtlProgram } from "@ppl/machine"
@@ -34,7 +53,7 @@ import { ir, declareProc, defineProc } from "@ppl/machine"
 import type { SemanticType, ListType, ListPattern, IntegerPattern } from "@ppl/core"
 import { concreteKindOf, derefType, SemanticTypeKinds, pList, pInteger } from "@ppl/core"
 import type { Direction } from "../engine/codec-extension"
-import { buildCodec } from "../engine/builders"
+import { buildCodec } from "../engine/resolver"
 import { codecRule } from "../engine/resolver"
 
 // ── leb128_encode(value) — §8.3, as an ir` ` fragment ────────────────────
@@ -50,8 +69,7 @@ function leb128EncodeBody(): IrFragment
             byte = value & 0x7F;
             value = value >> 7;
             if (value != 0) { byte = byte | 0x80; }
-            byte;
-            write(0, 1);
+            write(0, 1, byte);
         }
         return;
     `
@@ -88,23 +106,24 @@ function deltaEncodeBody(leb128: Procedure): IrFragment
     return ir`
         u32 left = 0;
         left = count(0);
-        write(0, 1);
+        write(0, 1, left);
         if (left == 0) { return; }
         enter_next(1, 0);
         u32 prev = 0;
         prev = load_val(1);
-        ${leb128}(prev);
+        ${leb128}((prev << 1) ^ -((prev & 0x80000000) != 0));
         left = left - 1;
+        u32 cur = 0;
+        u32 delta = 0;
         while (left != 0)
         {
             enter_next(1, 0);
-            u32 cur = 0;
             cur = load_val(1);
-            ${leb128}(cur - prev);
+            delta = cur - prev;
+            ${leb128}((delta << 1) ^ -((delta & 0x80000000) != 0));
             prev = cur;
             left = left - 1;
         }
-        return;
     `
 }
 
@@ -115,23 +134,23 @@ function deltaDecodeBody(leb128: Procedure): IrFragment
         left = read(0, 1);
         open_list(0);
         if (left == 0) { return; }
-        enter_next(1, 0);
+        u32 zz = 0;
         u32 prev = 0;
-        prev = ${leb128}();
-        prev;
-        store_val(1);
+        u32 delta = 0;
+        enter_next(1, 0);
+        zz = ${leb128}();
+        prev = (zz >> 1) ^ -(zz & 1);
+        store_val(1, prev);
         left = left - 1;
         while (left != 0)
         {
             enter_next(1, 0);
-            u32 delta = 0;
-            delta = ${leb128}();
+            zz = ${leb128}();
+            delta = (zz >> 1) ^ -(zz & 1);
             prev = prev + delta;
-            prev;
-            store_val(1);
+            store_val(1, prev);
             left = left - 1;
         }
-        return;
     `
 }
 

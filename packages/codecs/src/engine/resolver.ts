@@ -1,5 +1,6 @@
 /**
- * @ppl/codecs — The one generic codec resolver
+ * @ppl/codecs — The one generic codec resolver, plus `buildCodec`, the
+ * thin driver built on top of it
  *
  * Layer 1 (docs/ARCHITECTURE.md's "Mappings" section) — a dispatch engine,
  * not a codec, even though it currently has no consumer outside this
@@ -10,7 +11,11 @@
  * primitive, not two independently hand-rolled ones — `createCodecResolver`
  * is it, and both families are built directly on top of it, differing only
  * in which rule list and which context type (a JSON depth, or nothing at
- * all) they close over.
+ * all) they close over. `buildCodec` (bottom of this file, formerly its own
+ * `builders.ts`) composes `createCodecResolver` with `lowerProgram` — one
+ * `resolve()` call and one `lowerProgram()` call, nothing else — so it
+ * never earned a separate file of its own; it stays right next to the one
+ * primitive it's a driver over.
  *
  * `TypePattern`/`matchType` (`@ppl/core/matcher.ts`) — the pure structural
  * matching vocabulary already used by `target-cpp`/`target-js`'s own
@@ -51,8 +56,9 @@
 import type { TypePattern, TypeMatch, TypeGraph, TypeNode, MatchOf } from "@ppl/core"
 import type { SemanticType } from "@ppl/core"
 import { matchType, kindOf, buildTypeGraph } from "@ppl/core"
-import type { IrFragment, Procedure } from "@ppl/machine"
-import { declareProc, defineProc } from "@ppl/machine"
+import type { IrFragment, Procedure, RtlProgram } from "@ppl/machine"
+import { declareProc, defineProc, ir, lowerProgram } from "@ppl/machine"
+import { codecRules } from "./codec-extension"
 
 /**
  * One codec rule: a structural filter (`pattern`) and a producer
@@ -102,6 +108,33 @@ export function codecRule<P extends TypePattern, Ctx>(
 }
 
 /**
+ * Every codec-rule body is, by this library's own convention, a `void`
+ * procedure — it either falls straight through or ends in an explicit
+ * `trap(...)` for a real error case (docs/codec-extension.md §8.7's
+ * exhaustive-decode pattern), never a meaningful return value. Repeating a
+ * trailing `return;` in every single `produce()` — including genuine
+ * one-liners like `unitRule` — is pure ceremony the machine-level ISA
+ * itself won't drop (isa-core.md §2.3: a procedure body must end in a
+ * terminator, full stop — see `lower.ts`/`validate.ts`/`vm.ts`, no
+ * implicit-fallthrough exception for a "void" one). So this resolver
+ * supplies the ceremony instead of every rule author: a fragment that
+ * doesn't already end in `return`/`trap(...)` gets a bare `return;`
+ * appended; one that already does (because the rule genuinely needs to,
+ * e.g. to reject an out-of-range tag) is left exactly as written — never
+ * double-terminated, never second-guessed. `produce` can just... stop
+ * writing, once there's nothing left to say.
+ */
+function ensureTerminated(fragment: IrFragment): IrFragment
+{
+    const last = fragment.body[fragment.body.length - 1]
+    const alreadyTerminated = last !== undefined && (
+        last.type === "ReturnStatement" ||
+        (last.type === "ExpressionStatement" && last.expression.type === "CallExpression" && last.expression.callee.name === "trap")
+    )
+    return alreadyTerminated ? fragment : ir`${fragment} return;`
+}
+
+/**
  * Build an on-demand, memoized, cycle-safe `SemanticType → Procedure`
  * resolver from an ordered rule list (first match wins — a caller's own
  * rules go first so they can preempt a default). `keyOf` controls
@@ -141,16 +174,49 @@ export function createCodecResolver<Ctx>(
         const cached = cache.get(key)
         if(cached) return cached
 
-        const handle = declareProc([]) // mint identity now — reserved, before recursing
+        // `node` (a TypeNode, @ppl/core/type-graph.ts) becomes this
+        // procedure's opaque header — its declared `o0` type, per
+        // codec-extension.md §2.4/§4.1's `{GENERIC, CODEC}` ABI selector. A
+        // GENERIC helper declared directly (bypassing this resolver — e.g.
+        // delta-leb128.ts's leb128_encode) gets no header, meaning no o0 at
+        // all, exactly per §4.1. `validate-handles.ts`'s §7.1/§7.2 checks
+        // are the reason this exists: neither needs new validator
+        // machinery, just this one piece of type metadata carried through
+        // untouched by lower.ts (rtl.ts's `RtlProc.header` doc comment).
+        const handle = declareProc([], node) // mint identity now — reserved, before recursing
         cache.set(key, handle)
 
         const rule = rules.find(r => matchType(node.type, r.pattern) !== undefined)
         if(!rule) throw new Error(`no codec rule matches type kind "${kindOf(node.type)}"`)
 
         const match = matchType(node.type, rule.pattern)!
-        defineProc(handle, rule.produce(match, ctx, resolve))
+        defineProc(handle, ensureTerminated(rule.produce(match, ctx, resolve)))
         return handle
     }
 
     return resolve
+}
+
+/**
+ * Build a complete `RtlProgram` for `root` from `rules` (first match wins —
+ * list a caller's own rules before a library's to let them preempt it for
+ * specific shapes) and `initialCtx` (the context the root itself resolves
+ * with — `undefined` for a `CodecRule<void>[]` library like the binary
+ * rules, `0` for a depth-keyed one like `json.ts`'s). Returns the program
+ * only — not a bound `Extension`, since an `Extension` (via
+ * `createCodecExtension`, codec-extension.ts) is bound to one specific
+ * root *value* and byte buffer, which only exist per encode/decode call,
+ * not per type; build the program once with `buildCodec`, then call
+ * `createCodecExtension(direction, {container, key, type: root}, buffer)`
+ * fresh for every value encoded/decoded against it.
+ *
+ * The thinnest possible driver over `createCodecResolver` above — not its
+ * own file (`builders.ts`, retired): one call to build the resolver, one
+ * to resolve the root, one to lower the result, nothing this function
+ * itself needs to own that `createCodecResolver` doesn't already provide.
+ */
+export function buildCodec<Ctx>(root: SemanticType, rules: readonly CodecRule<Ctx>[], initialCtx: Ctx): RtlProgram
+{
+    const resolve = createCodecResolver(rules)
+    return lowerProgram(resolve(root, initialCtx), { rules: codecRules })
 }

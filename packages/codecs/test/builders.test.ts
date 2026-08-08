@@ -1,5 +1,6 @@
 /**
- * @ppl/codecs/test — builders.ts: the generic codec-generation library
+ * @ppl/codecs/test — buildCodec (engine/resolver.ts): the generic
+ * codec-generation driver
  *
  * Unit-level coverage per semantic-type kind, plus the two things that make
  * this a *library* rather than a one-off: memoizing shared types to one
@@ -16,7 +17,7 @@ import type { SemanticType, UnitPattern } from "@ppl/core"
 import { struct, union, unit, u8, u16, i8, i16, i32, list, pUnit, buildTypeGraph } from "@ppl/core"
 import { ir, validateProgram, run } from "@ppl/machine"
 
-import { buildCodec } from "../src/engine/builders"
+import { buildCodec } from "../src/engine/resolver"
 import { createCodecExtension } from "../src/engine/codec-extension"
 import type { CodecRule } from "../src/engine/resolver"
 import { codecRule } from "../src/engine/resolver"
@@ -122,7 +123,7 @@ describe("buildCodec — structs: field order, sharing, and union-tag hoisting",
         assert.equal(program.procedures.length, 2) // struct + one shared u8 codec
     })
 
-    test("a ≤4-variant union field is hoisted into a shared leading bitmap, not its own tag byte", () =>
+    test("a ≤128-variant union field is hoisted into a shared leading bitmap, not its own tag byte", () =>
     {
         const flag = union({ on: unit, off: unit }) // 2 variants -> 1 bit
         const t = struct({ flag, value: u8 })
@@ -136,15 +137,42 @@ describe("buildCodec — structs: field order, sharing, and union-tag hoisting",
         assert.deepEqual(decoded, { flag: { variant: "off", value: undefined }, value: 7 })
     })
 
-    test("a >4-variant union field falls back to a standalone (non-hoisted) union codec", () =>
+    test("a >128-variant union field falls back to a standalone (non-hoisted) union codec", () =>
     {
-        const big = union({ a: unit, b: unit, c: unit, d: unit, e: unit }) // 5 variants
+        // 129 variants -> would need 8 bits, one more than a standalone tag
+        // byte itself costs, so hoisting stops paying for itself right here
+        // (HOIST_MAX_VARIANTS's own break-even point vs. a 1-byte tag).
+        const big = union(Object.fromEntries(Array.from({ length: 129 }, (_, i) => [`v${i}`, unit])))
         const t = struct({ big, tail: u8 })
 
         // Falls back to a full tag byte for `big`, same as a bare union root.
-        const { buffer, decoded } = roundTrip(t, { big: { variant: "c", value: undefined }, tail: 5 })
+        const { buffer, decoded } = roundTrip(t, { big: { variant: "v2", value: undefined }, tail: 5 })
         assert.deepEqual(buffer, [2, 5])
-        assert.deepEqual(decoded, { big: { variant: "c", value: undefined }, tail: 5 })
+        assert.deepEqual(decoded, { big: { variant: "v2", value: undefined }, tail: 5 })
+    })
+
+    test("an optional field modeled as union({empty: unit, value: T}) hoists its presence bit for free", () =>
+    {
+        // codec-extension.md §8.5's own worked example models optionality as
+        // `List<T>` of length 0/1 (`COUNT`-as-presence) — a shape this
+        // builder's hoisting pass doesn't special-case (a length-prefixed
+        // list always costs a whole `countPrefixWidth` byte, never a single
+        // bitmap bit). But hoisting was never List-specific to begin with:
+        // it fires for *any* hoistable union field, so modeling "optional"
+        // as a 2-variant union instead gets the same 1-bit wire economy
+        // §8.5 reaches for a dedicated presence bitmap to get, via the exact
+        // mechanism `flag` above already exercises — no new code needed.
+        const optionalU8 = union({ empty: unit, value: u8 })
+        const t = struct({ a: optionalU8, b: u8 })
+
+        // absent: bitmap bit 0 (variant "empty" = #0), no payload byte at all.
+        assert.deepEqual(roundTrip(t, { a: { variant: "empty", value: undefined }, b: 9 }).buffer, [0, 9])
+
+        // present: bitmap bit 1 (variant "value" = #1), then the payload's
+        // own delegated u8 codec — still no separate tag byte for `a` itself.
+        const { buffer, decoded } = roundTrip(t, { a: { variant: "value", value: 42 }, b: 9 })
+        assert.deepEqual(buffer, [1, 42, 9])
+        assert.deepEqual(decoded, { a: { variant: "value", value: 42 }, b: 9 })
     })
 
     test("multiple hoistable fields pack into the same bitmap byte", () =>
@@ -176,7 +204,7 @@ describe("buildCodec — extensibility and recursive types", () =>
         // byte instead, purely by being listed first; no change to
         // binary-rules.ts itself. Two rules, not one branching on
         // direction — same reasoning as binary-rules.ts's own split.
-        const markerUnitEncodeRule = codecRule<UnitPattern, void>(pUnit(), () => ir`255; write(0, 1); return;`)
+        const markerUnitEncodeRule = codecRule<UnitPattern, void>(pUnit(), () => ir`write(0, 1, 255); return;`)
         const markerUnitDecodeRule = codecRule<UnitPattern, void>(pUnit(), () => ir`read(0, 1); return;`)
 
         const { buffer } = roundTrip(unit, undefined, {

@@ -357,6 +357,30 @@ describe("Unary operators", () =>
     })
 })
 
+describe("Constant folding (rules.ts, \"fold:unary:-\")", () =>
+{
+    // A negative literal parses as `UnaryExpression("-", Literal(4))`, never
+    // a negative `Literal` directly (grammer.pegjs's `PrefixExpression`
+    // rule) — `fold:unary:-` collapses it back to a plain constant wherever
+    // a `pConst()`-typed position (an IMM_ACC operand, `trap`'s argument)
+    // needs to see through it, with no separate pre-pass.
+
+    test("negative literal as an immediate binary operand", () =>
+    {
+        assertReturn(`
+            u32 x = 5;
+            return x + -4;
+        `, 1)
+    })
+
+    test("negative literal as trap's compile-time-constant argument", () =>
+    {
+        const { ok, trapCode } = runDsl("trap(-1);")
+        assert.equal(ok, false)
+        assert.equal(trapCode, -1)
+    })
+})
+
 describe("Builtin calls (clz, revbits)", () =>
 {
     // isa-core.md §10.5 — `clz(x)`/`revbits(x)` are DSL-level built-ins with

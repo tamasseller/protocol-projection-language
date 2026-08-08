@@ -12,7 +12,8 @@
  */
 export * from "./engine/codec-extension"
 export * from "./engine/resolver"
-export * from "./engine/builders"
+export * from "./engine/validate-handles"
+export * from "./engine/opcodes"
 
 export * from "./components/binary-rules"
 export * from "./components/delta-leb128"

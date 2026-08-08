@@ -4,7 +4,7 @@
  * Proves each opcode in `EFFECTS` (codec-extension.ts) lowers correctly from
  * `ir\`...\`` builtin-call syntax via `codecRules()`, end to end through
  * `validateProgram`/`run` against the existing `createCodecExtension`
- * runtime — the DSL surface `builders.ts` (Phase 2b) is built on. Small,
+ * runtime — the DSL surface `buildCodec` (engine/resolver.ts) is built on. Small,
  * hand-authored fragments per opcode group, not the full generic builder;
  * that gets its own exhaustive coverage in `builders.test.ts`.
  */
@@ -21,8 +21,8 @@ import type { Handle, Direction } from "../src/engine/codec-extension"
 function numberCodec(direction: Direction, width: number)
 {
     return direction === "encode"
-        ? proc([], ir`load_val(0); write(0, ${width}); return;`)
-        : proc([], ir`read(0, ${width}); store_val(0); return;`)
+        ? proc([], ir`write(0, ${width}, load_val(0)); return;`)
+        : proc([], ir`store_val(0, read(0, ${width})); return;`)
 }
 
 function lower(entry: ReturnType<typeof proc>): RtlProgram
@@ -79,7 +79,7 @@ describe("codecRules(): count / open_list / enter_next / call_codec_next", () =>
             ? proc([], ir`
                 u32 left = 0;
                 left = count(0);
-                write(0, 1);
+                write(0, 1, left);
                 while (left != 0) { call_codec_next(${elem}, 0); left = left - 1; }
                 return;
               `)

@@ -14,12 +14,12 @@
  * Literal as a direct child of Binary — no intermediate reg-output RtlNode.
  */
 
-import type {BinaryOperator, UnaryOperator} from "./ast"
+import type {BinaryOperator, Literal, UnaryOperator} from "./ast"
 import type {EastPattern, MatchOf, CallPattern} from "./matcher"
-import {pLiteral, pIdentifier, pRtl, pBinary, pUnary, pAssign, pCall, pBuiltinCall} from "./matcher"
+import {pLiteral, pConst, pIdentifier, pRtl, pBinary, pUnary, pAssign, pCall, pBuiltinCall} from "./matcher"
 import type {ComboName, OutputLocation, Resource, RtlInstr, BinaryOpcode, UnaryOpcode, StackCombo} from "./rtl"
 import {CONST, PUSH, LOAD, STORE, opReg, opRegWriteback, opImm, opStack, bare, call, trap, outputHas} from "./rtl"
-import type {RtlNode} from "./east"
+import type {EastExpression, RtlNode} from "./east"
 import {nodeInvariants, pickBinaryOrder} from "./builders"
 import type {Extension} from "./extension"
 
@@ -39,13 +39,17 @@ export interface Rule
      */
     name: string
     pattern: EastPattern
-    build: (match: MatchOf<any>) => RtlNode | undefined
+    /** Usually builds an `RtlNode` (real code); a `fold:*` rule (below)
+     *  builds a plain `Literal` instead — both are `EastExpression`s, and
+     *  the orchestrator's `tileNode` treats them uniformly as tile
+     *  candidates for the same node. */
+    build: (match: MatchOf<any>) => EastExpression | undefined
 }
 
 export function rule<P extends EastPattern>(
     name: string,
     pattern: P,
-    build: (match: MatchOf<P>) => RtlNode | undefined,
+    build: (match: MatchOf<P>) => EastExpression | undefined,
 ): Rule
 {
     return {name, pattern, build: build as Rule["build"]}
@@ -95,7 +99,12 @@ export function leafNode(output: OutputLocation[], fragment: RtlInstr[], clobber
     return {type: "RtlNode", output, fragment, clobbers, tosDelta, maxStack}
 }
 
-function unaryNode(child: RtlNode, output: OutputLocation[], fragment: RtlInstr[]): RtlNode
+/** Exported for extensions (extension.ts's `Extension.rules`) — same reason
+ *  as `leafNode` above: a domain-specific opcode that consumes a real,
+ *  tiled sub-expression's value (rather than only literal operands) needs
+ *  to splice that child's own fragment in ahead of its instruction and
+ *  inherit its `clobbers`/`tosDelta`/`maxStack`, exactly this shape. */
+export function unaryNode(child: RtlNode, output: OutputLocation[], fragment: RtlInstr[]): RtlNode
 {
     return {type: "RtlNode", output, fragment, clobbers: [...child.clobbers], tosDelta: child.tosDelta, maxStack: child.maxStack}
 }
@@ -147,6 +156,31 @@ function leafRules(resolveLocal: (name: string) => number): Rule[]
     ]
 }
 
+// ── Constant folding ─────────────────────────────────────────────────────────
+//
+// Expressed as an ordinary Rule producing a `Literal` instead of an
+// `RtlNode` — matcher.ts's `"Const"` pattern case (`pConst()`) resolves a
+// non-literal shape through the same memoized `tile()` search used for real
+// code, so e.g. a codec builtin's `pConst()`-typed argument sees through
+// `-4` (`UnaryExpression("-", Literal(4))`) for free, with no separate
+// pre-pass. `pLiteral()` itself stays a plain structural check — see
+// `ConstPattern`'s doc comment (matcher.ts) for why the two can't be the
+// same pattern kind.
+//
+// Deliberately "-" only, not "~"/"+"/"!": nothing here needs them folded
+// yet, and test/rule-coverage.test.ts's gate requires every declared rule
+// to actually fire somewhere in the suite — an unused fold rule would just
+// be dead code the gate catches immediately.
+
+const literalOf = (value: number): Literal => ({type: "Literal", value, raw: String(value)})
+
+function foldRules(): Rule[]
+{
+    return [
+        rule("fold:unary:-", pUnary("-", pConst()), m => literalOf(-m.argumentMatch.value)),
+    ]
+}
+
 // ── Unary rules ─────────────────────────────────────────────────────────────
 
 function unaryRules(): Rule[]
@@ -195,11 +229,12 @@ const BUILTIN_UNARY_CALLS: readonly {name: string; isa: UnaryOpcode}[] = [
  * `trap(code)` → `TRAP #code`. Unlike the unary built-ins, `code` isn't a
  * general expression tiled to a register location — it's encoded straight
  * into the instruction's own immediate, so the pattern demands the
- * argument literally *be* a `Literal` AST node (`pLiteral()`) rather than
- * tiling it to any output tag at all. There's no addressing-mode choice to
- * make (one literal, one fixed encoding), so unlike every other rule here
- * this one never competes against an alternative — it's the only match for
- * `trap(<literal>)` shape, full stop. `trap` is also, uniquely among these
+ * argument be a compile-time constant (`pConst()`, so e.g. `trap(-1)`
+ * still works) rather than tiling it to any output tag at all. There's no
+ * addressing-mode choice to make (one literal, one fixed encoding), so
+ * unlike every other rule here this one never competes against an
+ * alternative — it's the only match for `trap(<const>)` shape, full stop.
+ * `trap` is also, uniquely among these
  * three, a terminator (isa-core.md §4.5): `alwaysTerminates` (lower.ts)
  * special-cases a `trap(...)` statement the same way it does `return`, so
  * a block ending in one doesn't get a spurious `BLOCK_END` appended after
@@ -213,7 +248,7 @@ function builtinCallRules(): Rule[]
                 unaryNode(m.argumentMatches[0].node, ["acc"],
                     [...m.argumentMatches[0].node.fragment, bare(isa)]))),
 
-        rule("builtin:trap", pBuiltinCall("trap", pLiteral()), m =>
+        rule("builtin:trap", pBuiltinCall("trap", pConst()), m =>
             leafNode(["acc"], [trap(m.argumentMatches[0].value)], [], 0, 0)),
     ]
 }
@@ -271,20 +306,21 @@ function regOperandRules(astOp: BinaryOperator, isaOp: BinaryOpcode, flipped: bo
 }
 
 /**
- * IMM_ACC: operand is a Literal consumed via two-level pattern. Two output
- * variants (acc, tos). There is deliberately no register-writeback variant
- * here: the immediate addressing mode always forces its result to acc
- * (isa-core.md §3) — there is no combo that both applies an immediate and
- * writes back to a register in one instruction. `x += 1`-shaped expressions
- * get their one-instruction form a different way: reformulated via
- * commutativity as `1 + x` (an already-tiled acc value combined with a
+ * IMM_ACC: operand is a compile-time constant consumed via two-level
+ * pattern (`pConst()`, so e.g. `x + -4` still folds the operand). Two
+ * output variants (acc, tos). There is deliberately no register-writeback
+ * variant here: the immediate addressing mode always forces its result to
+ * acc (isa-core.md §3) — there is no combo that both applies an immediate
+ * and writes back to a register in one instruction. `x += 1`-shaped
+ * expressions get their one-instruction form a different way: reformulated
+ * via commutativity as `1 + x` (an already-tiled acc value combined with a
  * *register* operand), which is regOperandRules' REG_REG variant, above.
  */
 function immOperandRules(astOp: BinaryOperator, isaOp: BinaryOpcode, flipped: boolean): Rule[]
 {
     const pattern = flipped
-        ? pBinary(astOp, pLiteral(), pRtl("acc"))
-        : pBinary(astOp, pRtl("acc"), pLiteral())
+        ? pBinary(astOp, pConst(), pRtl("acc"))
+        : pBinary(astOp, pRtl("acc"), pConst())
 
     const variants: {loc: OutputLocation; extra: RtlInstr[]; extraTos: number; extraMax: number}[] = [
         {loc: "acc", extra: [], extraTos: 0, extraMax: 0},
@@ -482,6 +518,7 @@ export const ruleset = (
     resolveCallee: (name: string) => number | undefined,
     extension?: Extension,
 ) => [
+    ...foldRules(),
     ...leafRules(resolveLocal),
     ...unaryRules(),
     ...builtinCallRules(),

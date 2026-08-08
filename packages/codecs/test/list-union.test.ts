@@ -4,8 +4,8 @@
  * Hand-built `RtlProgram`s, same style as struct-encoder.test.ts, isolating
  * the new opcodes (`COUNT`/`OPEN_LIST`/`ENTER_NEXT`/`CALL_CODEC_NEXT` for
  * lists, `TAG`/`CALL_CODEC`'s union branch for unions) from
- * `builders.ts`'s generic codec-generation logic — a bug here is an opcode
- * bug, not a builder bug.
+ * `buildCodec`'s (engine/resolver.ts) generic codec-generation logic — a
+ * bug here is an opcode bug, not a builder bug.
  */
 
 import { describe, test } from "node:test"

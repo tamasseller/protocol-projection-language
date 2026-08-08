@@ -12,24 +12,40 @@ import type {
     BinaryOperator,
     UnaryOperator,
 } from "./ast"
-import {
-    EastExpression,
-    isEastAssign,
-    isEastBinary,
-    isEastCall,
-    isEastUnary,
-    isIdentifier,
-    isLiteral,
-    isRtlNode,
-    RtlNode,
-} from "./east"
-import { outputHas } from "./rtl"
-import type { OutputLocation } from "./rtl"
+import
+    {
+        EastExpression,
+        isEastAssign,
+        isEastBinary,
+        isEastCall,
+        isEastUnary,
+        isIdentifier,
+        isLiteral,
+        isRtlNode,
+        RtlNode,
+    } from "./east"
+import {outputHas} from "./rtl"
+import type {OutputLocation} from "./rtl"
 
 // 1. Pattern interfaces
 
-export interface LiteralPattern { kind: "Literal" }
-export interface IdentifierPattern { kind: "Identifier" }
+export interface LiteralPattern {kind: "Literal"}
+export interface IdentifierPattern {kind: "Identifier"}
+
+/**
+ * Like `LiteralPattern`, but also matches a constant-foldable shape (e.g.
+ * `-4`, a `UnaryExpression` over a `Literal` — rules.ts's `fold:*` rules)
+ * by consulting `tile()`, not just a bare AST `Literal` node. Only ever
+ * valid as a *nested* child pattern (an argument inside `pUnary`/`pBinary`/
+ * `pBuiltinCall`), never as a whole rule's own top-level pattern: at the
+ * top level `N` passed to `matchAllEast` *is* the exact node the enclosing
+ * `tileNode` call is currently computing, so consulting `tile(N)` there
+ * would recurse into that same in-progress computation before its memo
+ * entry exists. `literal:acc`/`literal:tos` (rules.ts) are the "is this
+ * node itself a bare literal" rules and correctly use plain
+ * `LiteralPattern` instead — see matchAllEast's `"Const"` case.
+ */
+export interface ConstPattern {kind: "Const"}
 
 export interface RtlPattern
 {
@@ -72,7 +88,7 @@ export interface AssignPattern<V extends EastPattern = EastPattern>
  * per-arg sub-patterns; the match just verifies the shape, and the builder
  * receives the RtlNode[] array.
  */
-export interface CallPattern { kind: "Call" }
+export interface CallPattern {kind: "Call"}
 
 /**
  * Builtin-call pattern: `name(arg0, arg1, ...)` — the DSL's function-call-
@@ -82,33 +98,35 @@ export interface CallPattern { kind: "Call" }
  * own sub-pattern (like `UnaryPattern`'s `argument`) rather than always
  * tiled to a fixed tag the way `CallPattern`'s arguments always go to
  * `"tos"` — `clz`/`revbits` want `pRtl("acc")` (tile the argument, demand it
- * land in `acc`), `trap` wants `pLiteral()` (the argument must itself be a
- * compile-time literal, since it's encoded directly into `TRAP #code`'s
- * immediate, not computed at runtime).
+ * land in `acc`), `trap` wants `pConst()` (the argument must be a compile-
+ * time constant, since it's encoded directly into `TRAP #code`'s immediate,
+ * not computed at runtime).
  *
- * `variadicTail`, when set, lets a builtin take a fixed literal-operand
- * prefix (the positional `arguments` above) plus a variable number of real
- * runtime-value arguments after it — an extension's call-shaped op (e.g.
- * the codec extension's `CALL_CODEC`, docs/codec-extension.md §3.3, §4)
- * needs exactly this shape: literal operands selecting *what* to call,
- * followed by the ordinary value arguments being passed to it. The tail is
- * tiled exactly like `CallPattern`'s own arguments (all but the last to
- * `"tos"`, the last to `"acc"`) rather than against a sub-pattern of its
- * own, since there's no fixed count of them to have individual patterns for.
+ * `tailPattern`, when set, lets a builtin take a fixed positional prefix
+ * (`arguments` above) plus a true variadic tail — zero or more further
+ * arguments, each matched against this *same* pattern (there's no fixed
+ * count of them to give individual positions to, unlike `arguments`). An
+ * extension's call-shaped op (e.g. the codec extension's `CALL_CODEC`,
+ * docs/codec-extension.md §3.3, §4) needs exactly this shape: fixed
+ * operands selecting *what* to call, followed by however many real
+ * runtime-value arguments the call site actually passes it. See `pTail`.
  */
-export interface BuiltinCallPattern<A extends readonly EastPattern[] = readonly EastPattern[]>
+export interface BuiltinCallPattern<
+    A extends readonly EastPattern[] = readonly EastPattern[],
+    T extends EastPattern | undefined = EastPattern | undefined,
+>
 {
     kind: "BuiltinCall"
     name: string
     arguments: A
-    variadicTail?: boolean
+    tailPattern?: T
 }
 
 // 2. Match interfaces
 
-export interface LiteralMatch { kind: "Literal"; value: number }
-export interface IdentifierMatch { kind: "Identifier"; name: string }
-export interface RtlMatch { kind: "Rtl"; node: RtlNode }
+export interface LiteralMatch {kind: "Literal"; value: number}
+export interface IdentifierMatch {kind: "Identifier"; name: string}
+export interface RtlMatch {kind: "Rtl"; node: RtlNode}
 
 export interface BinaryMatch<
     LM extends EastMatch = EastMatch,
@@ -143,20 +161,22 @@ export interface CallMatch
     argNodes: RtlNode[]
 }
 
-export interface BuiltinCallMatch<AM extends readonly EastMatch[] = readonly EastMatch[]>
+export interface BuiltinCallMatch<AM extends readonly EastMatch[] = readonly EastMatch[], TM extends EastMatch = EastMatch>
 {
     kind: "BuiltinCall"
     argumentMatches: AM
-    /** Present (possibly empty) exactly when the pattern set `variadicTail`
-     *  — one already-tiled `RtlNode` per trailing runtime argument, in the
-     *  same last-arg-in-acc/rest-in-tos shape `CallMatch.argNodes` uses. */
-    tailNodes?: readonly RtlNode[]
+    /** One match per variadic trailing call-argument, each already matched
+     *  (recursively, via `matchAllEast`) against the pattern's own
+     *  `tailPattern` — present (possibly empty) exactly when the pattern
+     *  declared one (`pTail`). */
+    tailMatches?: readonly TM[]
 }
 
 // 3. Union types
 
 export type EastPattern =
     | LiteralPattern
+    | ConstPattern
     | IdentifierPattern
     | RtlPattern
     | BinaryPattern
@@ -178,26 +198,28 @@ export type EastMatch =
 // 4. MatchOf<P> — pattern → match mapping (recursively maps child sub-patterns)
 
 export type MatchOf<P extends EastPattern> =
-    P extends LiteralPattern        ? LiteralMatch
-  : P extends IdentifierPattern    ? IdentifierMatch
-  : P extends RtlPattern           ? RtlMatch
-  : P extends BinaryPattern<infer L, infer R>
-      ? BinaryMatch<MatchOf<L>, MatchOf<R>>
-  : P extends UnaryPattern<infer A>
-      ? UnaryMatch<MatchOf<A>>
-  : P extends AssignPattern<infer V>
-      ? AssignMatch<MatchOf<V>>
-  : P extends CallPattern          ? CallMatch
-  : P extends BuiltinCallPattern<infer A>
-      ? BuiltinCallMatch<MatchOfTuple<A>>
-  : never
+    P extends LiteralPattern ? LiteralMatch
+    : P extends ConstPattern ? LiteralMatch
+    : P extends IdentifierPattern ? IdentifierMatch
+    : P extends RtlPattern ? RtlMatch
+    : P extends BinaryPattern<infer L, infer R>
+    ? BinaryMatch<MatchOf<L>, MatchOf<R>>
+    : P extends UnaryPattern<infer A>
+    ? UnaryMatch<MatchOf<A>>
+    : P extends AssignPattern<infer V>
+    ? AssignMatch<MatchOf<V>>
+    : P extends CallPattern ? CallMatch
+    : P extends BuiltinCallPattern<infer A, infer T>
+    ? BuiltinCallMatch<MatchOfTuple<A>, T extends EastPattern ? MatchOf<T> : never>
+    : never
 
 /** Maps each pattern in a fixed-length tuple to its `MatchOf`, preserving
- *  tuple position — what lets e.g. `pBuiltinCall(name, pLiteral())`'s match
- *  type `argumentMatches[0]` narrow to a `LiteralMatch` directly, the same
- *  way a single `argument: A` field used to. */
+ *  tuple position — what lets e.g. `pBuiltinCall("write", pConst(),
+ *  pConst(), pRtl("acc"))`'s match type narrow `argumentMatches` to
+ *  exactly `[LiteralMatch, LiteralMatch, RtlMatch]`, each position its own
+ *  real type, not a widened union array. */
 type MatchOfTuple<T extends readonly EastPattern[]> =
-    { readonly [K in keyof T]: T[K] extends EastPattern ? MatchOf<T[K]> : never }
+    {readonly [K in keyof T]: T[K] extends EastPattern ? MatchOf<T[K]> : never}
 
 // 5. matchAllEast — single dispatcher, inlines all per-kind matching
 //
@@ -223,163 +245,216 @@ type MatchOfTuple<T extends readonly EastPattern[]> =
 export function matchAllEast<P extends EastPattern>(
     N: EastExpression,
     P: P,
-    tile: (node: EastExpression) => readonly RtlNode[],
+    tile: (node: EastExpression) => readonly EastExpression[],
 ): MatchOf<P>[]
 {
-    switch (P.kind)
+    switch(P.kind)
     {
         case "Literal":
             return isLiteral(N)
-                ? [{ kind: "Literal", value: N.value } as MatchOf<P>]
+                ? [{kind: "Literal", value: N.value} as MatchOf<P>]
                 : []
+
+        case "Const":
+            {
+                // See `ConstPattern`'s doc comment for why this — unlike
+                // "Literal" — is safe to fall through to `tile()`: a `Const`
+                // pattern is never a whole rule's own top-level pattern, so
+                // `N` here is always a genuine child of whatever node the
+                // enclosing `tileNode` call is computing, never that same node.
+                if(isLiteral(N)) return [{kind: "Literal", value: N.value} as MatchOf<P>]
+                const values = new Set(tile(N).filter(isLiteral).map(c => c.value))
+                return [...values].map(value => ({kind: "Literal", value} as MatchOf<P>))
+            }
 
         case "Identifier":
             return isIdentifier(N)
-                ? [{ kind: "Identifier", name: N.name } as MatchOf<P>]
+                ? [{kind: "Identifier", name: N.name} as MatchOf<P>]
                 : []
 
         case "Rtl":
-        {
-            const candidates = tile(N)
-            const filtered = P.output === undefined
-                ? candidates
-                : candidates.filter(c => outputHas(c.output, P.output!))
-            return filtered.map(node => ({ kind: "Rtl", node } as MatchOf<P>))
-        }
+            {
+                const candidates = tile(N).filter(isRtlNode)
+                const filtered = P.output === undefined
+                    ? candidates
+                    : candidates.filter(c => outputHas(c.output, P.output!))
+                return filtered.map(node => ({kind: "Rtl", node} as MatchOf<P>))
+            }
 
         case "Binary":
-        {
-            if (!isEastBinary(N)) return []
-            if (N.operator !== P.operator) return []
-            const leftMatches = matchAllEast(N.left, P.left, tile)
-            if (leftMatches.length === 0) return []
-            const rightMatches = matchAllEast(N.right, P.right, tile)
-            if (rightMatches.length === 0) return []
-            const out: MatchOf<P>[] = []
-            for (const leftMatch of leftMatches)
-                for (const rightMatch of rightMatches)
-                    out.push({ kind: "Binary", operator: N.operator, leftMatch, rightMatch } as MatchOf<P>)
-            return out
-        }
+            {
+                if(!isEastBinary(N)) return []
+                if(N.operator !== P.operator) return []
+                const leftMatches = matchAllEast(N.left, P.left, tile)
+                if(leftMatches.length === 0) return []
+                const rightMatches = matchAllEast(N.right, P.right, tile)
+                if(rightMatches.length === 0) return []
+                const out: MatchOf<P>[] = []
+                for(const leftMatch of leftMatches)
+                    for(const rightMatch of rightMatches)
+                        out.push({kind: "Binary", operator: N.operator, leftMatch, rightMatch} as MatchOf<P>)
+                return out
+            }
 
         case "Unary":
-        {
-            if (!isEastUnary(N)) return []
-            if (N.operator !== P.operator) return []
-            return matchAllEast(N.argument, P.argument, tile)
-                .map(argumentMatch => ({ kind: "Unary", operator: N.operator, argumentMatch } as MatchOf<P>))
-        }
+            {
+                if(!isEastUnary(N)) return []
+                if(N.operator !== P.operator) return []
+                return matchAllEast(N.argument, P.argument, tile)
+                    .map(argumentMatch => ({kind: "Unary", operator: N.operator, argumentMatch} as MatchOf<P>))
+            }
 
         case "Assign":
-        {
-            if (!isEastAssign(N)) return []
-            if (N.operator !== P.operator) return []
-            // left is always an Identifier per the EAST type
-            if (N.left.type !== "Identifier") return []
-            return matchAllEast(N.right, P.right, tile)
-                .map(rightMatch => ({ kind: "Assign", operator: N.operator, target: N.left.name, rightMatch } as MatchOf<P>))
-        }
+            {
+                if(!isEastAssign(N)) return []
+                if(N.operator !== P.operator) return []
+                // left is always an Identifier per the EAST type
+                if(N.left.type !== "Identifier") return []
+                return matchAllEast(N.right, P.right, tile)
+                    .map(rightMatch => ({kind: "Assign", operator: N.operator, target: N.left.name, rightMatch} as MatchOf<P>))
+            }
 
         case "Call":
-        {
-            if (!isEastCall(N)) return []
-            // callee is always an Identifier per the EAST type
-            if (N.callee.type !== "Identifier") return []
-            // Every argument but the last must tile to a `"tos"` candidate
-            // (pushed, in order); the last tiles to `"acc"` instead (the
-            // calling convention's last-arg-in-acc rule — CallPattern's doc
-            // comment). The match set is the cross product across all slots.
-            const last = N.arguments.length - 1
-            const perArg = N.arguments.map((arg, i) =>
-                tile(arg).filter(c => outputHas(c.output, i === last ? "acc" : "tos")))
-            if (perArg.some(cands => cands.length === 0)) return []
-            let combos: RtlNode[][] = [[]]
-            for (const cands of perArg)
-                combos = combos.flatMap(prefix => cands.map(c => [...prefix, c]))
-            return combos.map(argNodes => ({ kind: "Call", callee: N.callee.name, argNodes } as MatchOf<P>))
-        }
+            {
+                if(!isEastCall(N)) return []
+                // callee is always an Identifier per the EAST type
+                if(N.callee.type !== "Identifier") return []
+                // Every argument but the last must tile to a `"tos"` candidate
+                // (pushed, in order); the last tiles to `"acc"` instead (the
+                // calling convention's last-arg-in-acc rule — CallPattern's doc
+                // comment). The match set is the cross product across all slots.
+                const last = N.arguments.length - 1
+                const perArg = N.arguments.map((arg, i) =>
+                    tile(arg).filter(isRtlNode).filter(c => outputHas(c.output, i === last ? "acc" : "tos")))
+                if(perArg.some(cands => cands.length === 0)) return []
+                let combos: RtlNode[][] = [[]]
+                for(const cands of perArg)
+                    combos = combos.flatMap(prefix => cands.map(c => [...prefix, c]))
+                return combos.map(argNodes => ({kind: "Call", callee: N.callee.name, argNodes} as MatchOf<P>))
+            }
 
         case "BuiltinCall":
-        {
-            if (!isEastCall(N)) return []
-            if (N.callee.type !== "Identifier" || N.callee.name !== P.name) return []
-            const fixedCount = P.arguments.length
-            if (P.variadicTail ? N.arguments.length < fixedCount : N.arguments.length !== fixedCount)
-                return []
+            {
+                if(!isEastCall(N)) return []
+                if(N.callee.type !== "Identifier" || N.callee.name !== P.name) return []
+                const fixedCount = P.arguments.length
+                if(P.tailPattern === undefined ? N.arguments.length !== fixedCount : N.arguments.length < fixedCount)
+                    return []
 
-            // Fixed positional prefix, matched by sub-pattern (cross product
-            // across positions) — mirrors "Binary"'s left/right combination.
-            const perFixed = P.arguments.map((pat, i) => matchAllEast(N.arguments[i]!, pat, tile))
-            if (perFixed.some(cands => cands.length === 0)) return []
-            let fixedCombos: EastMatch[][] = [[]]
-            for (const cands of perFixed)
-                fixedCombos = fixedCombos.flatMap(prefix => cands.map(c => [...prefix, c]))
+                // Fixed positional prefix, matched by sub-pattern (cross product
+                // across positions) — mirrors "Binary"'s left/right combination.
+                const perFixed = P.arguments.map((pat, i) => matchAllEast(N.arguments[i]!, pat, tile))
+                if(perFixed.some(cands => cands.length === 0)) return []
+                let fixedCombos: EastMatch[][] = [[]]
+                for(const cands of perFixed)
+                    fixedCombos = fixedCombos.flatMap(prefix => cands.map(c => [...prefix, c]))
 
-            if (!P.variadicTail)
-                return fixedCombos.map(argumentMatches =>
-                    ({ kind: "BuiltinCall", argumentMatches } as unknown as MatchOf<P>))
+                if(P.tailPattern === undefined)
+                    return fixedCombos.map(argumentMatches =>
+                        ({kind: "BuiltinCall", argumentMatches} as unknown as MatchOf<P>))
 
-            // Variadic tail: remaining arguments tile exactly like a real
-            // call's own calling convention ("Call", above) — all but the
-            // last to "tos", the last to "acc".
-            const tailArgs = N.arguments.slice(fixedCount)
-            const lastTail = tailArgs.length - 1
-            const perTail = tailArgs.map((arg, i) =>
-                tile(arg).filter(c => outputHas(c.output, i === lastTail ? "acc" : "tos")))
-            if (perTail.some(cands => cands.length === 0)) return []
-            let tailCombos: RtlNode[][] = [[]]
-            for (const cands of perTail)
-                tailCombos = tailCombos.flatMap(prefix => cands.map(c => [...prefix, c]))
+                // Variadic tail: every argument past the fixed prefix is matched
+                // against the *same* `tailPattern` — the identical recursive
+                // `matchAllEast` call a fixed position uses, just repeated for
+                // however many trailing arguments this call site actually has
+                // (there's no fixed count to give each one its own position).
+                const tailArgs = N.arguments.slice(fixedCount)
+                const perTail = tailArgs.map(arg => matchAllEast(arg, P.tailPattern!, tile))
+                if(perTail.some(cands => cands.length === 0)) return []
+                let tailCombos: EastMatch[][] = [[]]
+                for(const cands of perTail)
+                    tailCombos = tailCombos.flatMap(prefix => cands.map(c => [...prefix, c]))
 
-            const out: MatchOf<P>[] = []
-            for (const argumentMatches of fixedCombos)
-                for (const tailNodes of tailCombos)
-                    out.push({ kind: "BuiltinCall", argumentMatches, tailNodes } as unknown as MatchOf<P>)
-            return out
-        }
+                const out: MatchOf<P>[] = []
+                for(const argumentMatches of fixedCombos)
+                    for(const tailMatches of tailCombos)
+                        out.push({kind: "BuiltinCall", argumentMatches, tailMatches} as unknown as MatchOf<P>)
+                return out
+            }
     }
 }
 
 // 6. Pattern constructors
 
-export const pLiteral = (): LiteralPattern => ({ kind: "Literal" })
-export const pIdentifier = (): IdentifierPattern => ({ kind: "Identifier" })
+export const pLiteral = (): LiteralPattern => ({kind: "Literal"})
+export const pConst = (): ConstPattern => ({kind: "Const"})
+export const pIdentifier = (): IdentifierPattern => ({kind: "Identifier"})
 
 export const pRtl = (output?: OutputLocation): RtlPattern =>
-    ({ kind: "Rtl", output })
+    ({kind: "Rtl", output})
 
 export const pBinary = <L extends EastPattern, R extends EastPattern>(
     operator: BinaryOperator,
     left: L,
     right: R,
 ): BinaryPattern<L, R> =>
-    ({ kind: "Binary", operator, left, right })
+    ({kind: "Binary", operator, left, right})
 
 export const pUnary = <A extends EastPattern>(
     operator: UnaryOperator,
     argument: A,
 ): UnaryPattern<A> =>
-    ({ kind: "Unary", operator, argument })
+    ({kind: "Unary", operator, argument})
 
 export const pAssign = <V extends EastPattern>(
     operator: AssignmentOperator,
     right: V,
 ): AssignPattern<V> =>
-    ({ kind: "Assign", operator, right })
+    ({kind: "Assign", operator, right})
 
-export const pCall = (): CallPattern => ({ kind: "Call" })
+export const pCall = (): CallPattern => ({kind: "Call"})
 
-/** The 1-ary case — `clz(x)`/`revbits(x)`/`trap(code)`'s own shape. */
-export const pBuiltinCall = <A extends EastPattern>(name: string, argument: A): BuiltinCallPattern<readonly [A]> =>
-    ({ kind: "BuiltinCall", name, arguments: [argument] })
+/**
+ * Wraps a pattern as `pBuiltinCall`'s trailing variadic-tail marker: when
+ * the last rest argument to `pBuiltinCall` is a `TailPattern`, everything
+ * before it is the fixed positional prefix and `pattern` applies,
+ * uniformly, to every further call argument — however many there turn out
+ * to be (see `BuiltinCallPattern.tailPattern`). Deliberately not itself an
+ * `EastPattern` — it only ever means anything as `pBuiltinCall`'s own last
+ * argument, never nested inside another pattern — so a call whose last
+ * argument *isn't* one can never be mistaken for declaring a tail.
+ */
+export interface TailPattern<P extends EastPattern = EastPattern>
+{
+    kind: "Tail"
+    pattern: P
+}
 
-/** The general N-ary case, with an optional variadic runtime-value tail —
- *  what a call-shaped extension op (e.g. `CALL_CODEC`) needs: a fixed
- *  literal-operand prefix, matched positionally, plus zero or more real
- *  arguments tiled by the ordinary calling convention. */
-export const pBuiltinCallN = <A extends readonly EastPattern[]>(
-    name: string,
-    args: A,
-    opts?: { variadicTail?: boolean },
-): BuiltinCallPattern<A> =>
-    ({ kind: "BuiltinCall", name, arguments: args, variadicTail: opts?.variadicTail })
+export const pTail = <P extends EastPattern>(pattern: P): TailPattern<P> =>
+    ({kind: "Tail", pattern})
+
+const isTailPattern = (v: EastPattern | TailPattern): v is TailPattern => v.kind === "Tail"
+
+/**
+ * `name(arg0, arg1, ...)` — the DSL's function-call-like syntax for a
+ * fixed-lowering built-in (isa-core.md §10.5, e.g. `clz(x)`, `revbits(x)`,
+ * `trap(code)`), distinct from `pCall`'s real-procedure-call shape. Each
+ * fixed argument is a plain rest parameter — `A` is inferred as a genuine
+ * positional tuple straight from the call site itself (no array-literal
+ * wrapper needed for the N-ary case, no manual cast at the use site to
+ * recover per-position types the way splicing a same-typed array into a
+ * single non-rest parameter would lose them): `pBuiltinCall("write",
+ * pConst(), pConst(), pRtl("acc"))`'s match narrows `argumentMatches`
+ * to exactly `[LiteralMatch, LiteralMatch, RtlMatch]`, each position its
+ * own real type. The 1-ary case (`clz`/`revbits`/`trap`) is just the same
+ * call with one rest argument — no separate constructor needed for it.
+ *
+ * An optional trailing `pTail(pattern)` (the second overload) adds a true
+ * variadic tail on top of the fixed prefix — zero or more further
+ * arguments, all matched against the one `pattern` — for a call-shaped
+ * extension op that can carry a variable number of real runtime-value
+ * arguments after its fixed operands (e.g. the codec extension's
+ * `CALL_CODEC`, docs/codec-extension.md §3.3, §4: `codec_idx, src, ref,
+ * [args…]`). Overload resolution, not a runtime flag, picks this shape:
+ * `TailPattern` isn't an `EastPattern`, so a call whose last argument isn't
+ * one only ever matches the first, tail-less overload.
+ */
+export function pBuiltinCall<A extends readonly EastPattern[]>(name: string, ...fixed: A): BuiltinCallPattern<A, undefined>
+export function pBuiltinCall<A extends readonly EastPattern[], T extends EastPattern>(name: string, ...fixedAndTail: [...A, TailPattern<T>]): BuiltinCallPattern<A, T>
+export function pBuiltinCall(name: string, ...args: readonly (EastPattern | TailPattern)[]): BuiltinCallPattern
+{
+    const last = args[args.length - 1]
+    if(last !== undefined && isTailPattern(last))
+        return {kind: "BuiltinCall", name, arguments: args.slice(0, -1) as readonly EastPattern[], tailPattern: last.pattern}
+    return {kind: "BuiltinCall", name, arguments: args as readonly EastPattern[]}
+}

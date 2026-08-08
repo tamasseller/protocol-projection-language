@@ -27,7 +27,7 @@ import type { Rule } from "./rules"
 import { matchAllEast } from "./matcher"
 import type { EastMatch } from "./matcher"
 import type { EastExpression, RtlNode } from "./east"
-import { isRtlNode } from "./east"
+import { isRtlNode, isLiteral } from "./east"
 import type { OutputLocation } from "./rtl"
 import { outputHas } from "./rtl"
 import {instrBytes} from "./encoding"
@@ -46,7 +46,7 @@ function collectRtlNodes(m: EastMatch): RtlNode[]
         case "Unary": return collectRtlNodes(m.argumentMatch)
         case "Assign": return collectRtlNodes(m.rightMatch)
         case "Call": return m.argNodes
-        case "BuiltinCall": return [...m.argumentMatches.flatMap(collectRtlNodes), ...(m.tailNodes ?? [])]
+        case "BuiltinCall": return [...m.argumentMatches.flatMap(collectRtlNodes), ...(m.tailMatches ?? []).flatMap(collectRtlNodes)]
         default: return [] // Literal, Identifier — no RTL children
     }
 }
@@ -96,10 +96,21 @@ function dominates(b: RtlNode, a: RtlNode): boolean
  * selection (BURS-style instruction selection) relies on. See
  * docs/ir-engine.md.
  */
-function pruneToFrontier(candidates: RtlNode[]): RtlNode[]
+/**
+ * `candidates` may now mix real `RtlNode` tilings with `fold:*`-produced
+ * `Literal`s (rules.ts) — the two aren't comparable (a folded constant has
+ * no fragment/clobbers/maxStack to prune on) so they're handled separately:
+ * the existing cost frontier runs over the `RtlNode`s only, and folded
+ * candidates are just deduped by value (at most one distinct value can ever
+ * apply per node — there's no cost dimension to break a tie on).
+ */
+function pruneToFrontier(candidates: EastExpression[]): EastExpression[]
 {
+    const rtlCandidates = candidates.filter(isRtlNode)
+    const foldedCandidates = candidates.filter(c => !isRtlNode(c))
+
     const groups = new Map<string, RtlNode[]>()
-    for (const c of candidates)
+    for (const c of rtlCandidates)
     {
         const key = JSON.stringify(c.output)
         const group = groups.get(key)
@@ -107,7 +118,7 @@ function pruneToFrontier(candidates: RtlNode[]): RtlNode[]
         else groups.set(key, [c])
     }
 
-    const kept: RtlNode[] = []
+    const kept: EastExpression[] = []
     for (const group of groups.values())
     {
         const byCostPoint = new Map<string, RtlNode>()
@@ -121,6 +132,15 @@ function pruneToFrontier(candidates: RtlNode[]): RtlNode[]
             if (!reps.some(b => b !== a && dominates(b, a)))
                 kept.push(a)
     }
+
+    const seenValues = new Set<number>()
+    for (const c of foldedCandidates)
+    {
+        if (!isLiteral(c) || seenValues.has(c.value)) continue
+        seenValues.add(c.value)
+        kept.push(c)
+    }
+
     return kept
 }
 
@@ -138,14 +158,14 @@ function pruneToFrontier(candidates: RtlNode[]): RtlNode[]
  * see `pruneToFrontier`. This means `tileNode`/`tileExpr` no longer return
  * *every* structurally-realizable tiling, only the cost-relevant ones.
  */
-function tileNode(node: EastExpression, rules: readonly Rule[], memo: WeakMap<EastExpression, RtlNode[]>): RtlNode[]
+function tileNode(node: EastExpression, rules: readonly Rule[], memo: WeakMap<EastExpression, EastExpression[]>): EastExpression[]
 {
     if (isRtlNode(node)) return [node]
 
     const cached = memo.get(node)
     if (cached) return cached
 
-    const results: RtlNode[] = []
+    const results: EastExpression[] = []
     const tile = (n: EastExpression) => tileNode(n, rules, memo)
 
     for (const r of rules)
@@ -158,6 +178,12 @@ function tileNode(node: EastExpression, rules: readonly Rule[], memo: WeakMap<Ea
 
             const inherited = collectRtlNodes(m).flatMap(c => [...(nodeRuleNames.get(c) ?? [])])
             nodeRuleNames.set(built, new Set([r.name, ...inherited]))
+
+            // A `fold:*` rule (rules.ts) has no cost-based "winner" the way
+            // an RtlNode does — it either applies or it doesn't, so its
+            // coverage is recorded the moment it successfully builds, not
+            // via `pickCheapest`'s later selection (touchedRuleNames below).
+            if (!isRtlNode(built)) touchedRuleNames.add(r.name)
 
             results.push(built)
         }
@@ -176,12 +202,13 @@ function tileNode(node: EastExpression, rules: readonly Rule[], memo: WeakMap<Ea
 // conceptual rule never has stable object identity across calls. The name
 // does, by construction.
 
-/** Which rule(s) — transitively, including children — built each RtlNode
- *  ever produced by `tileExpr`. Process-wide (not per-call): a WeakMap costs
+/** Which rule(s) — transitively, including children — built each tile
+ *  candidate (`RtlNode` or `fold:*`'s `Literal`) ever produced by `tileNode`.
+ *  Process-wide (not per-call): a WeakMap costs
  *  nothing once a node is unreferenced, and sharing it is what lets
  *  `touchedRuleNames` below accumulate across the whole test suite rather
  *  than one call at a time. */
-const nodeRuleNames = new WeakMap<RtlNode, ReadonlySet<string>>()
+const nodeRuleNames = new WeakMap<EastExpression, ReadonlySet<string>>()
 
 /**
  * Rule names that have appeared in a node `lowerExpr` actually selected as
@@ -195,8 +222,8 @@ export const touchedRuleNames = new Set<string>()
  
 export function tileExpr(expr: EastExpression, rules: readonly Rule[], demand?: OutputLocation): RtlNode[]
 {
-    const memo = new WeakMap<EastExpression, RtlNode[]>()
-    const results = tileNode(expr, rules, memo)
+    const memo = new WeakMap<EastExpression, EastExpression[]>()
+    const results = tileNode(expr, rules, memo).filter(isRtlNode)
     return demand ? results.filter(n => outputHas(n.output, demand)) : results
 }
 

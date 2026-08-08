@@ -2,7 +2,7 @@
  * Codec integration test.
  *
  * Verifies that the GENERIC codec-generation library from @ppl/codecs
- * (builders.ts's `buildCodec`, json.ts's `buildJsonEncoder`), when
+ * (engine/resolver.ts's `buildCodec`, components/json.ts's `buildJsonEncoder`), when
  * COMPOSED over this project's independently-authored schema (via
  * compose.ts), correctly handles a real mix of nested struct, a
  * capacity-limited list of structs, and a small all-unit union — the

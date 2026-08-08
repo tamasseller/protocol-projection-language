@@ -10,9 +10,9 @@
  * builds or returns a decode-direction anything.
  *
  * Regularized onto the same `createCodecResolver` (`../engine/resolver.ts`)
- * `buildCodec` (`../engine/builders.ts`) is built on, not a bespoke driver
- * of its own — the two differ only in rule list and context type (`void`
- * for the binary rules, nesting depth here). Pretty-printing needs each
+ * `buildCodec` (same file) is built on, not a bespoke driver of its own —
+ * the two differ only in rule list and context type (`void` for the
+ * binary rules, nesting depth here). Pretty-printing needs each
  * nesting level's own indent string, but nesting depth is *structural*
  * (known from the type graph, not the data) — so, unlike `binary-rules.ts`,
  * resolution here is memoized by `(node, depth)`, not by node identity
@@ -58,7 +58,7 @@ const indent = (depth: number): string => "  ".repeat(depth)
  *  just N unrolled `<code>; write(0, 1);` statements, one per character. */
 function emitLiteral(s: string): string
 {
-    return Array.from(s).map(ch => `${ch.codePointAt(0)}; write(0, 1);\n`).join("")
+    return Array.from(s).map(ch => `write(0, 1, ${ch.codePointAt(0)});\n`).join("")
 }
 
 // ── emit_decimal(value) — no DIV/MOD; repeated subtract-largest-power ───
@@ -93,15 +93,14 @@ function emitDecimalBody(): IrFragment
         // Always shown — the only digit a value of exactly 0 ever prints.
         if(isUnits)
         {
-            src += `digit = digit + ${ZERO};\ndigit;\nwrite(0, 1);\n`
+            src += `digit = digit + ${ZERO};\nwrite(0, 1, digit);\n`
         }
         else
         {
             src +=
                 "if ((digit != 0) | started)\n{\n" +
                 `    digit = digit + ${ZERO};\n` +
-                "    digit;\n" +
-                "    write(0, 1);\n" +
+                "    write(0, 1, digit);\n" +
                 "    started = 1;\n" +
                 "}\n"
         }
@@ -118,14 +117,13 @@ type Resolve = (type: SemanticType, depth: number) => Procedure
 function jsonIntegerBody(match: IntegerMatch, emitDecimal: Procedure): IrFragment
 {
     if(match.min >= 0)
-        return ir`${emitDecimal}(load_val(0)); return;`
+        return ir`${emitDecimal}(load_val(0));`
 
     return ir`
         u32 val = 0;
         val = load_val(0);
         if ((val & 0x80000000) != 0) { ${emitLiteral("-")} val = -val; }
         ${emitDecimal}(val);
-        return;
     `
 }
 
@@ -144,7 +142,7 @@ function jsonStructBody(match: StructFieldsMatch, depth: number, resolve: Resolv
         `)
     })
 
-    return ir`${emitLiteral("{\n")} ${fields} ${emitLiteral(`${indent(depth)}}`)} return;`
+    return ir`${emitLiteral("{\n")} ${fields} ${emitLiteral(`${indent(depth)}}`)}`
 }
 
 function jsonListBody(match: ListMatch, depth: number, resolve: Resolve): IrFragment
@@ -163,7 +161,6 @@ function jsonListBody(match: ListMatch, depth: number, resolve: Resolve): IrFrag
             if (left == 0) { ${emitLiteral("\n")} } else { ${emitLiteral(",\n")} }
         }
         ${emitLiteral(`${indent(depth)}]`)}
-        return;
     `
 }
 
@@ -187,7 +184,7 @@ function jsonUnionBody(match: UnionFieldsMatch, depth: number, resolve: Resolve)
               `)
     })
 
-    return ir`switch (tag(0)) { ${cases} } return;`
+    return ir`switch (tag(0)) { ${cases} }`
 }
 
 // ── Entry point ──────────────────────────────────────────────────────────
@@ -219,7 +216,7 @@ export function buildJsonEncoder(root: SemanticType): RtlProgram
     // else, mirroring binary-rules.ts.
     const jsonRules: readonly CodecRule<number>[] = [
         codecRule<IntegerPattern, number>(pInteger(-Infinity, Infinity), (match) => jsonIntegerBody(match, getEmitDecimal())),
-        codecRule<UnitPattern, number>(pUnit(), () => ir`${emitLiteral("null")}return;`),
+        codecRule<UnitPattern, number>(pUnit(), () => ir`${emitLiteral("null")}`),
         codecRule(pList(pStar()), (match, depth: number, resolve) => jsonListBody(match, depth, resolve)),
         codecRule(pUnionFields(pStar()), (match, depth: number, resolve) => jsonUnionBody(match, depth, resolve)),
         codecRule(pStructFields(pStar()), (match, depth: number, resolve) => jsonStructBody(match, depth, resolve)),

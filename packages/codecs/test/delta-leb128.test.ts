@@ -9,7 +9,7 @@ import { list, struct, u8, u32, buildTypeGraph } from "@ppl/core"
 import { validateProgram, run } from "@ppl/machine"
 
 import { buildDeltaLeb128ListCodec, deltaLeb128EncodeRule, deltaLeb128DecodeRule } from "../src/components/delta-leb128"
-import { buildCodec } from "../src/engine/builders"
+import { buildCodec } from "../src/engine/resolver"
 import { createCodecExtension } from "../src/engine/codec-extension"
 import { binaryEncodeRules, binaryDecodeRules } from "../src/components/binary-rules"
 
@@ -54,13 +54,14 @@ describe("delta-leb128 — List<u32>", () =>
         assert.deepEqual(decode(buffer), values)
     })
 
-    test("round-trips correctly even with a negative delta — but pays for it: §8.6's own scheme has no " +
-        "zigzag step, so RSUB's two's-complement wraparound turns a small negative delta into a near-" +
-        "u32-max unsigned value, needing up to 5 LEB128 bytes instead of 1", () =>
+    test("round-trips correctly with a negative delta, and the zigzag step keeps it cheap — a small " +
+        "negative delta costs the same 1 byte a same-magnitude positive one would, not the up-to-5 " +
+        "bytes an unsigned encoding's two's-complement wraparound would otherwise waste on it", () =>
     {
         const values = [5, 5, 4, 100]
         const buffer = encode(values)
-        assert.equal(buffer.length, 1 + 1 + 1 + 5 + 1) // count, 5, +0, -1 (wrapped, 5 bytes), +96
+        // count(1) + zigzag(5)=10 (1) + zigzag(0)=0 (1) + zigzag(-1)=1 (1) + zigzag(96)=192 (2, >127).
+        assert.equal(buffer.length, 1 + 1 + 1 + 1 + 2)
         assert.deepEqual(decode(buffer), values)
     })
 

@@ -30,8 +30,26 @@
           "source.js",
           "source.jsx"
         ],
-        "path": "./syntaxes/ir-injection.tmLanguage.json"
+        "path": "./syntaxes/ir.tmLanguage.json"
       }
-    ]
+    ],
+    "configurationDefaults": {
+      "editor.tokenColorCustomizations": {
+        "textMateRules": [
+          {
+            "scope": "meta.embedded.block.c.ir-dsl",
+            "settings": {
+              "fontStyle": "italic"
+            }
+          },
+          {
+            "scope": "meta.embedded.block.c.ir-dsl meta.template.expression.ts",
+            "settings": {
+              "fontStyle": ""
+            }
+          }
+        ]
+      }
+    }
   }
 }
