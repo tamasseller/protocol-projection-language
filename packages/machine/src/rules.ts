@@ -158,7 +158,7 @@ function leafRules(resolveLocal: (name: string) => number): Rule[]
 
 // ── Constant folding ─────────────────────────────────────────────────────────
 //
-// Expressed as an ordinary Rule producing a `Literal` instead of an
+// Expressed as ordinary Rules producing a `Literal` instead of an
 // `RtlNode` — matcher.ts's `"Const"` pattern case (`pConst()`) resolves a
 // non-literal shape through the same memoized `tile()` search used for real
 // code, so e.g. a codec builtin's `pConst()`-typed argument sees through
@@ -167,17 +167,70 @@ function leafRules(resolveLocal: (name: string) => number): Rule[]
 // `ConstPattern`'s doc comment (matcher.ts) for why the two can't be the
 // same pattern kind.
 //
-// Deliberately "-" only, not "~"/"+"/"!": nothing here needs them folded
-// yet, and test/rule-coverage.test.ts's gate requires every declared rule
-// to actually fire somewhere in the suite — an unused fold rule would just
-// be dead code the gate catches immediately.
+// Binary folding is derived straight from `OP_TABLE` (below) rather than a
+// second hand-written list — one `fold:binary:${ast}` rule per entry,
+// keyed by AST operator (not `isa`/`swap`: a fold doesn't care which
+// instruction *would* compute it, only the value). A fold rule only ever
+// *adds* a `Literal`-kind candidate alongside a node's existing `RtlNode`
+// candidates at that same node (orchestrator.ts's `pruneToFrontier` keeps
+// the two separate) — it never removes or replaces them. But that node's
+// *parent* does see a new option once this fires: a literal-op-literal
+// subtree that previously forced a stack combo (no raw literal/identifier
+// at that exact child position for reg/imm rules to match) is now also a
+// `pConst()` match, so the parent can dispatch through `IMM_ACC` instead.
+// This genuinely broke `test/coverage-sweep.test.ts`'s old `(8 + 9)`-shaped
+// flip tie-break probes (folding made `(8 + 9)` cheap enough to stop
+// forcing the stack-combo route they meant to exercise) — fixed by
+// switching those probes to `(x + 100)`, which keeps the same acc/tos cost
+// delta but can't fold (`x` isn't a compile-time constant). Verified
+// against the full suite, not just reasoned about — see
+// test/fold-sweep.test.ts and coverage-sweep.test.ts's own comment.
+//
+// Deliberately not "~"/"+"/"!" on the unary side: nothing needs them
+// folded yet, and test/rule-coverage.test.ts's gate requires every
+// declared rule to actually fire somewhere in the suite — an unused fold
+// rule would just be dead code the gate catches immediately. Also no
+// folding for "/"/"%" (`BinaryOperator` has them but `OP_TABLE` doesn't —
+// there's no lowering for either yet at all, a separate, bigger gap).
 
 const literalOf = (value: number): Literal => ({type: "Literal", value, raw: String(value)})
+
+/** Mirrors vm.ts's own ALU-op semantics exactly (u32-wrapped inputs and,
+ *  for arithmetic/shift ops, output) so a folded constant is bit-identical
+ *  to what running the equivalent instruction would have produced. Only
+ *  ever called with an `op` that's actually a key of `OP_TABLE` (below),
+ *  so the two operators `BinaryOperator` has but `OP_TABLE` doesn't
+ *  ("/", "%") never reach here. */
+function foldBinaryOp(op: BinaryOperator, a: number, b: number): number
+{
+    const L = a >>> 0, R = b >>> 0
+    switch(op)
+    {
+        case "+": return (L + R) >>> 0
+        case "-": return (L - R) >>> 0
+        case "*": return Math.imul(L, R) >>> 0
+        case "&": return L & R
+        case "|": return L | R
+        case "^": return L ^ R
+        case "<<": return (L << (R & 31)) >>> 0
+        case ">>": return L >>> (R & 31)
+        case "==": return L === R ? 1 : 0
+        case "!=": return L !== R ? 1 : 0
+        case "<": return L < R ? 1 : 0
+        case "<=": return L <= R ? 1 : 0
+        case ">": return L > R ? 1 : 0
+        case ">=": return L >= R ? 1 : 0
+        default: throw new Error(`fold: no lowering for "${op}" (OP_TABLE)`)
+    }
+}
 
 function foldRules(): Rule[]
 {
     return [
         rule("fold:unary:-", pUnary("-", pConst()), m => literalOf(-m.argumentMatch.value)),
+        ...OP_TABLE.map(({ast}) =>
+            rule(`fold:binary:${ast}`, pBinary(ast, pConst(), pConst()), m =>
+                literalOf(foldBinaryOp(ast, m.leftMatch.value, m.rightMatch.value)))),
     ]
 }
 

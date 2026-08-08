@@ -4,8 +4,7 @@
  *
  * DSL lowering + VM execution (mirrors dsl-rules.test.ts's style), the
  * checksum-with-fixup worked example (§8.4) end to end, capability/runtime
- * guards, and the two static checks (validateCodecHandles,
- * computeStreamIteratorPeaks).
+ * guards, and the static check (validateCodecHandles).
  */
 import { describe, test } from "node:test"
 import assert from "node:assert/strict"
@@ -16,7 +15,7 @@ import type { RtlProgram } from "@ppl/machine"
 
 import { createCodecExtension, codecRules } from "../src/engine/codec-extension"
 import type { Handle } from "../src/engine/codec-extension"
-import { validateCodecHandles, computeStreamIteratorPeaks } from "../src/engine/validate-handles"
+import { validateCodecHandles } from "../src/engine/validate-handles"
 
 const unitGraph = buildTypeGraph(unit)
 
@@ -179,7 +178,7 @@ describe("stream forks — runtime capability guards", () =>
     })
 })
 
-describe("static checks — validateCodecHandles + computeStreamIteratorPeaks", () =>
+describe("static checks — validateCodecHandles", () =>
 {
     test("a well-formed fork program passes validateCodecHandles", () =>
     {
@@ -193,7 +192,6 @@ describe("static checks — validateCodecHandles + computeStreamIteratorPeaks", 
         `)
         const program = lower(entry)
         assert.doesNotThrow(() => validateCodecHandles(program))
-        assert.equal(computeStreamIteratorPeaks(program), 3) // i0, fork 1, fork 2
     })
 
     test("rejects READ on an iterator id never cloned in this procedure", () =>
@@ -208,12 +206,5 @@ describe("static checks — validateCodecHandles + computeStreamIteratorPeaks", 
         const entry = proc([], ir`clone_rd(0, 1); write(1, 1, 5); return;`)
         const program = lower(entry)
         assert.throws(() => validateCodecHandles(program), /iterator 1 is read-only, not write/)
-    })
-
-    test("a program that never forks reports a peak of 1 (i0 alone)", () =>
-    {
-        const entry = proc([], ir`write(0, 1, 1); return;`)
-        const program = lower(entry)
-        assert.equal(computeStreamIteratorPeaks(program), 1)
     })
 })

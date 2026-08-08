@@ -1,7 +1,6 @@
 /**
- * @ppl/codecs — Static validation (docs/codec-extension.md §7.1) and
- * resource-peak statistics (§7.2), for both object handles and stream
- * iterators
+ * @ppl/codecs — Static validation (docs/codec-extension.md §7.1): handle
+ * type/bounds checking and cross-procedure delegation-type consistency
  *
  * `@ppl/machine`'s `validate.ts` stays codec-agnostic — no notion of
  * handles/iterators, only TOS depth and the call graph. Everything here
@@ -27,8 +26,21 @@
  * pattern the runtime would actually allow — a deliberate, disclosed
  * scope limit, not a bug.
  *
- * Both entry points assume `validateProgram` already ran (no re-derivation
- * of §8.1-§8.5).
+ * §7.2's per-resource peak-usage stats (object-handle frame peaks, stream-
+ * iterator peaks) were built and then removed: envisioned for a target
+ * that blindly trusts pre-validation and needs to pre-size its resource
+ * tables from the stats alone, without re-deriving them — turned out
+ * nothing this project actually builds needs that. The one figure of this
+ * shape that *is* a genuine `@ppl/machine`-level concern (`validateProgram`'s
+ * own `ProgramStats`, isa-core.md §8.3's call-depth bound) already lives
+ * there, generically, for any consumer that wants it; a target that
+ * someday needs the codec-specific numbers too can derive them itself and
+ * fold them into its own application-level image. No point carrying
+ * unused surface here in a domain (§6) where compactness is the
+ * overriding goal.
+ *
+ * `validateCodecHandles` assumes `validateProgram` already ran (no
+ * re-derivation of §8.1-§8.5).
  */
 
 import type {RtlProgram, RtlProc, RtlInstr, ExtInstr} from "@ppl/machine"
@@ -118,31 +130,10 @@ function checkCalleeType(program: RtlProgram, codecIdx: number, childType: TypeN
             `delegated-to child's actual type (node ${childType.id}) — a field/variant is being decoded with the wrong codec`)
 }
 
-interface ProcAnalysis
-{
-    /** Highest handle id referenced anywhere in this procedure's own frame,
-     *  +1 — the frame-table size a target must reserve for it (§7.2). 0 for
-     *  a GENERIC procedure (no header) that never touches a handle, as it
-     *  must not (§4.1) — enforced here for free: its handle env starts
-     *  empty, so any handle reference at all fails as "never entered". */
-    localHandlePeak: number
-    /** Every `CALL_CODEC`/`CALL_CODEC_NEXT` call site's callee index — the
-     *  only ext ops that push a *fresh* handle frame at runtime
-     *  (`codec-extension.ts`'s own `frames.push`); a plain `CALL` reuses
-     *  the current frame, so it never contributes to the handle-peak total
-     *  (§7.2) — matching how a `GENERIC` callee has no handle frame of its
-     *  own to begin with. */
-    codecCallSites: readonly number[]
-}
-
-function analyzeProcedure(proc: RtlProc, procIndex: number, program: RtlProgram): ProcAnalysis
+function analyzeProcedure(proc: RtlProc, procIndex: number, program: RtlProgram): void
 {
     const header = proc.header as TypeNode | undefined
     const body = proc.body
-    const codecCallSites: number[] = []
-    let peak = header ? 1 : 0
-
-    function touch(id: number): void {peak = Math.max(peak, id + 1)}
 
     function handleExt(instr: ExtInstr, env: HandleEnv, iterEnv: IterEnv, pc: number): void
     {
@@ -155,14 +146,12 @@ function analyzeProcedure(proc: RtlProc, procIndex: number, program: RtlProgram)
             {
                 const [dst, src, ref] = instr.operands as readonly [number, number, number]
                 env.set(dst, childOf(handleOf(env, procIndex, pc, src, op), ref, procIndex, pc, op))
-                touch(dst)
                 return
             }
             case "ENTER_NEXT":
             {
                 const [dst, src] = instr.operands as readonly [number, number]
                 env.set(dst, nextOf(handleOf(env, procIndex, pc, src, op), procIndex, pc, op))
-                touch(dst)
                 return
             }
             case "LOAD_VAL":
@@ -196,7 +185,6 @@ function analyzeProcedure(proc: RtlProc, procIndex: number, program: RtlProgram)
                 const [codecIdx, src, ref] = instr.operands as readonly [number, number, number]
                 const childType = childOf(handleOf(env, procIndex, pc, src, op), ref, procIndex, pc, op)
                 checkCalleeType(program, codecIdx, childType, procIndex, pc, op)
-                codecCallSites.push(codecIdx)
                 return
             }
             case "CALL_CODEC_NEXT":
@@ -204,7 +192,6 @@ function analyzeProcedure(proc: RtlProc, procIndex: number, program: RtlProgram)
                 const [codecIdx, src] = instr.operands as readonly [number, number]
                 const childType = nextOf(handleOf(env, procIndex, pc, src, op), procIndex, pc, op)
                 checkCalleeType(program, codecIdx, childType, procIndex, pc, op)
-                codecCallSites.push(codecIdx)
                 return
             }
             case "READ":
@@ -292,8 +279,6 @@ function analyzeProcedure(proc: RtlProc, procIndex: number, program: RtlProgram)
     const seedEnv: HandleEnv = header ? new Map([[0, header]]) : new Map()
     const seedIterEnv: IterEnv = new Map([[0, "any"]])
     walk(0, seedEnv, seedIterEnv)
-
-    return {localHandlePeak: peak, codecCallSites}
 }
 
 /**
@@ -306,66 +291,4 @@ function analyzeProcedure(proc: RtlProc, procIndex: number, program: RtlProgram)
 export function validateCodecHandles(program: RtlProgram): void
 {
     program.procedures.forEach((proc, i) => analyzeProcedure(proc, i, program))
-}
-
-export interface HandlePeakStats
-{
-    /** One entry per procedure, in procedure-table order — mirrors
-     *  `ProgramStats.procedures` (`@ppl/machine/validate.ts`). */
-    readonly procedures: readonly number[]
-    /** Worst-case total concurrently-live handle-frame slots reachable from
-     *  procedure 0 — the object-handle generalization of `ProgramStats.
-     *  totalDepth` (§7.2, §8.3), by the same reasoning: every procedure on
-     *  the deepest `CALL_CODEC`/`CALL_CODEC_NEXT` chain has its own handle
-     *  frame alive simultaneously with all its callers', so the total is
-     *  additive down that chain, not the caller's own unrelated peak. */
-    readonly total: number
-}
-
-export function computeHandlePeaks(program: RtlProgram): HandlePeakStats
-{
-    const perProcedure = program.procedures.map((proc, i) => analyzeProcedure(proc, i, program))
-    const memo = new Map<number, number>()
-
-    function totalOf(index: number, visiting: Set<number>): number
-    {
-        const cached = memo.get(index)
-        if(cached !== undefined) return cached
-        if(visiting.has(index))
-            throw new Error(`codec validation: call-graph cycle at procedure ${index} (validateProgram should already have rejected this)`)
-
-        visiting.add(index)
-        const {localHandlePeak, codecCallSites} = perProcedure[index]!
-        let best = localHandlePeak
-        for(const callee of codecCallSites)
-            best = Math.max(best, localHandlePeak + totalOf(callee, visiting))
-        visiting.delete(index)
-
-        memo.set(index, best)
-        return best
-    }
-
-    return {
-        procedures: perProcedure.map(p => p.localHandlePeak),
-        total: program.procedures.length === 0 ? 0 : totalOf(0, new Set()),
-    }
-}
-
-/**
- * Peak concurrently-live stream iterators, whole-program (§7.2's other
- * named resource). No DFS, unlike `computeHandlePeaks`: `i0` and every
- * fork are *global* (§2.1 — one shared table, never frame-scoped, per this
- * file's header), so the peak is simply the highest iterator id any
- * `CLONE_RD`/`CLONE_WR` ever creates, anywhere in the program, +1 for
- * `i0` itself — a flat structural fact, not something nesting depth
- * changes.
- */
-export function computeStreamIteratorPeaks(program: RtlProgram): number
-{
-    let max = 0
-    for(const proc of program.procedures)
-        for(const instr of proc.body)
-            if(isExtInstr(instr) && (instr.ext === "CLONE_RD" || instr.ext === "CLONE_WR"))
-                max = Math.max(max, instr.operands[1] as number)
-    return max + 1
 }

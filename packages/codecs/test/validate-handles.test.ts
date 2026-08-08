@@ -1,13 +1,10 @@
 /**
- * @ppl/codecs/test — validate-handles.ts (codec-extension.md §7.1/§7.2)
+ * @ppl/codecs/test — validate-handles.ts (codec-extension.md §7.1)
  *
  * Two kinds of coverage: (1) real `buildCodec` output — including a
  * hoisted union field, so `ENTER` onto a non-`o0` handle actually appears
  * in the body — passes `validateCodecHandles` cleanly; (2) hand-built
- * `RtlProgram` fixtures for each violation §7.1 is supposed to catch, and
- * one hand-built fixture with a precisely hand-computed expected
- * `computeHandlePeaks` total, since nothing in `buildCodec`'s own output
- * is simple enough to hand-verify a peak count against by inspection.
+ * `RtlProgram` fixtures for each violation §7.1 is supposed to catch.
  */
 
 import { describe, test } from "node:test"
@@ -18,7 +15,7 @@ import { struct, union, unit, u8, u32, list, buildTypeGraph } from "@ppl/core"
 import type { RtlProgram, RtlProc } from "@ppl/machine"
 import { extInstr, bare, validateProgram } from "@ppl/machine"
 
-import { validateCodecHandles, computeHandlePeaks } from "../src/engine/validate-handles"
+import { validateCodecHandles } from "../src/engine/validate-handles"
 import { buildCodec } from "../src/engine/resolver"
 import { createCodecExtension } from "../src/engine/codec-extension"
 import { binaryEncodeRules, binaryDecodeRules } from "../src/components/binary-rules"
@@ -49,13 +46,6 @@ describe("validateCodecHandles — real buildCodec output", () =>
         const decodeExt = createCodecExtension("decode", { container: wrapper, key: "root", type: graph.root }, [...buffer])
         validateProgram(decodeProgram, decodeExt)
         assert.doesNotThrow(() => validateCodecHandles(decodeProgram))
-
-        for(const program of [encodeProgram, decodeProgram])
-        {
-            const stats = computeHandlePeaks(program)
-            assert.equal(stats.procedures.length, program.procedures.length)
-            assert.ok(stats.total >= 1)
-        }
     })
 })
 
@@ -111,15 +101,6 @@ describe("validateCodecHandles — hand-built fixtures", () =>
         const program: RtlProgram = { procedures: [itemProc, variantAProc, payloadProc] }
 
         assert.doesNotThrow(() => validateCodecHandles(program))
-
-        // localHandlePeak: itemProc uses handles 0,1,2 → 3; variantAProc:
-        // o0 only → 1; payloadProc uses 0,1 → 2.
-        const stats = computeHandlePeaks(program)
-        assert.deepEqual(stats.procedures, [3, 1, 2])
-
-        // total(1) = 1 (leaf). total(2) = 2 (leaf, no CALL_CODEC of its own).
-        // total(0) = localPeak(3) + max(total(1)=1, total(2)=2) = 3 + 2 = 5.
-        assert.equal(stats.total, 5)
     })
 
     test("rejects an out-of-range struct field ref", () =>

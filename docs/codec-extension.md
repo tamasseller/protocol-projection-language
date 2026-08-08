@@ -1,22 +1,21 @@
 # Codec Extension ISA
 
-> **Status:** Design spec, not yet implemented — ROADMAP.md item 7. Specifies
-> the codec extension's opcodes, calling convention, and encoding rules the
-> way isa-core.md specifies the generic core, and plugs into the core purely
-> through the mechanism isa-core.md §11 defines (opcode range ≥128, effect
-> declarations, literal-only operands). Unlike isa-core.md, it carries its
-> own rationale inline, section by section, rather than deferring to a
-> companion doc — there is no ir-engine.md-style pairing for this document.
-> An earlier recovered draft briefly served that role
-> (`codec-extension-draft.md`, since retired); its one piece of rationale
-> that didn't end up redundant with this document — why abnormal
+> **Status:** Implemented — ROADMAP.md item 7 (Done), including §6's byte
+> encoding. Specifies the codec extension's opcodes, calling convention,
+> and encoding rules the way isa-core.md specifies the generic core, and
+> plugs into the core purely through the mechanism isa-core.md §11 defines
+> (opcode range ≥128, effect declarations, literal-only operands). Unlike
+> isa-core.md, it carries its own rationale inline, section by section,
+> rather than deferring to a companion doc — there is no ir-engine.md-style
+> pairing for this document. An earlier recovered draft briefly served that
+> role (`codec-extension-draft.md`, since retired); its one piece of
+> rationale that didn't end up redundant with this document — why abnormal
 > termination is a generic-core concern, not a codec-specific one — moved to
 > [ir-engine.md](./ir-engine.md), its proper home by topic.
 >
-> Nothing below exists as code yet. `packages/machine/src/extension.ts`'s
-> `Extension` interface is the shape an implementation registers against;
-> it belongs in `@ppl/codecs` (`packages/codecs/`) — the generic core stays
-> protocol-agnostic by design (ROADMAP.md item 5).
+> Lives in `@ppl/codecs` (`packages/codecs/src/engine/`), registered
+> against `packages/machine/src/extension.ts`'s `Extension` interface — the
+> generic core stays protocol-agnostic by design (ROADMAP.md item 5).
 
 ---
 
@@ -139,7 +138,7 @@ object type, the root the walk above starts from. That is the only type a
 wire image needs to name explicitly — every other handle's type is
 derived, never declared, by the same structural walk a translator already
 performs for TOS depth. There is no per-procedure "referenced-types list"
-alongside it; ROADMAP.md item 8 sketches where that single root-type
+alongside it; docs/codec-image.md specifies where that single root-type
 reference and the semantic type tree it points into actually live —
 an image-level concern above this procedure header, not per-procedure
 metadata.
@@ -314,10 +313,13 @@ evaluated over the monomorphized DAG rather than a literal recursive cycle.
 
 ## 6. Encoding
 
-The concrete byte layout is not assigned yet — deferred, per isa-core.md
-§5.3's philosophy, until real codecs are compiled against this instruction
-set and opcode frequency can be measured. This section fixes the layout
-*rules*, which don't depend on the final byte assignment.
+Implemented — `packages/codecs/src/engine/wire.ts` (ROADMAP.md item 7),
+the `Extension.codec` (`ExtCodec`) `createCodecExtension` registers.
+`bytecode.ts`'s `encodeInstr`/`decodeInstr` delegate to it for every byte
+≥128, exactly as isa-core.md §5.1 requires of the active extension. This
+section fixes the layout *rules*; `wire.ts` itself is the literal source of
+truth for the derived byte values (its bases are computed from band
+widths, not hand-copied here — see §6.4).
 
 ### 6.1 Opcode-space skew
 
@@ -327,7 +329,9 @@ own ops skew longer on average than the core's: `CALL_CODEC` carries
 `codec_idx` + `ref` at minimum, `ENTER` carries `dst, src, ref`. That's an
 acceptable trade because delegation dominates real codec bodies (§8.1,
 §8.2) — a smaller number of frequent, still-not-tiny ops, rather than the
-core's evenly-spread arithmetic/comparison combo space.
+core's evenly-spread arithmetic/comparison combo space. 119 of the 128
+codes end up assigned (§6.4) — comfortably inside budget, no pressure to
+economize further.
 
 ### 6.2 Literal-ref segmentation
 
@@ -335,10 +339,15 @@ Handle/field/variant refs on `ENTER`/`CALL_CODEC` are small integers in
 practice (few structs have more than a handful of fields) — the same
 "segment the common case into the opcode itself" principle isa-core.md
 applies to comparison's zero-immediate (§4.2) and `CONST`'s small values
-(§4.4) applies here: a short literal-offset form should reach the first `N`
+(§4.4) applies here: a short literal-offset form reaches the first `N`
 fields of the handle's referenced type directly, escaping to an extended
-LEB128 form beyond that. `N` is a byte-budget call for the follow-up
-encoding revision, not fixed here.
+LEB128 form beyond that. `N = 4` — the same threshold §2.1/§2.2 already use
+for "typically < 4" handle/iterator IDs, not a separately-chosen number:
+every struct/union in packages/example's `TelemetryPacket` schema, the one
+real schema this project measures against, has ≤4 fields/variants, so this
+is the measurement §6's old text deferred to, not a guess standing in for
+it. A wider real corpus could justify raising `N` later; nothing about the
+compact/extended split (§6.4) requires it stay 4.
 
 ### 6.3 Effect declarations
 
@@ -361,14 +370,59 @@ isa-core.md §6); the `call` field is what folds the callee into the same
 `callSites` bookkeeping for §8.2/§8.3 — the entire point of
 `ExtOpEffect.call`.
 
+### 6.4 Byte assignment
+
+Bands are laid out in `CODEC_OPCODES`' own declared order (§3's table
+order), one band per opcode, each reserving as many codes as its own
+compact/extended split needs. A band's base offset is the running sum of
+every earlier band's width — computed once at module load in `wire.ts`,
+not a hand-copied literal per op (unlike isa-core.md's Appendix, which
+*is* hand-derived, because its formulas are simple enough to re-derive by
+eye and its bytes are hand-assigned constants in `bytecode.ts` — see this
+file's own §6 intro for why duplicating a "computed base" table here would
+just be a second place for the two to drift apart). `N` is §6.2's
+threshold (4); `WIDTHS` is `READ`/`WRITE`'s fixed 3-way enum, `{1, 2, 4}`.
+
+One recurring shape: `ENTER`/`ENTER_NEXT`/`CLONE_RD`/`CLONE_WR` each
+allocate a *fresh* handle/iterator, and every real body §8's worked
+examples (and `binary-rules.ts`'s actual generated code) produce allocates
+it one slot past its source — `enter(1, 0, ref)`, `CLONE_RD 0, 1`. Each of
+these four ops' compact form exploits that: it encodes only `src`, deriving
+`dst = src + 1`; an actual `dst != src + 1` (or `src >= N`) falls back to
+an extended form with both operands spelled out. `CALL_CODEC`/
+`CALL_CODEC_NEXT`'s `codec_idx` (a procedure-table index, with no small
+natural ceiling — it grows with how many distinct codecs a real program
+has) and `SEEK`'s `delta` (a genuine signed offset, encoded zigzag since
+§5.4's LEB128 is unsigned-only) never get a compact form; only the
+handle/iterator-ID operands sitting alongside them do.
+
+| Opcode | Width | Compact form | Extended form |
+|---|---|---|---|
+| `ENTER` | `N² + 1` = 17 | 1 code per `(src, ref)` pair, `src,ref < N`, `dst = src+1` implied | `dst, src, ref` all LEB128 |
+| `ENTER_NEXT` | `N + 1` = 5 | 1 code per `src < N`, `dst = src+1` implied | `dst, src` both LEB128 |
+| `LOAD_VAL` / `STORE_VAL` / `COUNT` / `TAG` / `OPEN_LIST` / `HAS_NEXT` | `N + 1` = 5 (each) | 1 code per `idx < N` | `idx` LEB128 |
+| `READ` / `WRITE` | `N·`\|`WIDTHS`\|` + `\|`WIDTHS`\| = 15 (each) | 1 code per `(iter, width)`, `iter < N` | 1 code per `width` + `iter` LEB128 — `width` never LEB128'd |
+| `CLONE_RD` / `CLONE_WR` | `N + 1` = 5 (each) | 1 code per `src < N`, `dst = src+1` implied | `src, dst` both LEB128 |
+| `SEEK` | `N + 1` = 5 | 1 code per `iter < N` + `delta` zigzag-LEB128 | `iter` LEB128 + `delta` zigzag-LEB128 |
+| `CALL_CODEC` | `N² + 1` = 17 | 1 code per `(src, ref)` pair + `codec_idx` LEB128 | `codec_idx, src, ref` all LEB128 |
+| `CALL_CODEC_NEXT` | `N + 1` = 5 | 1 code per `src < N` + `codec_idx` LEB128 | `codec_idx, src` both LEB128 |
+
+Total: 119 codes (bytes 128..246); 247..255 (9 codes) reserved and unused,
+isa-core.md §5.3's "leave room, don't force a smaller encoding to fill
+every slot" philosophy. `test/wire.test.ts` cross-checks a representative
+byte for every compact/extended variant above, mirroring
+`bytecode.test.ts`'s own literal-table approach, plus one end-to-end test
+round-tripping a real `buildCodec`-generated program's full instruction
+stream.
+
 ---
 
-## 7. Static Validation — Open Design
+## 7. Static Validation
 
-Not yet implemented (ROADMAP.md item 7). Both questions below now have a
-concrete mechanism rather than just being open — documented here, not in
-isa-core.md, since both ride on codec-extension concepts (handle
-provenance, named resources) the generic core has no notion of.
+Implemented — `packages/codecs/src/engine/validate-handles.ts` (ROADMAP.md
+item 7). Documented here, not in isa-core.md, since §7.1's checks ride on
+codec-extension concepts (handle provenance) the generic core has no
+notion of.
 
 ### 7.1 Handle type and bounds checking
 
@@ -394,20 +448,28 @@ the existing TOS-depth accumulator. Two checks fall out:
   depth bound would ever catch it.
 
 Neither check needs new validator machinery beyond a semantic type tree to
-walk against — see ROADMAP.md item 8 for where that tree lives at the wire
-level.
+walk against — see docs/codec-image.md for where that tree lives at the
+wire level.
 
-### 7.2 Resource-peak statistics
+### 7.2 Resource-peak statistics — built, then removed
 
 Per-resource peaks (maximum concurrent stream iterators, maximum
-concurrent object handles) generalize a mechanism isa-core.md §8.3 now
-provides in its own right: maximum call depth, the control-stack sizing
-figure isa-core.md §8.3 computes alongside — and distinctly from — its
-operand-stack depth bound (see isa-core.md §8.3 for why the two diverge).
-Iterator/handle-count peaks are the extension-specific instances of that
-same generic pattern, not a parallel mechanism: same bottom-up DFS, one
-more named resource tracked alongside call depth and TOS depth, with the
-same per-procedure/tight-cross-call-site treatment falling out for free.
+concurrent object handles) would have generalized a mechanism isa-core.md
+§8.3 provides in its own right: maximum call depth, the control-stack
+sizing figure §8.3 computes alongside — and distinctly from — its
+operand-stack depth bound. The premise was a target that blindly trusts
+pre-validation and needs to pre-size its resource tables from published
+stats alone, without re-deriving them itself. Built (`computeHandlePeaks`/
+`computeStreamIteratorPeaks`), then removed once it became clear nothing
+this project actually builds needs that: no consumer wants pre-sized
+iterator/handle tables, so the numbers had no reader. The generic
+`@ppl/machine`-level figure this would have generalized —
+`validateProgram`'s own `ProgramStats` (§8.3's call-depth bound) — is
+unaffected and still available to any caller; a future consumer that
+genuinely needs the codec-specific peaks can derive them the same way
+these functions did (walk `RtlProc.header`/`ExtInstr` directly) and keep
+them at its own application layer, rather than this package carrying
+unused surface in a domain (§6) where compactness is the overriding goal.
 
 ---
 
@@ -678,4 +740,4 @@ stream/handle teardown and decides the response.
 - **Optional-field convention.** §8.5's 0/1-length-`List` + `COUNT`
   modeling is sufficient for the cases considered; confirm it holds across
   more realistic schemas before locking it in as the only convention.
-- **Validator/resource-peak generalization.** See §7 — not yet designed.
+- **Validator/resource-peak generalization.** Implemented — see §7.

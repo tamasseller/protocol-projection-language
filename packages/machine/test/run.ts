@@ -11,6 +11,7 @@ import "./validate.test"
 import "./extension.test"
 import "./algorithms.test"
 import "./coverage-sweep.test"
+import "./fold-sweep.test"
 
 // Must come last: reports on rule-name coverage accumulated by every
 // lowerExpr call in the files above (see the file for why).

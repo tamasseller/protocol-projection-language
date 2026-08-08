@@ -52,7 +52,7 @@ machinery, landed as its own package. `@ppl/core` doesn't depend on it.
 effect, DSL call resolution, VM execution, wire codec. Procedure
 extension-header fields are opaque, carried through untouched.
 
-## 7. Codec-specific extension — Mostly done
+## 7. Codec-specific extension — Done
 
 `docs/codec-extension.md` §1-§3 implemented as `@ppl/codecs`'s own
 `Extension`:
@@ -74,30 +74,50 @@ extension-header fields are opaque, carried through untouched.
   than a hand-rolled tree walk. `matcher.ts`'s new `pConst()` pattern (vs.
   plain `pLiteral()`) resolves a non-literal shape like `-4`
   (`UnaryExpression("-", Literal(4))`) through it on demand — any
-  `pConst()`-typed argument benefits, not just `seek`'s. Deliberately
-  unary-only, not general binary constant folding (`8 + 9` staying a
-  `Binary` node): `test/coverage-sweep.test.ts`'s "flip" combo probes rely
-  on a literal-literal *subexpression* keeping its compound shape for a
-  cost-based tie-break, so folding it away would regress 16 rule names for
-  no current need.
+  `pConst()`-typed argument benefits, not just `seek`'s. Since generalized
+  to binary folding too: one `fold:binary:${ast}` rule per `OP_TABLE`
+  entry (not `/`/`%` — `OP_TABLE` has no lowering for either yet at all).
+  This did regress `test/coverage-sweep.test.ts`'s "flip" combo probes
+  exactly as predicted (a literal-literal subexpression like `8 + 9` no
+  longer keeps its compound shape, so it stopped forcing the stack-combo
+  tie-break those probes exist to exercise) — fixed by switching the
+  probes to a literal-op-*identifier* shape (`x + 100`), which keeps the
+  same acc/tos cost delta without being foldable.
 - **`engine/resolver.ts`** — `createCodecResolver` (generic, on-demand,
   memoized, cycle-safe `SemanticType -> Procedure` resolution over an
   ordered `CodecRule<Ctx>[]`) plus `buildCodec`, the thin driver over it.
   `Ctx` isn't "the direction" — direction is which rule *list* a caller
   passes (`binaryEncodeRules` vs `binaryDecodeRules`), never a threaded
   runtime flag.
-- **`engine/validate-handles.ts`** — §7.1/§7.2's static checks, entirely
-  in `@ppl/codecs` (`validate.ts` needed no new capability — just
+- **`engine/validate-handles.ts`** — §7.1's static checks, entirely in
+  `@ppl/codecs` (`validate.ts` needed no new capability — just
   `RtlProc.header` carrying each `CODEC`-ABI procedure's declared `o0`
-  type, a `TypeNode`). `validateCodecHandles(program)` throws on
-  wrong-kind/out-of-range handle access or a delegation site whose callee
-  was built for the wrong type. `computeHandlePeaks`/
-  `computeStreamIteratorPeaks` give per-resource peak-usage stats
-  (object handles: additive across `CALL_CODEC`'s fresh frames; stream
-  iterators: a flat whole-program max, since `i0`/its forks are global,
-  never frame-scoped). Iterator validation is conservatively
-  same-procedure-only — the runtime actually allows sharing a fork across
-  a `CALL_CODEC` boundary, but nothing built needs that yet.
+  type, a `TypeNode`; this is a real, load-bearing use of the generic
+  `header?: unknown` extension mechanism, not vestigial). `validateCodecHandles(program)`
+  throws on wrong-kind/out-of-range handle access or a delegation site
+  whose callee was built for the wrong type. Iterator validation is
+  conservatively same-procedure-only — the runtime actually allows sharing
+  a fork across a `CALL_CODEC` boundary, but nothing built needs that yet.
+  §7.2's per-resource peak-usage stats (`computeHandlePeaks`/
+  `computeStreamIteratorPeaks`) were built, then removed — see
+  codec-extension.md §7.2 and item 8 below for why.
+- **`engine/wire.ts`** — the wire-level `codec` byte encoding
+  (codec-extension.md §6): `Extension.codec` (`encode`/`decode`), wired
+  into `createCodecExtension`'s returned `Extension`; `bytecode.ts`'s
+  `encodeInstr`/`decodeInstr` delegate to it for every `CODEC`-family
+  opcode ≥128. Per-opcode compact/extended bands (isa-core.md §5.3's
+  "segment the common case" philosophy) — a small handle/iterator index
+  (`< 4`, §2.1/§2.2's own threshold, confirmed against `packages/example`'s
+  `TelemetryPacket` schema) folds into the opcode byte itself, with
+  `ENTER`/`ENTER_NEXT`/`CLONE_RD`/`CLONE_WR` additionally exploiting the
+  "fresh handle/iterator lands one slot past its source" pattern real
+  generated bodies actually have (`dst = src + 1` implied, only `src`
+  encoded); `codec_idx` (unbounded) and `SEEK`'s `delta` (signed,
+  zigzag-LEB128'd) never get a compact form. 119 of 128 codes assigned;
+  codec-extension.md §6.4 has the full band table. Verified via
+  `packages/codecs/test/wire.test.ts` (a representative-byte table per
+  band, mirroring `bytecode.test.ts`'s own style, plus an end-to-end round
+  trip of a real `buildCodec`-generated program).
 - **Components**: `binary-rules.ts` (default binary wire format;
   struct union-tag hoisting up to 128 variants — the real byte/bitmap
   break-even point, see `HOIST_MAX_VARIANTS`'s comment; note "optional"
@@ -122,40 +142,90 @@ on `Extension`/`ExecState`/`ExtOpEffect`) into `@ppl/core` would drag that
 dependency in. A new sibling package is sound in principle but premature:
 `@ppl/codecs` is still the only consumer.
 
-**Still open**: the wire-level `codec` byte encoding (§6) — deferred to
-item 8, on purpose, until real codecs exist to measure against (they now
-do).
+## 8. Multi-procedure program envelope — Not started
 
-## 8. Remaining wire framing and codec-referenced-type serdes
+`CALL`'s numeric encode/decode plus program-level framing (procedure
+count/offset table). Purely `@ppl/machine`-generic — no codec-specific
+piece at all, unlike everything else from here on. **Not blocked on
+anything**: items 1-7 are all `Done`, and procedure bodies are already
+self-framing (bracket matching), so this is plausibly just a count +
+concatenated bodies. Of everything left on this roadmap, this is the one
+item ready to implement with no design work or prerequisite left to
+settle first.
 
-Two independent halves:
+**Considered and declined:** baking resource-peak stats (max stack depth,
+max concurrent handles/iterators) into this envelope, for a target that
+trusts pre-validation and wants to pre-size its resource tables without
+re-deriving them. Declined because nothing this project builds needs it,
+and `@ppl/codecs`'s own use case (§6) wants maximum compactness — not a
+few extra bytes per program for a capability with no reader.
+`validateProgram`'s own `ProgramStats` stays available generically either
+way; a consumer that does need pre-sized stats can pull them from there
+(or derive its own codec-specific ones) and fold them into its own
+application-level image instead. Same reasoning is why
+`computeHandlePeaks`/`computeStreamIteratorPeaks` (item 7's
+`validate-handles.ts`) were built, then removed.
 
-- **Multi-procedure program envelope** — `CALL`'s numeric encode/decode
-  plus program-level framing (procedure count/offset table). Not blocked
-  on anything; procedure bodies are already self-framing (bracket
-  matching), so this is plausibly just a count + concatenated bodies.
-  Stays `@ppl/machine`-generic.
-- **Procedure header encoding + codec-referenced semantic types** —
-  depends on (7) for a concrete extension header shape to encode against.
-  Sketch, not a design: a **codec image** — semantic type tree, encoder
-  program, decoder program (never one call graph between them, per §2.3's
-  directionality rule) — living above both `@ppl/machine` and
-  `@ppl/codecs`. Open question: do `GENERIC`-ABI helpers (e.g.
-  `leb128_encode`) get their own copy per direction, or a shared pool?
-  Not decided.
+## 9. Declared default values (`@ppl/core`) — Not started
 
-## 9. Core shakedown
+Doesn't depend on (7) or (8) — this is a `@ppl/core`-only type-system
+change, and item 10 depends on *this* landing, not the other way around.
+Motivated entirely by codec-image.md §3.1/§3.3 (a consumer's on-demand
+codegen sometimes has no source value at all for a field only one of the
+two independently-versioned schemas declares, on either the encode or the
+decode path, and needs a value that travels with whichever tree does
+declare it).
 
-Depends on (7)/(8) landing.
+`@ppl/core/metamodel.ts`'s `struct()`/`union()` build a plain
+`Map<string, SemanticType>` today — no slot between name and type to hang
+a default off. The unused `SemanticField = {name, type}` alias already
+sitting in metamodel.ts is a candidate shape for a third `default` member,
+not a decision made yet. Needs: where declared (probably at
+`struct({...})`/`union({...})` call sites, alongside the type), how a
+composite field's default composes from its own fields' defaults
+(codec-image.md §4) rather than requiring a hand-authored whole literal,
+and how `matchType`/`TypeGraph`/every existing consumer of
+`StructType.fields`/`UnionType.variants` reacts to the value shape
+changing from `SemanticType` to `SemanticType`-plus-default.
+
+## 10. Codec image — Designed, not implemented
+
+Depends on (8) (its encoder and decoder programs are each a whole
+multi-procedure `RtlProgram` — item 8's envelope is what a target actually
+serializes them with) and (9) (its type tree carries declared defaults per
+field/variant, per codec-image.md §4/§5).
+
+Full design lives in **`docs/codec-image.md`**, not repeated here: why the
+semantic type tree needs to travel between two independently-built
+parties at all (one builds native code once and ships this as a portable
+wire-format description; the other generates its own ser/des code on
+demand against it), the name-keyed reconciliation algorithm two
+independently-evolved trees need, and the four direction-crossed
+relaxation rules that make graceful protocol evolution actually work.
+
+Two things resolved along the way, footnoted here since they were
+previously open items on this list: a procedure's `RtlProc.header` (the
+`o0` `TypeNode`, item 7) turns out not to need wire encoding at all — it's
+a lowering→validation handoff entirely internal to one `buildCodec` call,
+resolved before anything is ever serialized (codec-extension.md §2.4/
+§7.1). **Still genuinely open:** the image container's own concrete byte
+layout (deferred the same "measure real cases first" way §6 was, until
+(8) and (9) exist to measure against), and whether `GENERIC`-ABI helpers
+(e.g. `leb128_encode`) get their own copy per direction inside one image,
+or a shared pool.
+
+## 11. Core shakedown — Not started, no hard dependency
+
 - Reassess `traits.ts` — suspected unused bloat; confirm and justify or
-  remove.
+  remove. Purely an audit; doesn't need anything else on this list to
+  land first, and could happen anytime.
 - Design the "weird" features properly (wishlist-level today): e.g. a
   target type mapping forcing raw packet accessors instead of
   element-by-element codec work.
 
-## 10. Real target codegens
+## 12. Real target codegens
 
-Depends on (7)-(9) for the codec-specific pieces. `target-cpp`/
+Depends on (7)-(10) for the codec-specific pieces. `target-cpp`/
 `target-js` are rushed stubs today.
 
 **Sketched, not verified** (`packages/machine/src/raise.ts`) —

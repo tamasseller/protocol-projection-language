@@ -5,8 +5,8 @@
  * `./opcodes.ts` names (§2/§3), plus `codecRules()`, their `ir\`...\`` DSL
  * surface. Lives here rather than `@ppl/machine` because that package must
  * stay protocol-agnostic; conceptually it's still core infrastructure, not
- * a codec itself. Still out of scope: the wire-level `codec` byte layout
- * (§6 — deliberately deferred, ROADMAP.md item 8).
+ * a codec itself. The wire-level `codec` byte layout (§6, ROADMAP.md item
+ * 8) lives in `./wire.ts`, wired in below as `Extension.codec`.
  *
  * Direction (§2.1/§2.3) is a whole-program property, passed in once here.
  * It's read by `computeChild`'s union branch (decode instantiates a
@@ -24,6 +24,7 @@ import type { IntegerType, TypeNode } from "@ppl/core"
 import { kindOf, SemanticTypeKinds } from "@ppl/core"
 import type { CodecOpcode } from "./opcodes"
 import { isCodecOpcode, assertNever } from "./opcodes"
+import { codecWireCodec } from "./wire"
 
 export type Direction = "encode" | "decode"
 
@@ -548,6 +549,6 @@ export function createCodecExtension(direction: Direction, root: Handle, buffer:
         }
     }
 
-    return { effects: EFFECTS, exec }
+    return { effects: EFFECTS, exec, codec: codecWireCodec }
 }
 

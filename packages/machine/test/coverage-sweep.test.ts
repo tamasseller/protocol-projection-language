@@ -187,8 +187,8 @@ for (const {ast, isa, swap, hasFlip, writeback} of OPS)
             // direct and flip exactly (relabeling which side plays which
             // role costs the same either way), and direct always wins
             // that tie. Breaking it needs two compound operands whose
-            // tos-vs-acc cost *delta* differs: "(8+9)" (both literals)
-            // costs exactly 1 byte more as tos than as acc
+            // tos-vs-acc cost *delta* differs: "(x+100)" (identifier op
+            // large-literal) costs exactly 1 byte more as tos than as acc
             // (immOperandRules' dedicated tos variant is a flat
             // one-PUSH delta over its acc form); "(p+q)" (both
             // identifiers) costs 2 more, since its only tos route is a
@@ -199,23 +199,32 @@ for (const {ast, isa, swap, hasFlip, writeback} of OPS)
             // applies whether the top-level op ends in PEEK_PEEK or
             // POP_ACC+PUSH, since the asymmetry is about the *children's*
             // cost, not the top-level combo.
+            //
+            // Deliberately not "(8+9)" (two literals): rules.ts's
+            // `fold:binary:*` rules (one per OP_TABLE entry) fold any
+            // literal-op-literal subtree to a plain constant regardless of
+            // what the *outer* operator is, which would let the outer op
+            // dispatch through `IMM_ACC:flip` (an immediate operand) instead
+            // of the stack combo this probe means to force — "(x+100)"
+            // keeps the same acc/tos delta this tie-break needs while
+            // staying unfoldable (`x` isn't a compile-time constant).
             test("POP_ACC (flip)", () =>
             {
-                winsRule(`(8 + 9) ${ast} (p + q)`, "acc", `${ast}->${flipIsa}:POP_ACC:flip`)
+                winsRule(`(x + 100) ${ast} (p + q)`, "acc", `${ast}->${flipIsa}:POP_ACC:flip`)
             })
 
             if (writeback)
             {
                 test("PEEK_PEEK (flip)", () =>
                 {
-                    winsRule(`(8 + 9) ${ast} (p + q)`, "tos", `${ast}->${flipIsa}:PEEK_PEEK:flip`)
+                    winsRule(`(x + 100) ${ast} (p + q)`, "tos", `${ast}->${flipIsa}:PEEK_PEEK:flip`)
                 })
             }
             else
             {
                 test("POP_ACC:tos (flip, no peek combo for comparisons)", () =>
                 {
-                    winsRule(`(8 + 9) ${ast} (p + q)`, "tos", `${ast}->${flipIsa}:POP_ACC:tos:flip`)
+                    winsRule(`(x + 100) ${ast} (p + q)`, "tos", `${ast}->${flipIsa}:POP_ACC:tos:flip`)
                 })
             }
         }
