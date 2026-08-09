@@ -21,30 +21,47 @@ export type SemanticField = {name: string; type: SemanticType}
 export interface UnitType {kind: SemanticTypeKinds.Unit}
 export const unit: UnitType = {kind: SemanticTypeKinds.Unit}
 
-export interface IntegerType 
+export interface IntegerType
 {
     kind: SemanticTypeKinds.Integer
     min: number
     max: number
+    /** Value a decoder/encoder substitutes when this field/variant has no
+     *  source value of its own on one side of a reconciled pair of trees
+     *  (docs/codec-image.md §3.1/§3.3). Always concrete — every integer
+     *  has a default, `0` unless the constructor was given a third
+     *  argument. A field needing a non-zero default doesn't reuse a
+     *  shared constant like `u8`; it constructs its own `integer(min,
+     *  max, d)` value, which is already a distinct `TypeNode`
+     *  (type-graph.ts's sharing is keyed by object identity, not
+     *  structure) — no separate per-slot default record is needed. */
+    default: number
 }
 
-export interface ListType 
+export interface ListType
 {
     kind: SemanticTypeKinds.List
     elementType: SemanticType
     capacity?: number
 }
 
-export interface StructType 
+export interface StructType
 {
     kind: SemanticTypeKinds.Struct
     fields: Map<string, SemanticType>
 }
 
-export interface UnionType 
+export interface UnionType
 {
     kind: SemanticTypeKinds.Union
     variants: Map<string, SemanticType>
+    /** Name of the variant `defaultValueOf` (and a decoder reconciling
+     *  against a narrower image tree, docs/codec-image.md §3.2) falls
+     *  back to. Opt-in and restricted to a `unit`-valued variant (so it
+     *  never needs a payload of its own) — a union with no natural
+     *  fallback (e.g. an instruction-opcode-style enum) simply doesn't
+     *  declare one, and defaultValueOf/reconciliation trap instead. */
+    defaultVariant?: string
 }
 
 export const kindOf = (t: SemanticType): SemanticTypeKinds | "reference" => typeof t === "function" ? "reference" : t.kind
@@ -69,7 +86,8 @@ export const isStruct = (t: SemanticType): t is StructType => kindOf(t) === Sema
 export const isUnion = (t: SemanticType): t is UnionType => kindOf(t) === SemanticTypeKinds.Union
 export const isReference = (t: SemanticType): t is UnionType => kindOf(t) === "reference"
 
-export const integer = (min: number, max: number): IntegerType => ({kind: SemanticTypeKinds.Integer, min, max})
+export const integer = (min: number, max: number, defaultValue: number = 0): IntegerType =>
+    ({kind: SemanticTypeKinds.Integer, min, max, default: defaultValue})
 
 // `2 ** n`, not `1 << n`: JS's `<<` operates on signed 32-bit ints (shift
 // amount mod 32, result sign-interpreted), which silently breaks exactly
@@ -96,8 +114,54 @@ export const struct = (def: {[k: string]: SemanticType}): StructType =>
     fields: new Map(Object.entries(def))
 })
 
-export const union = (def: {[k: string]: SemanticType}): UnionType =>
-({
-    kind: SemanticTypeKinds.Union,
-    variants: new Map(Object.entries(def))
-})
+export const union = (def: {[k: string]: SemanticType}, defaultVariant?: string): UnionType =>
+{
+    if(defaultVariant !== undefined)
+    {
+        const variantType = def[defaultVariant]
+        if(variantType === undefined)
+            throw new Error(`union: defaultVariant "${defaultVariant}" is not a variant of this union`)
+        if(!isUnit(variantType))
+            throw new Error(`union: defaultVariant "${defaultVariant}" must be unit-valued`)
+    }
+
+    return {
+        kind: SemanticTypeKinds.Union,
+        variants: new Map(Object.entries(def)),
+        defaultVariant
+    }
+}
+
+/**
+ * The value a decoder/encoder substitutes when a field/variant has no
+ * source value of its own on one side of a reconciled pair of trees
+ * (docs/codec-image.md §3.1/§3.3): `undefined` for `unit` (no data to
+ * default), the type's own `default` for an integer, `[]` for a list
+ * (an unfilled list is simply empty, never a declared value), the
+ * field-by-field composition of its own fields' defaults for a struct,
+ * and `{variant: defaultVariant, value: undefined}` for a union that
+ * declared one.
+ *
+ * Throws if a union with no declared `defaultVariant` is reached — a
+ * type-tree author who never needs this union's default (e.g. it's never
+ * the type of a field only one side of a reconciled pair declares) never
+ * has to declare one; the failure only surfaces once this is actually
+ * asked for, which docs/codec-image.md §4 fixes as a build/codegen-time
+ * error, not a per-message runtime trap.
+ */
+export function defaultValueOf(t: SemanticType): unknown
+{
+    const c = derefType(t)
+    switch(c.kind)
+    {
+        case SemanticTypeKinds.Unit:    return undefined
+        case SemanticTypeKinds.Integer: return c.default
+        case SemanticTypeKinds.List:    return []
+        case SemanticTypeKinds.Struct:
+            return Object.fromEntries([...c.fields.entries()].map(([name, type]) => [name, defaultValueOf(type)]))
+        case SemanticTypeKinds.Union:
+            if(c.defaultVariant === undefined)
+                throw new Error("defaultValueOf: union has no declared defaultVariant")
+            return {variant: c.defaultVariant, value: undefined}
+    }
+}

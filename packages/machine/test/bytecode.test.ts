@@ -17,13 +17,15 @@ import assert from "node:assert/strict"
 
 import {
     encodeInstr, decodeInstr, encodeBody, decodeBody,
-    encodeLeb128, decodeLeb128,
+    encodeProgram, decodeProgram, encodeLeb128, decodeLeb128,
 } from "../src/bytecode"
 import {
     opReg, opRegWriteback, opStack, opImm, bare, brTable, trap, call,
     LOAD, STORE, PUSH, POP, CONST,
 } from "../src/rtl"
-import type { RtlInstr, BinaryOpcode } from "../src/rtl"
+import type { RtlInstr, RtlProgram, BinaryOpcode } from "../src/rtl"
+import { validateProgram } from "../src/validate"
+import { run } from "../src/vm"
 
 // ─── The 128-row opcode table (isa-core.md, Appendix — Opcode Table) ──────
 
@@ -57,7 +59,7 @@ rows.push({ byte: 95, instr: bare("LOOP") })
 rows.push({ byte: 96, instr: brTable(1) })
 rows.push({ byte: 97, instr: brTable(2) })
 rows.push({ byte: 98, instr: brTable(3) })
-// 99 (CALL) has no encodable instruction yet — covered separately below.
+rows.push({ byte: 99, instr: call(REG) })
 rows.push({ byte: 100, instr: bare("RETURN") })
 rows.push({ byte: 101, instr: trap(0) })
 rows.push({ byte: 102, instr: trap(5) })
@@ -95,7 +97,6 @@ describe("Bytecode codec — 128-row opcode table (isa-core.md Appendix)", () =>
     test("all 128 byte values are accounted for (124 assigned + 4 reserved)", () =>
     {
         const assigned = new Set(rows.map(r => r.byte))
-        assigned.add(99) // CALL — assigned, just not encodable yet
         for (let b = 0; b < 128; b++)
         {
             if (b >= 124) continue // reserved, checked separately
@@ -114,12 +115,6 @@ describe("Bytecode codec — 128-row opcode table (isa-core.md Appendix)", () =>
     {
         assert.throws(() => decodeInstr(Uint8Array.of(128), 0), /extension opcode/)
         assert.throws(() => decodeInstr(Uint8Array.of(255), 0), /extension opcode/)
-    })
-
-    test("CALL is rejected on both encode and decode (no program-table wire framing yet)", () =>
-    {
-        assert.throws(() => encodeInstr(call(0)), /program-table wire framing/)
-        assert.throws(() => decodeInstr(Uint8Array.of(99), 0), /program-table wire framing/)
     })
 
     test("a comparison with a combo its addressing table doesn't have is rejected", () =>
@@ -223,5 +218,76 @@ describe("Bytecode codec — full-body round trip", () =>
     {
         const bytes = encodeBody([opImm("ADD", EXT_IMM)]) // [4, ...leb128(1000)]
         assert.throws(() => decodeBody(bytes.slice(0, bytes.length - 1)))
+    })
+})
+
+describe("Bytecode codec — program framing (isa-core.md §5.5)", () =>
+{
+    // proc 0 (entry): CONST 5; CALL 1; RETURN — calls proc 1 with 5 in acc.
+    // proc 1 (argCount 1): LOAD 0; ADD #10; RETURN — returns arg0 + 10.
+    function twoProcProgram(): RtlProgram
+    {
+        return {
+            procedures: [
+                { argCount: 0, body: [CONST(5), call(1), bare("RETURN")] },
+                { argCount: 1, body: [LOAD(0), opImm("ADD", 10), bare("RETURN")] },
+            ],
+        }
+    }
+
+    test("round-trips a multi-procedure program exactly", () =>
+    {
+        const program = twoProcProgram()
+        const decoded = decodeProgram(encodeProgram(program))
+        assert.deepEqual(decoded, program)
+    })
+
+    test("the round-tripped program still validates and runs correctly", () =>
+    {
+        const decoded = decodeProgram(encodeProgram(twoProcProgram()))
+        validateProgram(decoded)
+        const result = run(decoded)
+        assert.equal(result.ok, true)
+        assert.equal(result.acc, 15) // 5 + 10, via a real CALL across the wire
+    })
+
+    test("a procedure's own header never survives the round trip", () =>
+    {
+        // §5.5: extension header fields are deliberately not wire-encoded —
+        // only `arg_count` is. A caller-supplied header (as any extension,
+        // e.g. the codec extension, would set) comes back `undefined`.
+        const program: RtlProgram = {
+            procedures: [{ argCount: 0, body: [bare("RETURN")], header: { some: "extension data" } }],
+        }
+        const decoded = decodeProgram(encodeProgram(program))
+        assert.equal(decoded.procedures[0]!.header, undefined)
+    })
+
+    test("an empty program round-trips to zero procedures", () =>
+    {
+        const decoded = decodeProgram(encodeProgram({ procedures: [] }))
+        assert.deepEqual(decoded, { procedures: [] })
+    })
+
+    test("header rows come before any body byte — a decoder never touches body N's bytes to size body 0", () =>
+    {
+        // Two procedures whose bodies are deliberately different lengths;
+        // if the header table were interleaved with (or after) body bytes
+        // instead of preceding all of them, slicing body 0 by its declared
+        // length would still work by construction — so this instead directly
+        // checks the byte layout itself: the header table's own encoded
+        // length must exactly equal (1 count byte) + 2 * (1 argCount byte +
+        // 1 bodyLength byte) for two single-byte-argCount, sub-128-byte
+        // bodies, before any RETURN/CALL opcode byte appears.
+        const program: RtlProgram = {
+            procedures: [
+                { argCount: 0, body: [bare("RETURN")] },                    // 1 byte body
+                { argCount: 0, body: [CONST(1), bare("RETURN")] },          // 2 byte body
+            ],
+        }
+        const bytes = encodeProgram(program)
+        // count(1) + [argCount(1) bodyLength(1)] * 2 = 5 header bytes, then
+        // body 0's single RETURN byte (100), then body 1's CONST/RETURN.
+        assert.deepEqual([...bytes], [2, 0, 1, 0, 2, 100, 108 + 1, 100])
     })
 })

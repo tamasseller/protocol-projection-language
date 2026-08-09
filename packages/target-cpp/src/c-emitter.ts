@@ -68,7 +68,7 @@ function nameOf(nodeId: number, traits: TraitRegistry): string
 }
 
 /** Pick the smallest C integer type that fits the range. */
-export function cIntType(t: IntegerType): string
+export function cIntType(t: {min: number, max: number}): string
 {
     const {min, max} = t
     if (min >= 0)

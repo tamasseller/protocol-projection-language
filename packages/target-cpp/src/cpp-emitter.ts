@@ -109,7 +109,7 @@ export function refOf(node: TypeNode, graph: TypeGraph, traits: TraitRegistry): 
 }
 
 /** Pick the smallest fixed-width C++ integer type that fits the range. */
-function integerRef(t: IntegerType): string
+function integerRef(t: {min: number, max: number}): string
 {
     const {min, max} = t
     if(min >= 0)

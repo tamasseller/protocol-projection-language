@@ -365,6 +365,42 @@ arithmetic's — both classes' register mode reads an operand from `rN`.)
 See the Appendix — Opcode Table for the full literal expansion of this
 section's formula, one row per byte value.
 
+### 5.5 Program framing
+
+A whole program (§2.3: a procedure table, entry at index 0) serializes as
+one procedure count, one fixed-shape header row per procedure (`arg_count`
+plus that procedure's own body byte length), then every procedure's
+encoded body concatenated in table order:
+
+```
+program := proc_count:LEB128
+           (arg_count:LEB128  body_length:LEB128){proc_count}
+           (body_bytes){proc_count}
+```
+
+Header rows come first, as one block — not interleaved with bodies — so a
+decoder computes every procedure's exact byte range from `body_length`
+alone, without touching a single body byte until it actually wants one.
+Lengths, not absolute offsets: an offset is only ever the prefix sum of
+the lengths before it, so storing both would be redundant, and lengths
+are what a decoder needs anyway to size a buffer or skip a body outright.
+
+Only `arg_count` is a wire-level, core-mandated field. A procedure
+header's extension fields (§2.3, §11.4) are *not* wire-encoded here, on
+purpose: they're opaque to the generic core by design, and the one real
+consumer measured so far (the codec extension's `o0` `TypeNode`,
+docs/codec-image.md) turned out to be a build/validate-time-only value
+that never needs to survive being serialized at all — nothing has ever
+asked for extension header data to persist across a wire boundary. If
+that changes, it's a new, symmetric hook (an `Extension.header` codec,
+mirroring `Extension.codec` for opcodes) added when a real need appears,
+not something reserved against speculatively here.
+
+`CALL`'s own trailing operand (§5.4) is exactly `proc_idx` — a plain,
+unbounded LEB128 procedure-table index, the same treatment `codec_idx`
+gets in the codec extension's own opcodes (docs/codec-extension.md §6.4):
+a procedure-table index has no small natural ceiling worth a compact form.
+
 ---
 
 ## 6. Calling Convention

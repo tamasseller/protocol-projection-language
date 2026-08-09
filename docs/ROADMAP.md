@@ -27,12 +27,12 @@ rejection, header/block well-formedness) and returns the *tight*
 stack-depth bound (actual per-call-site depth + callee's worst case, not
 the loose per-procedure-maxima sum) as a byproduct of the same DFS.
 
-## 4. Bytecode ser/des — Partially done
+## 4. Bytecode ser/des — Done
 
 `bytecode.ts` encodes/decodes a flat `RtlInstr[]` body, checked row-for-row
 against isa-core.md's opcode table, plus extension opcodes (byte ≥128, via
-`Extension.codec`). `CALL`'s numeric encoding and the multi-procedure
-program envelope moved to item 8.
+`Extension.codec`). `CALL`'s own numeric encoding and the multi-procedure
+program envelope landed as item 8.
 
 Building this surfaced a real bug (since fixed): comparisons have no
 `PEEK_PEEK` addressing mode (§4.2), but `rules.ts` generated one anyway and
@@ -142,16 +142,26 @@ on `Extension`/`ExecState`/`ExtOpEffect`) into `@ppl/core` would drag that
 dependency in. A new sibling package is sound in principle but premature:
 `@ppl/codecs` is still the only consumer.
 
-## 8. Multi-procedure program envelope — Not started
+## 8. Multi-procedure program envelope — Done
 
-`CALL`'s numeric encode/decode plus program-level framing (procedure
-count/offset table). Purely `@ppl/machine`-generic — no codec-specific
-piece at all, unlike everything else from here on. **Not blocked on
-anything**: items 1-7 are all `Done`, and procedure bodies are already
-self-framing (bracket matching), so this is plausibly just a count +
-concatenated bodies. Of everything left on this roadmap, this is the one
-item ready to implement with no design work or prerequisite left to
-settle first.
+`CALL`'s numeric encode/decode (isa-core.md §5.4: byte 99 + unbounded
+LEB128 `proc_idx`, the same treatment `codec_idx` gets in codec-extension.md
+§6.4) plus program-level framing — isa-core.md §5.5,
+`bytecode.ts`'s `encodeProgram`/`decodeProgram`. Purely `@ppl/machine`-
+generic, no codec-specific piece at all: a procedure count, then a header
+row per procedure (`arg_count` + that procedure's own body byte length) up
+front — a real offset table, not bodies self-framing via bracket-matching
+as originally speculated — then every body concatenated in table order.
+`Uint8Array.subarray` slices each procedure's exact byte range as a view
+(no copy) before handing it to the existing single-body `decodeBody`, so
+nothing about single-procedure encoding needed to change.
+
+Verified via `packages/machine/test/bytecode.test.ts`'s new "program
+framing" suite: exact round-trip (including an empty program), the
+round-tripped program still passing `validateProgram` and actually running
+correctly through a real cross-procedure `CALL`, and a direct byte-layout
+check that the header table precedes every body byte, not just an
+incidental result of slicing by length.
 
 **Considered and declined:** baking resource-peak stats (max stack depth,
 max concurrent handles/iterators) into this envelope, for a target that
@@ -164,36 +174,86 @@ way; a consumer that does need pre-sized stats can pull them from there
 (or derive its own codec-specific ones) and fold them into its own
 application-level image instead. Same reasoning is why
 `computeHandlePeaks`/`computeStreamIteratorPeaks` (item 7's
-`validate-handles.ts`) were built, then removed.
+`validate-handles.ts`) were built, then removed — and the same reasoning
+this envelope also applies to a procedure's own `header` (its extension
+fields, isa-core.md §2.3/§11.4): dropped, never wire-encoded, since
+nothing has ever needed one to survive serialization (item 10's own
+finding about the codec extension's `o0` `TypeNode` specifically).
 
-## 9. Declared default values (`@ppl/core`) — Not started
+## 9. Declared default values (`@ppl/core`) — Done
 
 Doesn't depend on (7) or (8) — this is a `@ppl/core`-only type-system
 change, and item 10 depends on *this* landing, not the other way around.
-Motivated entirely by codec-image.md §3.1/§3.3 (a consumer's on-demand
-codegen sometimes has no source value at all for a field only one of the
-two independently-versioned schemas declares, on either the encode or the
+Motivated by codec-image.md §3.1/§3.3 (a consumer's on-demand codegen
+sometimes has no source value at all for a field only one of the two
+independently-versioned schemas declares, on either the encode or the
 decode path, and needs a value that travels with whichever tree does
-declare it).
+declare it) and, per §3.2, a union with no declared default now traps on
+an unrecognized incoming variant instead of silently dropping it.
 
-`@ppl/core/metamodel.ts`'s `struct()`/`union()` build a plain
-`Map<string, SemanticType>` today — no slot between name and type to hang
-a default off. The unused `SemanticField = {name, type}` alias already
-sitting in metamodel.ts is a candidate shape for a third `default` member,
-not a decision made yet. Needs: where declared (probably at
-`struct({...})`/`union({...})` call sites, alongside the type), how a
-composite field's default composes from its own fields' defaults
-(codec-image.md §4) rather than requiring a hand-authored whole literal,
-and how `matchType`/`TypeGraph`/every existing consumer of
-`StructType.fields`/`UnionType.variants` reacts to the value shape
-changing from `SemanticType` to `SemanticType`-plus-default.
+Per-kind mechanism, decided (codec-image.md §4):
+
+- **Integer** — a third constructor parameter, `integer(min, max, default
+  = 0): IntegerType`, stored as `IntegerType.default: number`. `u8`/`i16`/
+  etc. get default `0` for free — they already call `integer(min, max)`
+  with no third argument. A field needing a non-zero default doesn't
+  reuse a shared constant, it constructs its own `integer(min, max, d)`
+  value — `type-graph.ts`'s own sharing model is already keyed by
+  type-*object* identity, not structure, so a field wanting its own
+  default already gets its own `TypeNode` for free by not sharing the
+  object; no new per-slot wrapper needed. The `SemanticField = {name,
+  type}` shape previously floated as a candidate for a third `default`
+  member is *not* the direction taken — `struct()`/`union()` keep
+  building a plain `Map<string, SemanticType>`, unchanged.
+- **Unit** — none; carries no data, never needed.
+- **List** — none, ever. An unfilled list is empty — not a declared
+  default, the only value absence can coherently have for a list. No
+  `ListType` change.
+- **Struct** — none authored. Always the composition of its own fields'
+  declared defaults, recursively.
+- **Union** — opt-in `defaultVariant?: string` on `UnionType`, set via
+  `union(def, defaultVariant?)`, restricted to naming a `unit`-valued
+  variant of `def` (validated at construction — throws otherwise). Not
+  mandatory: an instruction-opcode-style union (every variant `unit`, no
+  natural fallback) should trap rather than silently default, and that's
+  the type-tree author's own per-union decision.
+
+`defaultValueOf(type: SemanticType): unknown` is the new recursive
+function (`metamodel.ts`) that computes one: `undefined` for `unit`, the
+type's own `default` for an integer, `[]` for a list, field-by-field
+composition for a struct, `{variant: defaultVariant, value: undefined}`
+for a union that declared one. A union that didn't, reached mid-
+composition, throws — and since which defaults will ever be asked for is
+fully knowable once the two trees are reconciled (codec-image.md §2), that
+failure belongs at build/codegen time, not deferred to a per-message
+runtime trap the way a real out-of-range value (codec-image.md §3.4) has
+to be.
+
+No shape change to `StructType.fields`/`UnionType.variants` (still plain
+`Map<string, SemanticType>`) and no change to `IntegerPattern`/
+`matchInteger` (a default doesn't affect matchability) — the only
+metamodel surface changes are the additive `IntegerType.default` and
+`UnionType.defaultVariant?`, both landed in `metamodel.ts` exactly as
+designed above, plus `defaultValueOf`. Verified via
+`packages/core/test/metamodel.runtime.test.ts` (default-value coverage per
+kind, `union`'s construction-time validation, and composite composition
+through nested structs/unions).
+
+This did surface two real call sites that only needed an integer's
+`{min, max}`, not the whole `IntegerType` (so didn't need — and, once
+`default` became required, couldn't cheaply fake — a `default` they never
+read): `codec-extension.ts`'s `intWireSize` (called with a bare
+`IntegerMatch` witness, `binary-rules.ts`), and `target-cpp`'s
+`cIntType`/`integerRef` (called with the same). All three narrowed their
+parameter to `{min: number, max: number}` — a real "required more than it
+used" fix the new field exposed, not a workaround.
 
 ## 10. Codec image — Designed, not implemented
 
-Depends on (8) (its encoder and decoder programs are each a whole
-multi-procedure `RtlProgram` — item 8's envelope is what a target actually
-serializes them with) and (9) (its type tree carries declared defaults per
-field/variant, per codec-image.md §4/§5).
+Depends on (8) and (9) — both Done: the encoder/decoder programs are each
+a whole multi-procedure `RtlProgram`, serializable via item 8's envelope,
+and the type tree can now carry declared defaults per field/variant, per
+codec-image.md §4/§5.
 
 Full design lives in **`docs/codec-image.md`**, not repeated here: why the
 semantic type tree needs to travel between two independently-built
@@ -210,9 +270,9 @@ a lowering→validation handoff entirely internal to one `buildCodec` call,
 resolved before anything is ever serialized (codec-extension.md §2.4/
 §7.1). **Still genuinely open:** the image container's own concrete byte
 layout (deferred the same "measure real cases first" way §6 was, until
-(8) and (9) exist to measure against), and whether `GENERIC`-ABI helpers
-(e.g. `leb128_encode`) get their own copy per direction inside one image,
-or a shared pool.
+(9) lands and real defaults exist to measure against), and whether
+`GENERIC`-ABI helpers (e.g. `leb128_encode`) get their own copy per
+direction inside one image, or a shared pool.
 
 ## 11. Core shakedown — Not started, no hard dependency
 

@@ -2,29 +2,26 @@
  * @ppl/machine — Bytecode codec (isa-core.md §5, Appendix — Opcode
  * Table)
  *
- * Encodes/decodes one procedure's flat instruction stream — deliberately
- * scoped to just that. There is no procedure header (`arg_count` +
- * extension fields, §2.3) and no multi-procedure program framing yet
- * (ROADMAP.md items 1 and 6 respectively), so there's nothing to wrap this
- * codec in beyond a raw byte length. `encoding.ts` is unrelated: a
- * relative cost estimate for the lowerer's own candidate comparison, not a
- * real serializer.
+ * `encodeInstr`/`decodeInstr`/`encodeBody`/`decodeBody` handle one
+ * procedure's flat instruction stream, no header, no length prefix — the
+ * caller already knows where that buffer ends. `encodeProgram`/
+ * `decodeProgram` (isa-core.md §5.5, ROADMAP.md item 8) are the layer
+ * above: a whole program's procedure table, framed by a header row per
+ * procedure (`arg_count` + that procedure's own body byte length) up
+ * front, then every body concatenated in table order — deliberately *not*
+ * wire-encoding a procedure's extension header fields (§2.3/§11.4); see
+ * §5.5 for why nothing has ever needed that to survive serialization.
+ * `encoding.ts` is unrelated: a relative cost estimate for the lowerer's
+ * own candidate comparison, not a real serializer.
  *
  * `decodeInstr`/`encodeInstr` byte ≥128 (§5.1, "owned by the active
  * extension") delegates to an `Extension.codec` (extension.ts, ROADMAP.md
  * item 6), passed in as an optional trailing parameter; with none
  * registered, they throw a specific, well-labeled error at exactly that
  * point rather than misinterpreting the byte or failing generically.
- * `CALL` is the other deliberate stub: it
- * now carries the same resolved `calleeIndex: number` §4.6's `proc_idx`
- * wants (ROADMAP.md items 1–2 landed name→index resolution), but there is
- * still no multi-procedure program framing to encode/decode it *against*
- * — a lone `CALL` inside one procedure's body has nothing to check its
- * index against without the program-wide procedure table (ROADMAP.md
- * item 4's program envelope, not yet built).
  */
 
-import type { RtlInstr, BinaryOpcode, UnaryOpcode } from "./rtl"
+import type { RtlInstr, RtlProc, RtlProgram, BinaryOpcode, UnaryOpcode } from "./rtl"
 import type { Extension } from "./extension"
 
 // ── LEB128 ───────────────────────────────────────────────────────────────
@@ -92,12 +89,12 @@ const UNARY_OPS: readonly UnaryOpcode[] = ["NEG", "NOT", "CLZ", "REVBITS"]
 // ── Encode ───────────────────────────────────────────────────────────────
 
 /** Encode one instruction. Throws on anything not representable in the
- *  current wire format — see this file's header comment for `CALL` and
- *  extension opcodes; every other throw is a genuinely malformed
- *  `RtlInstr` (e.g. a comparison with a combo its addressing table
- *  doesn't have — isa-core.md §4.2 — which nothing in `rules.ts` should
- *  ever produce, but the codec checks anyway rather than silently
- *  emitting a wrong byte). */
+ *  current wire format — extension opcodes with no registered
+ *  `Extension.codec` (see this file's header comment); every other throw
+ *  is a genuinely malformed `RtlInstr` (e.g. a comparison with a combo its
+ *  addressing table doesn't have — isa-core.md §4.2 — which nothing in
+ *  `rules.ts` should ever produce, but the codec checks anyway rather than
+ *  silently emitting a wrong byte). */
 export function encodeInstr(instr: RtlInstr, extension?: Extension): number[]
 {
     if (instr.op === "EXT")
@@ -147,7 +144,7 @@ export function encodeInstr(instr: RtlInstr, extension?: Extension): number[]
             if (instr.imm === 2) return [97]
             return [98, ...encodeLeb128(instr.imm)]
         case "CALL":
-            throw new Error(`encodeInstr: CALL has no program-table wire framing yet (ROADMAP.md item 4)`)
+            return [99, ...encodeLeb128(instr.calleeIndex)]
         case "RETURN": return [100]
         case "TRAP":
             return instr.imm === 0 ? [101] : [102, ...encodeLeb128(instr.imm)]
@@ -222,8 +219,7 @@ export function decodeInstr(bytes: Uint8Array, offset: number, extension?: Exten
         case 96: return { instr: { op: "BR_TABLE", imm: 1 }, next: pos }
         case 97: return { instr: { op: "BR_TABLE", imm: 2 }, next: pos }
         case 98: { const r = decodeLeb128(bytes, pos); return { instr: { op: "BR_TABLE", imm: r.value }, next: r.next } }
-        case 99:
-            throw new Error(`decodeInstr: byte 99 (CALL) has no program-table wire framing yet (ROADMAP.md item 4)`)
+        case 99: { const r = decodeLeb128(bytes, pos); return { instr: { op: "CALL", calleeIndex: r.value }, next: r.next } }
         case 100: return { instr: { op: "RETURN" }, next: pos }
         case 101: return { instr: { op: "TRAP", imm: 0 }, next: pos }
         case 102: { const r = decodeLeb128(bytes, pos); return { instr: { op: "TRAP", imm: r.value }, next: r.next } }
@@ -240,10 +236,10 @@ export function decodeInstr(bytes: Uint8Array, offset: number, extension?: Exten
 }
 
 /** Decode a full instruction stream from exactly `bytes` — no header, no
- *  length prefix; the caller already knows where the buffer ends (a
- *  length-prefixed container is a program-framing concern, ROADMAP.md
- *  item 1, not this codec's). Throws if a trailing partial instruction
- *  would run past the end of the buffer. */
+ *  length prefix; the caller already knows where the buffer ends (one
+ *  procedure's own byte range, sliced out by `decodeProgram` below, per
+ *  §5.5). Throws if a trailing partial instruction would run past the end
+ *  of the buffer. */
 export function decodeBody(bytes: Uint8Array, extension?: Extension): RtlInstr[]
 {
     const instrs: RtlInstr[] = []
@@ -255,4 +251,55 @@ export function decodeBody(bytes: Uint8Array, extension?: Extension): RtlInstr[]
         pos = next
     }
     return instrs
+}
+
+// ── Program framing (isa-core.md §5.5) ─────────────────────────────────────
+
+/** Encode a whole program: procedure count, then one `(arg_count,
+ *  body_length)` header row per procedure, then every body concatenated in
+ *  table order. Deliberately drops each `RtlProc.header` — see this file's
+ *  header comment and §5.5 for why extension header fields never need to
+ *  cross the wire (nothing has ever needed them to survive
+ *  serialization). */
+export function encodeProgram(program: RtlProgram, extension?: Extension): Uint8Array
+{
+    const bodies = program.procedures.map(proc => encodeBody(proc.body, extension))
+    const table = program.procedures.flatMap((proc, i) =>
+        [...encodeLeb128(proc.argCount), ...encodeLeb128(bodies[i]!.length)])
+    return Uint8Array.from([
+        ...encodeLeb128(program.procedures.length),
+        ...table,
+        ...bodies.flatMap(b => [...b]),
+    ])
+}
+
+/** Decode a whole program from exactly `bytes` (§5.5) — reads the header
+ *  table once, up front, so every procedure's body is sliced out by exact
+ *  byte length (`Uint8Array.subarray`, a view, not a copy) rather than
+ *  relying on `decodeBody` to self-detect where one procedure ends and the
+ *  next begins. Decoded procedures always come back with `header:
+ *  undefined` — nothing wire-level to restore it from (§5.5). */
+export function decodeProgram(bytes: Uint8Array, extension?: Extension): RtlProgram
+{
+    const countR = decodeLeb128(bytes, 0)
+    const count = countR.value
+    let pos = countR.next
+
+    const headers: { argCount: number; bodyLength: number }[] = []
+    for (let i = 0; i < count; i++)
+    {
+        const argCountR = decodeLeb128(bytes, pos)
+        const bodyLengthR = decodeLeb128(bytes, argCountR.next)
+        headers.push({ argCount: argCountR.value, bodyLength: bodyLengthR.value })
+        pos = bodyLengthR.next
+    }
+
+    const procedures: RtlProc[] = headers.map(({ argCount, bodyLength }) =>
+    {
+        const body = decodeBody(bytes.subarray(pos, pos + bodyLength), extension)
+        pos += bodyLength
+        return { argCount, body }
+    })
+
+    return { procedures }
 }

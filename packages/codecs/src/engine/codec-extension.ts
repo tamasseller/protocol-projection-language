@@ -35,7 +35,7 @@ export type Direction = "encode" | "decode"
  *  host-mapping layer — never has to import from the bytecode-*generation*
  *  layer (a component) built on top of it; `binary-rules.ts` imports it
  *  from here instead. */
-export function intWireSize(t: IntegerType): number
+export function intWireSize(t: {min: number, max: number}): number
 {
     const range = t.max - t.min
     if(range <= 0xFF) return 1

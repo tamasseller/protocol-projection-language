@@ -1,8 +1,8 @@
 # Codec Image
 
 > **Status:** Design spec, not yet implemented — ROADMAP.md item 10.
-> Depends on item 8 (multi-procedure program envelope) and item 9
-> (declared default values), neither implemented yet either. Specifies the
+> Depends on item 8 (multi-procedure program envelope — done) and item 9
+> (declared default values — done). Specifies the
 > artifact one party's build produces and another, independently-built
 > party's on-demand code generator consumes — the semantic type tree
 > reconciliation this requires is the actual reason this item's wire
@@ -178,37 +178,46 @@ The bytecode still fully specifies how to read (and, where relevant,
 navigate past) the unrecognized data — it was compiled against the wider
 image tree, which does know its shape. Generated code executes that
 reading faithfully (so the stream cursor stays correctly positioned for
-whatever comes next) but drops the corresponding write: there is no local
-storage location to bridge it to.
+whatever comes next); what it does with the *value* differs by kind.
 
-For a struct field this is unconditionally safe: a struct's shape doesn't
-depend on which fields are present, so skipping the write of one changes
-nothing about how any other field is read.
+For a struct field, the write is simply dropped: there is no local
+storage location to bridge it to, and this is unconditionally safe — a
+struct's shape doesn't depend on which fields are present, so skipping
+the write of one changes nothing about how any other field is read.
 
 For a union, the active variant *is* the payload's shape — an
 unrecognized variant tag still gets its payload read correctly (the
 bytecode, generated against the image tree, already knows exactly how many
 bytes and what structure that variant's payload has, independent of
-whether the *consumer* understands it), but there is no local case to
-materialize a value into, so the value is simply dropped, same as an
-unrecognized struct field — nothing is written, decode moves on.
+whether the *consumer* understands it). What happens locally now depends
+on whether the local union type declares a **default variant** (§4): if
+it does, decode materializes that variant instead — the same declared
+default a missing struct field would reach for, just arrived at via an
+unrecognized tag instead of an absent field. If it doesn't, decode
+**traps**: unlike a struct field's absence (unconditionally safe, per the
+paragraph above — a struct's shape never depends on which fields are
+present), a union's active variant *is* its shape, so silently
+materializing nothing would leave the local object holding a value from no
+case its own type admits at all. Whether that's tolerable is exactly the
+call §4 already assigns to whichever union declares — or deliberately
+doesn't declare — a default variant: an instruction-opcode-style union
+(every variant `unit`, no natural fallback) is a real "don't default,
+trap" case, not an oversight the mechanism needs to work around.
 
-Whether the local union type should instead carry an explicit
-"unrecognized variant" case, so application code can tell "this arrived
-and decoded fine" apart from "something arrived that this build doesn't
-understand yet," is a real, separate question this document does *not*
-resolve — not a lighter "opt-in" toggle on the mechanism above, since no
-concrete mechanism for it exists yet (there's no schema-level way today to
-mark one variant as "the catch-all for anything unrecognized," and
-matching by name (§2.1) gives reconciliation no way to route an
-unrecognized tag into a specific local variant without one). Nor is it
-the same problem §4's declared defaults solve: a default stands in for a
-value of a *known* shape the consumer simply has no source for; an
-unrecognized variant is the absence of shape knowledge itself, not a
-missing value of a known one — §4 doesn't cover it, and inventing a
-default for "whatever this unknown thing is" wouldn't mean anything. Left
-for the Appendix as a genuinely open question, not a decided,
-just-not-mandatory feature.
+A declared default variant answers *most* of what was previously an open
+question here: whether the local union type should carry an explicit
+"unrecognized variant" case at all — yes, opt in by declaring one (§4),
+restricted to a `unit`-valued variant so it never needs a payload of its
+own. What's still genuinely open: a default variant reached because §4
+needed *some* value for a struct field of this union's type (§3.1/§3.3)
+and a default variant reached because an *incoming tag wasn't recognized*
+(this paragraph) are, on the wire, indistinguishable outcomes — both land
+on the same named variant. An application that needs to tell "this
+decoded fine as that variant" apart from "this arrived as something my
+build doesn't recognize yet, so it fell back" has no mechanism to do so
+beyond its own naming convention (e.g. reserving a variant literally named
+`unrecognized`). A dedicated, unambiguous case for that distinction is
+still not designed here.
 
 ### 3.3 Encode, image tree wider (image describes a field/variant local has no source value for)
 
@@ -260,26 +269,45 @@ declares a given field is the one that must supply its default, whether
 that's the image (§3.3, encode) or the local tree (§3.1, decode) — neither
 direction is more of an afterthought than the other.
 
-**Where it attaches.** Per struct field and per union variant — not per
-leaf type. The same leaf type (say `u8`) reused across many fields needs a
-different sensible default in each context, so the default belongs to the
-*slot* (the field/variant edge), not the type sitting at the far end of
-it. `@ppl/core/metamodel.ts` today has no such slot: `struct()`/`union()`
-build a plain `Map<string, SemanticType>`, with nothing between the name
-and the type to hang a default off. (The existing `SemanticField = {name:
-string; type: SemanticType}` alias is unused by `struct()`/`union()`
-today — `dogfood.ts` shadows the name locally for something unrelated —
-but its shape, `{name, type}`, is exactly where a third `default` member
-would go if this is the direction item 9 takes; not a decision made here,
-just a candidate the shape already points at.)
+**Where it attaches.** On the type value itself, not on a separate slot
+between name and type. `type-graph.ts` already keys sharing by
+type-*object* identity, not structure ("same JS object → same `TypeNode`
+… the author controls sharing by how they construct/export types" — its
+own file header) — so "the same leaf type (say `u8`) reused across many
+fields needs a different sensible default in each context" isn't actually
+a gap to fill with a new per-slot wrapper: a field that needs its own
+default simply doesn't reuse the shared `u8` constant, it constructs its
+own `integer(0, 255, d)` value, which already gets its own `TypeNode` for
+free. The `SemanticField = {name, type}` shape floated here previously as
+a candidate for a third `default` member is *not* the direction taken —
+`struct()`/`union()` keep building a plain `Map<string, SemanticType>`,
+unchanged.
 
-**What it is.** A fully-formed value of the field's/variant's own type.
-For a composite (struct/union) field with no default of its own, the
-default should be derivable by composing its *own* fields'/variants'
-declared defaults recursively — so a whole nested default object doesn't
-need to be hand-authored as one literal blob wherever a composite field
-might need one. `unit` needs no default at all (it carries no data —
-there's nothing to default).
+**What it is**, per kind (the concrete `@ppl/core` shape is ROADMAP item
+9's own work; this is the decision that work has to implement):
+
+- **Integer** — a third constructor parameter, `default = 0`
+  (`IntegerType.default: number`). Every existing constant (`u8`, `i16`,
+  …) gets default `0` for free, since none of them pass a third argument.
+- **Unit** — none; carries no data, nothing to default.
+- **List** — none, ever. An unfilled list is empty — that's not a
+  declared default, it's the only value absence can coherently have for a
+  list.
+- **Struct** — none authored. Always the composition of its own fields'
+  declared defaults, recursively — a whole nested default object is never
+  hand-authored as one literal blob.
+- **Union** — opt-in, naming one of its own variants as the
+  **default variant**, restricted to a `unit`-valued one (so it never
+  needs a payload of its own). Deliberately not mandatory: some unions
+  (all-`unit`, instruction-opcode-style, no natural fallback — §3.2) must
+  trap instead of ever defaulting, and that's the type-tree author's own
+  per-union call.
+
+A composite default that bottoms out in a union with no declared default
+variant fails — and since which defaults will ever be asked for is fully
+knowable once the two trees are reconciled (§2), that failure belongs at
+build/codegen time, not deferred to a per-message runtime trap the way
+§3.4's real out-of-range-value trap has to be.
 
 **When it's required.** Only a field actually reached by §3.1 or §3.3 in
 practice needs one — but since nobody can know in advance whether a given
@@ -295,27 +323,27 @@ point in a field's lifetime where "what should an old reader do if it
 doesn't know I exist yet" is a question whoever's adding the field is
 already best placed to answer.)
 
-This document fixes *why* a default is needed and *where* it has to
-attach for §3.1/§3.3 to work — not the `@ppl/core` API/syntax for
-declaring one, nor whether it's mandatory at every field going forward.
-That's ROADMAP item 9's own design work; this section is the constraint
-that work has to satisfy, not a preview of its outcome.
+This document fixes *why* a default is needed, *where* it has to attach,
+and *which kind gets what shape of default* for §3.1/§3.3 to work. The
+literal `@ppl/core` syntax and `defaultValueOf`, the function that
+actually walks a type computing one, are implemented — ROADMAP item 9,
+`@ppl/core/metamodel.ts`.
 
 ---
 
 ## 5. What the image carries
 
 - The semantic type tree, rooted at the entry procedure's declared object
-  type (codec-extension.md §2.4) — now additionally carrying, per struct
-  field and union variant, an optional declared default (§4), since §3.3
-  needs to read it *from the image*: the image is the only place a value
-  for a field the local tree doesn't have at all could come from. §3.1's
-  own defaults are the mirror image, not something the image needs to
-  carry at all — they're declared in the *consumer's* own schema, compiled
-  into its own on-demand codegen exactly the way the image's defaults are
-  compiled into the origin's, and never cross the wire either way. Each
-  side's defaults live with the tree that declares them; the image only
-  ever needs to carry its own.
+  type (codec-extension.md §2.4) — now additionally carrying each
+  integer's own declared `default` and each union's own declared
+  `defaultVariant`, if any (§4), since §3.3 needs to read them *from the
+  image*: the image is the only place a value for a field the local tree
+  doesn't have at all could come from. §3.1's own defaults are the mirror
+  image, not something the image needs to carry at all — they're declared
+  in the *consumer's* own schema, compiled into its own on-demand codegen
+  exactly the way the image's defaults are compiled into the origin's, and
+  never cross the wire either way. Each side's defaults live with the tree
+  that declares them; the image only ever needs to carry its own.
 - One encoder program, one decoder program — unchanged from what
   codec-extension.md already specifies. Reconciliation is purely a
   codegen-time bridge (§2.1); nothing about it changes the bytecode's own
@@ -394,18 +422,37 @@ common, but the mirror case):** image tree is wider. The consumer's
 substitutes V2's declared default (`0`) — §3.3 — so the V2-shaped wire
 bytes this device still expects come out well-formed regardless.
 
+**A union's default variant (§3.2/§4):** suppose `SensorKind` is
+`union({ temperature: ..., humidity: ..., unrecognized: unit },
+"unrecognized")` at the server's (consumer's) own build, and an older
+device ships an image whose `SensorKind` has a third variant the server
+predates entirely, say `pressure`. Decoding a `pressure` reading: the
+bytecode reads its payload correctly (compiled against the image, which
+does know `pressure`'s shape), but the server's own tree has no
+`pressure` case to write into — decode selects `unrecognized` instead of
+trapping, because `SensorKind` declared a default variant for exactly
+this. Had `SensorKind` not named one, this exact scenario would trap
+instead — the same union, minus one constructor argument, trades
+"gracefully degrade" for "fail loudly," which is the point: that trade is
+the type author's call, not a distinction the mechanism makes for them.
+
 ---
 
 ## Appendix — Deferred Design Points
 
 - **Image container byte encoding.** Still open — §5's closing paragraph.
-- **`@ppl/core` default-value API.** Still open — §4's closing paragraph,
-  tracked as ROADMAP item 9.
-- **Explicit "unrecognized variant" case.** Genuinely open, per §3.2 — no
-  schema-level mechanism exists yet for a union to mark one variant as a
-  catch-all for an unrecognized tag, and §4's declared defaults don't
-  cover it (a default stands in for a missing value of a *known* shape;
-  this is the absence of shape knowledge itself). Not designed here.
+- **`@ppl/core` default-value API.** Done (§4, ROADMAP item 9) — integer
+  gets a third constructor parameter (`default`, defaulting to `0`);
+  union gets an opt-in `defaultVariant` restricted to a `unit`-valued
+  variant; list/struct/unit need none (always empty / always composed /
+  never needed); `defaultValueOf` computes one, recursively.
+- **Explicit "unrecognized variant" case.** Mostly answered by §3.2's
+  default-variant refinement — a union opts in by declaring one. What's
+  still genuinely open: a default variant reached via §4 (composing a
+  struct field's default) and one reached via an unrecognized incoming
+  tag (§3.2) are indistinguishable on the wire, so an application that
+  needs to tell those two apart has no mechanism beyond its own naming
+  convention. Not designed here.
 - **Kind-changing evolution** (§2.2). Rejected outright, not designed
   around.
 - **List element-type evolution.** A list's one element edge reconciles
