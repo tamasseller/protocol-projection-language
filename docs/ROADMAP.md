@@ -442,6 +442,52 @@ that would recognize `WRITE_SEQ`/`READ_SEQ` and emit a raw-buffer/DMA
 version for a target that's opted in. This item only built the snatch
 point; choosing what to do with it is real target-codegen work.
 
+### Reconciliation algorithm (docs/codec-image.md §2/§3) — implemented
+
+Previously scoped under item 12 on the reasoning that it "has no meaning
+independent of a codegen consuming it." Revisited: that's true of its
+*output*, not of the algorithm computing it — exactly the same relationship
+`raise.ts` has to a target's own emitter. It's target-independent (pure
+spec: kind checks, name-matching, the four relaxation rules), so it lives
+here, next to `type-tree-wire.ts`/`codec-image.ts`, not deferred into item
+12.
+
+`packages/codecs/src/engine/reconcile.ts` — `reconcile(imageRoot,
+localRoot): Correspondence`, a lock-step walk of two ordinary `TypeNode`
+graphs (the decoded image tree's own graph, and the consumer's local one)
+producing a bidirectional `"matched"`/`"image-only"`/`"local-only"` tree;
+`resolve(parent, edge, direction): Resolution`, the separate, direction-
+*aware* step applying §3's rules (`bridge`/`drop`/`default`/`trap`) to one
+edge. Kept apart because the tree shape doesn't depend on direction, only
+its interpretation does (docs/codec-image.md §2.4 has the full design,
+including the one real correctness subtlety found while building this: a
+union variant is *not* an always-present slot the way a struct field is,
+so only two of `resolve`'s four (extra-side × direction) combinations for
+a variant are ever reachable — the other two get a fifth `Resolution`
+case, `"unreachable"`, rather than a silently-fabricated `drop`/`default`
+for a codegen branch that can never execute).
+
+`Correspondence` deliberately carries no name of its own — struct fields
+and union variants are `{name, correspondence}` edges hanging off
+`.children`, mirroring `type-graph.ts`'s own `TypeEdge {step, target}`
+split. Caught by a test before it shipped: an earlier draft put `.name`
+directly on `Correspondence`, which silently broke identity-sharing for
+both genuine cycles *and* unrelated positions that happen to reuse the
+same shared type object — a cyclic back-edge (or a second sibling field
+typed as the same constant) returned the ancestor's own name instead of
+the edge's own. Moving name off the node, onto the edge — exactly why
+`TypeNode` itself carries no name — fixed it without losing the identity-
+sharing that makes a cyclic/shared position return the same
+`Correspondence` object a caller may already have elsewhere (useful for a
+codegen wanting to monomorphize one procedure per distinct pair, the same
+way `resolver.ts` already does via `TypeNode` identity).
+
+Tests: `packages/codecs/test/reconcile.test.ts` — matched/image-only/
+local-only walks, §2.2's kind-mismatch rejection, cycle safety on the
+local side, the image side, and both sides mutually, the sibling-sharing
+regression above, and all eight cells of §2.4's resolve() table (six real
+rules, two `unreachable`).
+
 ## 12. Real target codegens
 
 Depends on (7)-(10) for the codec-specific pieces. `target-cpp`/
@@ -451,10 +497,11 @@ A target codegen that consumes a codec image (item 10) also needs
 codec-image.md §2/§3 — the name-keyed reconciliation algorithm and its
 four relaxation rules — since that's precisely what turns "here's an
 image" into "here's the native accessor code bridging it to my own
-schema." No code exists for this yet; it has no meaning independent of
-the codegen that would consume it, which is why it lives here and not on
-item 10's own list (item 10's job was the artifact itself, not what a
-consumer does with it).
+schema." That algorithm is now implemented (item 11's
+`packages/codecs/src/engine/reconcile.ts`, target-independent — see item
+11's own writeup) — what's still this item's own job is a real codegen
+actually *calling* `reconcile()`/`resolve()` and turning the result into
+native accessor code for a specific target.
 
 **Sketched, not verified** (`packages/machine/src/raise.ts`) —
 `raiseProgram`/`raiseProc`, the structural inverse of `lower.ts`: flat
@@ -475,6 +522,7 @@ against real fixtures — reasoned by hand, not yet run against
 - crypto extension via stream iterators: new handle space, openssl like api, could cover CRCs, fixed and variable length hashes (shake) and aead as well
 - better dsl syntax accessing handles: like stream[0].read/write or some declaration like syntax (could also allow allocations to be delegated to the lowerer, would be nice)
 - small **value** space merging binary codec, e.g. union tag merged with limited range number field in one of the variants, might need some annotation/hinting/some kind of meta-argument to specify what to merge with what, becasue it favors some against the others heavily compactness-wise.
+- target side transformation (unit of measurement)
 
 ---
 

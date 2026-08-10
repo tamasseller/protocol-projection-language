@@ -3,11 +3,15 @@
 > **Status:** ROADMAP.md item 10 — Done. §6 (type tree wire encoding) and
 > §7 (container layout) are implemented, `packages/codecs/src/engine/
 > type-tree-wire.ts` and `engine/codec-image.ts` — that's this item's own
-> scope, the artifact itself. §2/§3 (reconciliation) has no code yet, but
-> that's tracked under item 12 (real target codegens): it has no meaning
-> independent of a codegen consuming it, so it isn't this item's job to
-> implement. Depends on item 8 (multi-procedure program envelope — done)
-> and item 9 (declared default values — done). Specifies the
+> scope, the artifact itself. §2/§3/§2.4 (reconciliation) is *also*
+> implemented, but under item 11, not this one — `engine/reconcile.ts`, a
+> target-independent `reconcile()`/`resolve()` pair (mirroring `raise.ts`'s
+> own placement in `@ppl/machine`: it computes a mapping a target codegen
+> consumes, but knows nothing about any target language itself). What's
+> still genuinely item 12's job is a real target codegen actually calling
+> it and emitting native accessor code from the result. Depends on item 8
+> (multi-procedure program envelope — done) and item 9 (declared default
+> values — done). Specifies the
 > artifact one party's build produces and another, independently-built
 > party's on-demand code generator consumes — the semantic type tree
 > reconciliation this requires is the actual reason this item's wire
@@ -129,6 +133,91 @@ having a variant the other doesn't, a list's declared capacity differing —
 reconciliation doesn't reject the mismatch outright. It's resolved per
 §3's direction-and-width rules instead, which is the entire point of doing
 this walk rather than requiring the two trees to be isomorphic.
+
+### 2.4 Implementation shape
+
+`packages/codecs/src/engine/reconcile.ts` — target-independent, like
+`raise.ts` is in `@ppl/machine`: it computes a mapping a target codegen
+consumes, but knows nothing about any target language itself. Two
+functions, deliberately kept separate:
+
+```ts
+export function reconcile(imageRoot: TypeNode, localRoot: TypeNode): Correspondence
+export function resolve(parent: Correspondence, edge: CorrespondenceEdge, direction: Direction): Resolution
+```
+
+`reconcile` is the direction-agnostic lock-step walk §2 describes: one
+`Correspondence` tree, `imageRoot`'s `TypeNode.id` (from a `TypeGraph`
+built over the *decoded* image tree, `buildTypeGraph(decoded.typeTree)`)
+paired against `localRoot`'s own `TypeNode` — the "image nodes by index,
+local nodes by `TypeNode`" split falls out for free, since both are
+ordinary `TypeNode`s once the image tree is decoded. Throws on a §2.2 kind
+mismatch; every other divergence becomes a `"matched"` / `"image-only"` /
+`"local-only"` node.
+
+A `Correspondence` carries **no name of its own** — struct fields and
+union variants are `CorrespondenceEdge {name, correspondence}` pairs
+hanging off `.children`, mirroring `type-graph.ts`'s own `TypeEdge
+{step, target}` split (a `TypeNode` has no name; only the edge reaching it
+does). This isn't a style choice: `reconcile` is memoized on the exact
+(imageNode, localNode) pair, mint-before-recurse exactly like
+`buildTypeGraph`'s own `byObject` cache, so a cyclic or independently-
+shared position returns the *same* `Correspondence` object a caller may
+already have elsewhere in the tree — valuable, since it lets a codegen
+monomorphize one generated procedure per distinct pair, the same way
+`resolver.ts` already does via `TypeNode` identity. Putting a name on the
+node itself (an earlier draft's mistake, caught by a test before this
+ever shipped) would silently report the *first* edge's name for every
+later edge that happens to reach the same shared or cyclic node — exactly
+the class of bug `type-graph.ts` avoids by keeping names off nodes in the
+first place.
+
+`resolve` is the separate, direction-*aware* step that turns one
+*edge* — not a bare node — into what a codegen should actually emit,
+which is why it takes `parent` alongside the edge: a struct field and a
+union variant need different rules under the same outcome (below), and
+only the *parent's own kind* (Struct vs. Union — read directly off
+`parent.imageNode`/`parent.localNode`) tells `resolve` which applies.
+`parent` must itself be `"matched"` — never a limitation in practice,
+since a non-`"matched"` edge's own resolution (`drop`/`default`/`trap`/
+`unreachable`) already fully describes what to do with everything nested
+inside it (§3.2's own reasoning: dropping a struct field write is safe
+regardless of what the field's type contains), so a real caller only ever
+calls `resolve` on children of an edge it already bridged into.
+
+**The asymmetry `resolve` has to get right**: a struct field is an
+always-present slot regardless of direction, so all four combinations of
+(extra side × direction) are real and each needs an actual resolution. A
+union variant is *not* an always-present slot — it's a §2.3-style
+mutually-exclusive choice — so only two of the four combinations are ever
+reachable at runtime:
+
+| Parent kind | Extra side | Direction | §3 rule | Resolution |
+|---|---|---|---|---|
+| struct | image-only | decode | §3.2 | `drop` |
+| struct | image-only | encode | §3.3 | `default` (from image) |
+| struct | local-only | decode | §3.1 | `default` (from local) |
+| struct | local-only | encode | §3.4 (additive) | `drop` |
+| union | image-only | decode | §3.2 | `default` (local's declared default variant) or `trap` if none |
+| union | image-only | **encode** | — | **`unreachable`** — encode switches on the local value's own active variant, which can never *be* a variant local's type doesn't define |
+| union | local-only | **decode** | — | **`unreachable`** — decode switches on the incoming tag, which is always one the image itself declares |
+| union | local-only | encode | §3.4 (all-or-nothing) | `trap` — no wire representation |
+
+The two `unreachable` rows aren't a gap in §3 — they're combinations §3
+never needed to give a rule for, because the union's own selection
+mechanism (the local value's active variant on encode; the wire tag on
+decode) already rules them out structurally. `resolve` names this
+explicitly (a fifth `Resolution` case) rather than silently returning
+`drop` or fabricating a `default` for a branch that can never execute.
+
+Two things §2.2 leaves to the caller, deliberately not computed by either
+function: an integer's range compatibility (`imageRange ⊆ localRange` for
+decode; the actual value fitting `imageRange` for encode) and a list's
+capacity — both are directly readable off `c.imageNode.type`/
+`c.localNode.type` on a `"matched"` `Correspondence`, and §2.2 already
+frames the value-fitting half as "checked at generation time where
+possible, at runtime otherwise" — the consuming codegen's own job, not a
+structural reconciliation question.
 
 ---
 
