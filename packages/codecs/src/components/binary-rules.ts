@@ -83,6 +83,32 @@ ir`
     }
 `)
 
+// ── List<Integer> — the same length-prefixed layout, but the element run
+// itself goes through one WRITE_SEQ/READ_SEQ bulk transfer (ROADMAP.md
+// item 11) instead of `listEncodeRule`/`listDecodeRule`'s per-element
+// `call_codec_next` loop — no nested procedure call per element, and a
+// single recognizable op a target codegen's `raise.ts` pass can later
+// specialize into a raw-buffer/DMA copy. Placed ahead of the generic list
+// rules below (first-match-wins) so it preempts them for this one element
+// shape; a non-integer element (a struct, a nested list) still falls
+// through to the generic per-element loop. ─────────────────────────────
+
+const listOfIntegerEncodeRule = codecRule(pList(pInteger(-Infinity, Infinity)), (match, _ctx: void) =>
+ir`
+    u32 left = 0;
+    left = count(0);
+    write(0, ${countPrefixWidth(match.capacity)}, left);
+    write_seq(0, 0, ${intWireSize(match.elementMatch)}, left);
+`)
+
+const listOfIntegerDecodeRule = codecRule(pList(pInteger(-Infinity, Infinity)), (match, _ctx: void) =>
+ir`
+    u32 left = 0;
+    left = read(0, ${countPrefixWidth(match.capacity)});
+    open_list(0);
+    read_seq(0, 0, ${intWireSize(match.elementMatch)}, ${match.elementMatch.min < 0 ? 1 : 0}, left);
+`)
+
 /** Byte width of a standalone union's tag, sized to its actual variant
  *  count (mirrors `countPrefixWidth` above — same reasoning, a discrete
  *  count instead of an optional capacity). A tag is a variant *index*
@@ -246,7 +272,7 @@ const structDecodeRule = codecRule(pStructFields(pStar()), (match, _ctx: void, r
  *  `[...myOverrides, ...binaryEncodeRules]` to preempt specific shapes
  *  (see `components/delta-leb128.ts`). */
 export const binaryEncodeRules: readonly CodecRule<void>[] =
-    [integerEncodeRule, unitRule, listEncodeRule, unionEncodeRule, structEncodeRule]
+    [integerEncodeRule, unitRule, listOfIntegerEncodeRule, listEncodeRule, unionEncodeRule, structEncodeRule]
 
 export const binaryDecodeRules: readonly CodecRule<void>[] =
-    [integerDecodeRule, unitRule, listDecodeRule, unionDecodeRule, structDecodeRule]
+    [integerDecodeRule, unitRule, listOfIntegerDecodeRule, listDecodeRule, unionDecodeRule, structDecodeRule]

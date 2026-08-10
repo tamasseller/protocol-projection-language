@@ -23,8 +23,7 @@ import {
     runRuleset,
 } from "@ppl/core"
 import {
-    TraitRegistry,
-    TypeNameTrait,
+    nameOf as declaredNameOf,
 } from "@ppl/core"
 import {
     pInteger,
@@ -59,16 +58,16 @@ export interface TSTypeDecl
 // Helpers
 // ——————————————————————————————————————————————
 
-function nameOf(nodeId: number, traits: TraitRegistry): string
+function nameOf(node: TypeNode): string
 {
-    return traits.get(TypeNameTrait, nodeId) ?? `T${nodeId}`
+    return declaredNameOf(node.source as any) ?? `T${node.id}`
 }
 
 /**
  * Resolve a TS type reference for a node.
  * Integers → "number", Unit → "null", Lists → "T[]", others → by name.
  */
-export function tsRefOf(node: TypeNode, traits: TraitRegistry): string
+export function tsRefOf(node: TypeNode): string
 {
     const t = node.type
 
@@ -78,10 +77,10 @@ export function tsRefOf(node: TypeNode, traits: TraitRegistry): string
     if (isList(t))
     {
         const elemNode = child(node, {element: true})!
-        return `${tsRefOf(elemNode, traits)}[]`
+        return `${tsRefOf(elemNode)}[]`
     }
 
-    return nameOf(node.id, traits)
+    return nameOf(node)
 }
 
 // ——————————————————————————————————————————————
@@ -116,18 +115,18 @@ export function tsTypeRules(): ReadonlyArray<Rule<TSTypeDecl>>
         // 3. List → T[] (inline)
         {
             pattern: pList(pStar()),
-            produce: (_m, nodeId, graph, traits) => {
+            produce: (_m, nodeId, graph) => {
                 const elemNode = child(graph.nodes.get(nodeId)!, {element: true})!
-                return {ref: `${tsRefOf(elemNode, traits)}[]`, deps: [elemNode.id]}
+                return {ref: `${tsRefOf(elemNode)}[]`, deps: [elemNode.id]}
             },
         },
 
         // 4. Union (exact named variants) → discriminated union
         {
             pattern: pUnion({}),
-            produce: (_m, nodeId, graph, traits) => {
+            produce: (_m, nodeId, graph) => {
                 const node = graph.nodes.get(nodeId)!
-                const name = nameOf(nodeId, traits)
+                const name = nameOf(node)
 
                 const allUnit = node.edges.every(e => isUnit(e.target.type))
                 if (allUnit)
@@ -142,7 +141,7 @@ export function tsTypeRules(): ReadonlyArray<Rule<TSTypeDecl>>
                 // Discriminated union with tag field
                 const members = node.edges.map(e => {
                     const vName = "variant" in e.step ? e.step.variant : "_"
-                    const vType = tsRefOf(e.target, traits)
+                    const vType = tsRefOf(e.target)
                     return `  | { tag: "${vName}"; value: ${vType} }`
                 })
                 return {
@@ -156,9 +155,9 @@ export function tsTypeRules(): ReadonlyArray<Rule<TSTypeDecl>>
         // 5. Homogeneous-variants union → discriminated union
         {
             pattern: pUnionFields(pStar()),
-            produce: (_m, nodeId, graph, traits) => {
+            produce: (_m, nodeId, graph) => {
                 const node = graph.nodes.get(nodeId)!
-                const name = nameOf(nodeId, traits)
+                const name = nameOf(node)
 
                 const allUnit = node.edges.every(e => isUnit(e.target.type))
                 if (allUnit)
@@ -171,7 +170,7 @@ export function tsTypeRules(): ReadonlyArray<Rule<TSTypeDecl>>
 
                 const members = node.edges.map(e => {
                     const vName = "variant" in e.step ? e.step.variant : "_"
-                    const vType = tsRefOf(e.target, traits)
+                    const vType = tsRefOf(e.target)
                     return `  | { tag: "${vName}"; value: ${vType} }`
                 })
                 return {
@@ -185,12 +184,12 @@ export function tsTypeRules(): ReadonlyArray<Rule<TSTypeDecl>>
         // 6. Struct → interface
         {
             pattern: pStructFields(pStar()),
-            produce: (_m, nodeId, graph, traits) => {
+            produce: (_m, nodeId, graph) => {
                 const node = graph.nodes.get(nodeId)!
-                const name = nameOf(nodeId, traits)
+                const name = nameOf(node)
                 const fieldLines = node.edges.map(e => {
                     const fName = "field" in e.step ? e.step.field : "_"
-                    return `  readonly ${fName}: ${tsRefOf(e.target, traits)};`
+                    return `  readonly ${fName}: ${tsRefOf(e.target)};`
                 })
                 return {
                     ref: name,
@@ -211,10 +210,9 @@ export function tsTypeRules(): ReadonlyArray<Rule<TSTypeDecl>>
  */
 export function projectTSTypes(
     graph: TypeGraph,
-    traits: TraitRegistry,
 ): Map<number, TSTypeDecl>
 {
-    return runRuleset(graph, tsTypeRules(), traits)
+    return runRuleset(graph, tsTypeRules())
 }
 
 /**

@@ -23,8 +23,7 @@ import {
     runRuleset,
 } from "@ppl/core"
 import {
-    TraitRegistry,
-    TypeNameTrait,
+    nameOf as declaredNameOf,
 } from "@ppl/core"
 import {
     pInteger,
@@ -62,9 +61,9 @@ export interface CTypeDecl
 // Helpers
 // ——————————————————————————————————————————————
 
-function nameOf(nodeId: number, traits: TraitRegistry): string
+function nameOf(node: TypeNode): string
 {
-    return traits.get(TypeNameTrait, nodeId) ?? `T${nodeId}`
+    return declaredNameOf(node.source as any) ?? `T${node.id}`
 }
 
 /** Pick the smallest C integer type that fits the range. */
@@ -100,7 +99,6 @@ export function cIntType(t: {min: number, max: number}): string
  */
 export function cRefOf(
     node: TypeNode,
-    traits: TraitRegistry,
 ): string
 {
     const t = node.type
@@ -108,7 +106,7 @@ export function cRefOf(
     if (isInteger(t))  return cIntType(t as IntegerType)
     if (isUnit(t))     return "void"
     // Structs and unions are always referenced by name.
-    return nameOf(node.id, traits)
+    return nameOf(node)
 }
 
 // ——————————————————————————————————————————————
@@ -142,9 +140,9 @@ export function cTypeRules(): ReadonlyArray<Rule<CTypeDecl>>
 
         // 3. Union with EXACT named variants — tagged union.
         //    When ALL variants are unit, emit just a tag byte (no data union).
-        rule(pUnion({}), (_m, nodeId, graph, traits) => {
+        rule(pUnion({}), (_m, nodeId, graph) => {
             const node = graph.nodes.get(nodeId)!
-            const name = nameOf(nodeId, traits)
+            const name = nameOf(node)
             const allUnit = node.edges.every(e => isUnit(e.target.type))
 
             if (allUnit)
@@ -164,7 +162,7 @@ export function cTypeRules(): ReadonlyArray<Rule<CTypeDecl>>
             // Mixed-payload tagged union.
             const variantFields = node.edges.map(e => {
                 const vName = "variant" in e.step ? e.step.variant : "_"
-                const vType = cRefOf(e.target, traits)
+                const vType = cRefOf(e.target)
                 return `        ${vType} ${vName};`
             })
             return {
@@ -182,9 +180,9 @@ export function cTypeRules(): ReadonlyArray<Rule<CTypeDecl>>
 
         // 4. Homogeneous-variants union (pUnionFields) — fallback for
         //    unions where we don't enumerate every variant name.
-        rule(pUnionFields(pStar()), (_m, nodeId, graph, traits) => {
+        rule(pUnionFields(pStar()), (_m, nodeId, graph) => {
             const node = graph.nodes.get(nodeId)!
-            const name = nameOf(nodeId, traits)
+            const name = nameOf(node)
             const allUnit = node.edges.every(e => isUnit(e.target.type))
 
             if (allUnit)
@@ -199,7 +197,7 @@ export function cTypeRules(): ReadonlyArray<Rule<CTypeDecl>>
 
             const variantFields = node.edges.map(e => {
                 const vName = "variant" in e.step ? e.step.variant : "_"
-                const vType = cRefOf(e.target, traits)
+                const vType = cRefOf(e.target)
                 return `        ${vType} ${vName};`
             })
             return {
@@ -217,9 +215,9 @@ export function cTypeRules(): ReadonlyArray<Rule<CTypeDecl>>
 
         // 5. Struct — each field emitted directly. List fields become
         //    fixed array + count.
-        rule(pStructFields(pStar()), (_m, nodeId, graph, traits) => {
+        rule(pStructFields(pStar()), (_m, nodeId, graph) => {
             const node = graph.nodes.get(nodeId)!
-            const name = nameOf(nodeId, traits)
+            const name = nameOf(node)
             const fieldLines: string[] = []
             const deps: number[] = []
 
@@ -237,7 +235,7 @@ export function cTypeRules(): ReadonlyArray<Rule<CTypeDecl>>
                     // option here.
                     const lt = edge.target.type as ListType
                     const elemNode = child(edge.target, {element: true})!
-                    const elemType = cRefOf(elemNode, traits)
+                    const elemType = cRefOf(elemNode)
                     const cap = lt.capacity ?? 255
 
                     fieldLines.push(`    ${elemType} ${fName}[${cap}];`)
@@ -246,7 +244,7 @@ export function cTypeRules(): ReadonlyArray<Rule<CTypeDecl>>
                 }
                 else
                 {
-                    fieldLines.push(`    ${cRefOf(edge.target, traits)} ${fName};`)
+                    fieldLines.push(`    ${cRefOf(edge.target)} ${fName};`)
                     deps.push(edge.target.id)
                 }
             }
@@ -271,10 +269,9 @@ export function cTypeRules(): ReadonlyArray<Rule<CTypeDecl>>
  */
 export function projectCTypes(
     graph: TypeGraph,
-    traits: TraitRegistry,
 ): Map<number, CTypeDecl>
 {
-    return runRuleset(graph, cTypeRules(), traits)
+    return runRuleset(graph, cTypeRules())
 }
 
 /**

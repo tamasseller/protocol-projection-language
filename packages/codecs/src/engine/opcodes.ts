@@ -2,12 +2,13 @@
  * @ppl/codecs — The codec extension's opcode vocabulary (docs/codec-
  * extension.md §3)
  *
- * The single source of truth for the 15 mnemonics `codec-extension.ts`'s
+ * The single source of truth for the 17 mnemonics `codec-extension.ts`'s
  * `codecRules()`/`EFFECTS`/`exec()` and `validate-handles.ts`'s static
  * checks all dispatch on — every op in §3, including the stream-fork
- * class (`HAS_NEXT`/`CLONE_RD`/`CLONE_WR`/`SEEK`). A typo in any one
- * wouldn't be caught by anything otherwise (`ExtInstr.ext` is a bare
- * `string` — opaque to `@ppl/machine` by design, isa-core.md §5.1);
+ * class (`HAS_NEXT`/`CLONE_RD`/`CLONE_WR`/`SEEK`) and the bulk-array
+ * transfer pair (`WRITE_SEQ`/`READ_SEQ`, ROADMAP.md item 11). A typo in
+ * any one wouldn't be caught by anything otherwise (`ExtInstr.ext` is a
+ * bare `string` — opaque to `@ppl/machine` by design, isa-core.md §5.1);
  * `CodecOpcode` lets `EFFECTS` be typed `Record<CodecOpcode, ExtOpEffect>`
  * (missing/misspelled key ⇒ compile error) and lets `exec`/
  * `validate-handles.ts`'s dispatches be checked exhaustively via
@@ -34,6 +35,7 @@ export const CODEC_OPCODES = [
     "CLONE_WR",
     "SEEK",
     "CALL_CODEC", "CALL_CODEC_NEXT",
+    "WRITE_SEQ", "READ_SEQ",
 ] as const
 
 export type CodecOpcode = typeof CODEC_OPCODES[number]

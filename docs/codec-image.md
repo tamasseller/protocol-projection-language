@@ -1,8 +1,13 @@
 # Codec Image
 
-> **Status:** Design spec, not yet implemented — ROADMAP.md item 10.
-> Depends on item 8 (multi-procedure program envelope — done) and item 9
-> (declared default values — done). Specifies the
+> **Status:** ROADMAP.md item 10 — Done. §6 (type tree wire encoding) and
+> §7 (container layout) are implemented, `packages/codecs/src/engine/
+> type-tree-wire.ts` and `engine/codec-image.ts` — that's this item's own
+> scope, the artifact itself. §2/§3 (reconciliation) has no code yet, but
+> that's tracked under item 12 (real target codegens): it has no meaning
+> independent of a codegen consuming it, so it isn't this item's job to
+> implement. Depends on item 8 (multi-procedure program envelope — done)
+> and item 9 (declared default values — done). Specifies the
 > artifact one party's build produces and another, independently-built
 > party's on-demand code generator consumes — the semantic type tree
 > reconciliation this requires is the actual reason this item's wire
@@ -357,13 +362,235 @@ domain wants maximum compactness), and any per-procedure header data
 beyond the entry's own root type (ROADMAP.md item 7/codec-extension.md
 §2.4 — every other handle's type is already derived, never declared).
 
-The concrete byte-level layout of the image container itself — how the
-type tree (including defaults), the two programs, and whatever framing
-ties them together actually get serialized — is still open, same
-"measure real cases first" reasoning as isa-core.md §5.3 and
-codec-extension.md §6 before it. This document fixes the *shape* the
-container needs to hold and the *algorithm* a consumer runs against it;
-the wire bytes are a separate, later question.
+The concrete byte-level layout — §6 (the type tree itself) and §7 (how the
+three pieces sit next to each other in one container).
+
+---
+
+## 6. Type tree wire encoding
+
+### 6.1 A postorder stack machine, not a table of nodes with pointers
+
+The bytecode itself already encodes a tree with zero pointers: `ref`
+operands (`ENTER`/`CALL_CODEC`, codec-extension.md §2.4) are *local* —
+positional into whichever node the current handle already stands on, not
+a global index into some tree-wide table. The only place a node's global
+identity matters at all is the single entry binding (handle 0 ↔ root
+type). Nothing downstream of decode cares how this section internally
+represents the tree, only that decode hands back the right shape — so
+this section's own wire format is free to pick whatever's most compact,
+independent of §2's reconciliation algorithm and independent of item 8's
+program envelope.
+
+The same trick the bytecode itself doesn't need to reach for — because a
+tree, walked postorder, never needs a reference to a child at all: by the
+time a parent is described, its children are already fully built and
+sitting right where the last few construction steps left them. This reads
+as a tiny stack machine: leaves push a value; a list/struct/union pops
+however many children it has and pushes the combined result. No node ever
+says "my child is over there" — the child is simply whatever the
+machine just finished building.
+
+### 6.2 Instructions
+
+One byte-tag instruction stream, decoded by a stack machine over a value
+stack of already-built (sub)types. The top 2 bits of the tag byte pick a
+*family*; for the three families that recur once per tree node
+(`STRUCT`'s field count, `UNION`'s variant count, `PUSH_REF`'s delta),
+the low 6 bits *are* the payload — no separate count/delta operand, ever,
+for the overwhelming majority of realistic values (0–63, or 1–64 for the
+1-based `PUSH_REF` delta). Decode is `family = byte >> 6; payload = byte &
+0x3F`, four cases, no bit-packing beyond that one shift+mask:
+
+| range | family | payload |
+|---|---|---|
+| `0x00`–`0x3F` | `STRUCT` | field count = payload (0–63) |
+| `0x40`–`0x7F` | `UNION` | variant count = payload (0–63) |
+| `0x80`–`0xBF` | `PUSH_REF` | delta = payload + 1 (1–64 constructions back, §6.4) |
+| `0xC0`–`0xFF` | everything else | sub-selected by payload |
+
+`STRUCT`/`UNION` are followed by a name specification — the range-list
+form §6.3 defines, self-terminating once it's supplied exactly that many
+names — plus, for `UNION`, one more LEB128 (`0` = no default variant,
+else `index + 1`, §4). A struct/union with ≥64 members, or a `PUSH_REF`
+more than 64 constructions back, falls through to the fourth family's own
+explicit-count escapes below — realistic schemas are never expected to
+reach them; they exist so nothing silently breaks on one that does.
+
+Fourth family (`0xC0`–`0xFF`), plain sequential tags, no further bit
+tricks — there's no per-node recurrence to exploit here, so a byte per
+tag is already at floor:
+
+| byte | instruction | operands |
+|---|---|---|
+| `0xC0` | `PUSH_UNIT` | none |
+| `0xC1`–`0xC6` | `PUSH_U8` / `I8` / `U16` / `I16` / `U32` / `I32` | none — covers every constant `metamodel.ts` exports today |
+| `0xC7` | `PUSH_INT_MIN0_D0_EXT` | max (zigzag-LEB128) — `min = 0`, `default = 0` |
+| `0xC8` | `PUSH_INT_MIN0_EXT` | max, default — `min = 0` |
+| `0xC9` | `PUSH_INT_D0_EXT` | min, max — `default = 0` |
+| `0xCA` | `PUSH_INT_EXT` | min, max, default — the fully general case |
+| `0xCB` | `LIST` | none (uncapacitated) |
+| `0xCC` | `LIST_EXT` | capacity: LEB128 |
+| `0xCD` | `STRUCT_EXT` | fieldCount: LEB128, then a name specification (§6.3) for that many names |
+| `0xCE` | `UNION_EXT` | variantCount: LEB128, name specification, defaultIndex |
+| `0xCF` | `PUSH_REF_EXT` | delta: LEB128 |
+| `0xD0` | `END` | none — pop the one remaining value (must be the *only* one left) → the root type; section over |
+| `0xD1`–`0xFF` | *reserved* | — |
+
+Four integer forms rather than one generic form plus min/default checks:
+`default = 0` is the common case even for a non-canonical range (§4's own
+declare-at-point-of-need discipline means most fields never bother
+overriding it), and `min = 0` covers most non-canonical ranges anyway
+(an arbitrary-width unsigned count or percentage, not just the six
+canonical widths). Both fold independently, so all four combinations get
+their own tag rather than paying for operands the common cases don't
+need — same "fold the measured-common case into the tag, keep one
+general escape" move `wire.ts` already made for the codec opcodes
+themselves.
+
+Encode is a bare postorder walk, no bookkeeping beyond what §6.4 adds:
+
+```
+encode(node):
+    switch(node.type.kind)
+        unit:    emit PUSH_UNIT
+        integer: emit canonical PUSH_*, or whichever PUSH_INT_*EXT
+                 fits (min=0? default=0? both? neither?)
+        list:    encode(elementType); emit LIST or LIST_EXT(capacity)
+        struct:  for each field:   encode(child)
+                 emit STRUCT(N, nameSpec) or, if N ≥ 64,
+                      STRUCT_EXT(N, nameSpec)
+        union:   for each variant: encode(child)
+                 emit UNION(N, nameSpec, defaultIndex) or,
+                      if N ≥ 64, UNION_EXT(...)
+encode(root); emit END
+```
+
+### 6.3 String table
+
+Field/variant names never appear inline — they're looked up in a table
+that precedes the instruction stream: `count: LEB128`, then `count`
+length-prefixed UTF-8 entries, deduplicated at encode time (a
+`Map<string, index>` built while walking, in first-appearance order — see
+below for why this document doesn't try to do better than that).
+
+This table belongs to the type tree section specifically, not the
+container as a whole: the two programs never carry names at all — they
+address everything positionally via `ref` (§6.1), and reconciliation's own
+name matching (§2.1) is a codegen-time concern that only ever touches the
+*decoded* tree, never the bytecode.
+
+**Name specification.** `STRUCT`/`UNION` don't reference the string table
+as a flat list of indices — they reference it as a list of *ranges*,
+read until it has supplied exactly as many names as the instruction's own
+count already said to expect (no separate range-count needed). Unlike
+`§6.2`'s outer instruction stream, this sub-encoding isn't itself
+opcode-tagged — it's a private format contextually known to be exactly
+this shape (a run of small integers, mostly length 1, occasionally
+longer), so it's free to use whatever's most compact without needing to
+fit the tag-byte scheme at all:
+
+Each range is `(base, length)`, meaning "names at string-table indices
+`base, base+1, …, base+length-1`," encoded as either one or two LEB128
+values depending on `length`:
+
+- **`length = 1`** (the common case — most individual name references
+  aren't part of a longer run): one LEB128, `(base << 1) | 1`.
+- **`length ≥ 2`**: two LEB128 values, `(length - 2) << 1` then `base`
+  plain.
+
+Decode reads one LEB128 `v`: if odd, `base = v >> 1`, `length = 1`; if
+even, `length = (v >> 1) + 2` and a second LEB128 supplies `base`. Fill
+that many slots from `base` upward, advance, and read another range if
+slots remain.
+
+Given a fixed string-table order, an encoder never needs to search for
+the best partition into ranges: merging any two numerically-adjacent
+pieces into one longer range never costs more (one range of length *L*
+always costs ≤ the cost of splitting it, under this scheme) and often
+costs less, so greedily extending each run as far as consecutiveness
+holds is already optimal. (A `length = 2` range costs the same 2 LEB128
+values as two separate `length = 1` entries, so it's a wash, not a loss —
+worth knowing, not worth special-casing further.)
+
+**Why the string table's order stays plain first-appearance, not
+actively optimized for this.** A struct that's the first place all of its
+own names ever appear already gets them as a contiguous run for free, no
+extra effort — first-appearance order already hands the range mechanism
+something to work with. Doing better than that — reordering the whole
+table so that names shared *across* multiple structs/unions also end up
+contiguous for each of them — is a real, named problem, not just an
+implementation detail: it's the **Consecutive Ones Property** (does a
+0/1 matrix of referrer-vs-name membership admit a column order making
+every row's membership contiguous), decidable in linear time via a
+**PQ-tree** (Booth & Lueker, 1976) when a single order can satisfy every
+referrer at once. When it can't — three referrers pairwise sharing one
+name each out of three names is enough to make that impossible, by simple
+pigeonhole on how many adjacent pairs a line of 3 elements even has —
+*maximizing* how many referrers still end up satisfied is NP-hard in
+general, the same complexity class as the physical-mapping problems this
+structure shows up in. Implementing or lifting a PQ-tree (or a heuristic
+approximating one) is real algorithmic machinery to carry for a payoff
+bounded by shaving a handful of index bytes off name-lists in images that
+are already small; declined for that reason, same bar applied to
+`PUSH_REF` (§6.4) and the nibble-packing question before it.
+
+### 6.4 `PUSH_REF` — optional, decode-mandatory dedup
+
+Every *construction* (everything except `PUSH_REF`/`PUSH_REF_EXT`
+themselves) gets an implicit sequential index just by counting how many
+have executed so far. Decode already has to retain a table of
+constructions to support `PUSH_REF` resolving against it at all
+(append-as-built, unconditionally — cheap whether or not an encoder ever
+emits one); `PUSH_REF`/`PUSH_REF_EXT` look up `table[nextIndex - delta]`
+and push a copy, without adding a new table entry.
+
+The discovery side falls out of §6.2's postorder walk for free: since
+each subtree's bytes are fully known the instant it finishes emitting,
+keep a `Map<bytes, constructionIndex>` alongside the walk — the literal
+emitted bytes as the key, not a hash, since these are small and a direct
+key sidesteps collision-handling entirely. Before appending a subtree's
+bytes, check whether that exact sequence was already emitted; if so, emit
+`PUSH_REF` instead; if not, emit normally and record it.
+
+This is strictly more general than `type-graph.ts`'s own object-identity
+sharing: it also catches two independently-written `struct({a: u8, b:
+unit})` calls — distinct objects that just happen to be structurally
+identical, not only genuine fan-in through one shared thunk. It's also
+fully opt-in: an encoder that never populates the map simply never emits
+`PUSH_REF` and still produces a correct, fully self-contained tree (real
+schemas seen so far — `packages/example`'s `Timestamp` is defined once
+and used in exactly one field — have no fan-in at all, so duplicating
+whatever sharing *does* show up elsewhere is not assumed to be a real
+cost; §6.2's postorder form is the one actually doing the compactness
+work, `PUSH_REF` is a strictly-optional refinement on top of it, not load
+bearing).
+
+### 6.5 Self-framing
+
+`END` pops the single value the whole stream must have reduced to and
+asserts nothing else is left on the stack — a decode-time sanity check
+that also means this section needs no outer length prefix: decode simply
+runs until it hits `END`.
+
+---
+
+## 7. Container layout
+
+Three sections, concatenated in this fixed order, with no framing between
+them at all — none is needed, because each already knows its own length
+as it's produced:
+
+1. **Type tree** (§6) — self-framing via `END` (§6.5).
+2. **Encoder program** — item 8's `encodeProgram` format: a procedure
+   count then a header row per procedure (`argCount`, `bodyLength`) up
+   front, so decode already knows exactly how many bytes the whole
+   program occupies before reading a single body byte.
+3. **Decoder program** — same format as (2).
+
+Decode reads the three in order, each consuming exactly its own bytes and
+handing back the next offset; nothing about the container adds anything
+beyond what its parts already carry.
 
 ---
 
@@ -440,7 +667,13 @@ the type author's call, not a distinction the mechanism makes for them.
 
 ## Appendix — Deferred Design Points
 
-- **Image container byte encoding.** Still open — §5's closing paragraph.
+- **Image container byte encoding.** Done — §6 (a postorder stack
+  machine over the type tree, with an opt-in `PUSH_REF` for structural
+  dedup) and §7 (the three sections just concatenate; each already
+  self-frames, so the container adds nothing on top), implemented in
+  `engine/type-tree-wire.ts`/`engine/codec-image.ts` and verified against
+  a real `buildCodec`-built encoder/decoder pair, run through the VM after
+  a full round trip.
 - **`@ppl/core` default-value API.** Done (§4, ROADMAP item 9) — integer
   gets a third constructor parameter (`default`, defaulting to `0`);
   union gets an opt-in `defaultVariant` restricted to a `unit`-valued

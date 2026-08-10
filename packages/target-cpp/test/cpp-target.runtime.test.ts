@@ -9,7 +9,7 @@ import * as assert from "node:assert/strict"
 import {integer, list, struct, union, unit} from "@ppl/core"
 import {buildTypeGraph, child} from "@ppl/core"
 import {runRuleset} from "@ppl/core"
-import {extractTraits, named} from "@ppl/core"
+import {named} from "@ppl/core"
 import {cppRules, emitCppHeader, refOf, TypeDecl} from "../src/cpp-emitter"
 
 ////////////////////////////////////////////////////////////////////////////////////////////////
@@ -29,8 +29,7 @@ test("cpp: integer → smallest fitting fixed-width type", () => {
     for(const [min, max, expected] of cases)
     {
         const g = buildTypeGraph(integer(min, max))
-        const traits = extractTraits(g)
-        const r = runRuleset(g, cppRules(), traits)
+        const r = runRuleset(g, cppRules())
         assert.equal(r.get(0)?.ref, expected, `integer(${min}, ${max}) → ${expected}`)
     }
 })
@@ -42,8 +41,7 @@ test("cpp: integer → smallest fitting fixed-width type", () => {
 test("cpp: struct with named fields emits struct declaration", () => {
     const T = named("Point", struct({x: integer(0, 255), y: integer(0, 255)}))
     const g = buildTypeGraph(T)
-    const traits = extractTraits(g)
-    const r = runRuleset(g, cppRules(), traits)
+    const r = runRuleset(g, cppRules())
 
     const decl = r.get(0)!
     assert.equal(decl.ref, "Point")
@@ -56,8 +54,7 @@ test("cpp: struct with named fields emits struct declaration", () => {
 test("cpp: unnamed struct gets T<id> fallback name", () => {
     const T = struct({a: integer(0, 1)})
     const g = buildTypeGraph(T)
-    const traits = extractTraits(g)
-    const r = runRuleset(g, cppRules(), traits)
+    const r = runRuleset(g, cppRules())
 
     assert.equal(r.get(0)?.ref, "T0")
     assert.ok(r.get(0)?.decl?.includes("struct T0 {"))
@@ -67,8 +64,7 @@ test("cpp: nested struct references child by name", () => {
     const Inner = named("Inner", struct({val: integer(0, 255)}))
     const Outer = named("Outer", struct({inner: Inner}))
     const g = buildTypeGraph(Outer)
-    const traits = extractTraits(g)
-    const r = runRuleset(g, cppRules(), traits)
+    const r = runRuleset(g, cppRules())
 
     const outerDecl = r.get(0)!
     assert.ok(outerDecl.decl?.includes("Inner inner;"), "nested struct field references child by name")
@@ -81,8 +77,7 @@ test("cpp: nested struct references child by name", () => {
 test("cpp: generic union → struct wrapping std::variant", () => {
     const T = named("Result", union({ok: integer(0, 255), err: integer(0, 255)}))
     const g = buildTypeGraph(T)
-    const traits = extractTraits(g)
-    const r = runRuleset(g, cppRules(), traits)
+    const r = runRuleset(g, cppRules())
 
     const decl = r.get(0)!
     assert.equal(decl.ref, "Result")
@@ -98,8 +93,7 @@ test("cpp: optional union → std::optional<T>", () => {
     const Optional = (T: any) => union({value: T, empty: unit})
     const T = struct({flag: Optional(integer(0, 255))})
     const g = buildTypeGraph(T)
-    const traits = extractTraits(g)
-    const r = runRuleset(g, cppRules(), traits)
+    const r = runRuleset(g, cppRules())
 
     const structDecl = r.get(0)!
     assert.ok(structDecl.decl?.includes("std::optional<uint8_t> flag;"), "optional field inlines as std::optional")
@@ -112,8 +106,7 @@ test("cpp: optional union → std::optional<T>", () => {
 test("cpp: list of integers → std::vector<uint8_t>", () => {
     const T = list(integer(0, 255))
     const g = buildTypeGraph(T)
-    const traits = extractTraits(g)
-    const r = runRuleset(g, cppRules(), traits)
+    const r = runRuleset(g, cppRules())
 
     assert.equal(r.get(0)?.ref, "std::vector<uint8_t>")
 })
@@ -122,8 +115,7 @@ test("cpp: list of structs → std::vector<NamedType>", () => {
     const Point = named("Point", struct({x: integer(0, 255), y: integer(0, 255)}))
     const T = list(Point)
     const g = buildTypeGraph(T)
-    const traits = extractTraits(g)
-    const r = runRuleset(g, cppRules(), traits)
+    const r = runRuleset(g, cppRules())
 
     assert.equal(r.get(0)?.ref, "std::vector<Point>")
 })
@@ -140,8 +132,7 @@ test("cpp: recursive type generates forward declaration + cycle-safe refs", () =
     }))
 
     const g = buildTypeGraph(T)
-    const traits = extractTraits(g)
-    const r = runRuleset(g, cppRules(), traits)
+    const r = runRuleset(g, cppRules())
 
     // The union (root) should be named "Tree"
     const treeDecl = r.get(0)!
@@ -164,8 +155,7 @@ test("cpp: emitCppHeader produces a complete header file", () => {
     const T = named("Shape", struct({origin: Point, points: list(Point)}))
 
     const g = buildTypeGraph(T)
-    const traits = extractTraits(g)
-    const r = runRuleset(g, cppRules(), traits)
+    const r = runRuleset(g, cppRules())
     const header = emitCppHeader(r, g, "Shape")
 
     assert.ok(header.includes("#pragma once"))
@@ -191,8 +181,7 @@ test("cpp: emitCppHeader with recursive type has forward decls before definition
     }))
 
     const g = buildTypeGraph(T)
-    const traits = extractTraits(g)
-    const r = runRuleset(g, cppRules(), traits)
+    const r = runRuleset(g, cppRules())
     const header = emitCppHeader(r, g, "Tree")
 
     const forwardPos = header.indexOf("struct Tree;")
@@ -242,8 +231,7 @@ test("cpp: dogfood TypeExpr generates a valid header", () => {
     }))
 
     const g = buildTypeGraph(TypeExpr)
-    const traits = extractTraits(g)
-    const r = runRuleset(g, cppRules(), traits)
+    const r = runRuleset(g, cppRules())
     const header = emitCppHeader(r, g, "TypeExpr")
 
     // The header should compile conceptually: forward decls, then definitions.

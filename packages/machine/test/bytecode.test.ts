@@ -238,13 +238,15 @@ describe("Bytecode codec — program framing (isa-core.md §5.5)", () =>
     test("round-trips a multi-procedure program exactly", () =>
     {
         const program = twoProcProgram()
-        const decoded = decodeProgram(encodeProgram(program))
-        assert.deepEqual(decoded, program)
+        const bytes = encodeProgram(program)
+        const decoded = decodeProgram(bytes)
+        assert.deepEqual(decoded.program, program)
+        assert.equal(decoded.next, bytes.length)
     })
 
     test("the round-tripped program still validates and runs correctly", () =>
     {
-        const decoded = decodeProgram(encodeProgram(twoProcProgram()))
+        const { program: decoded } = decodeProgram(encodeProgram(twoProcProgram()))
         validateProgram(decoded)
         const result = run(decoded)
         assert.equal(result.ok, true)
@@ -259,14 +261,29 @@ describe("Bytecode codec — program framing (isa-core.md §5.5)", () =>
         const program: RtlProgram = {
             procedures: [{ argCount: 0, body: [bare("RETURN")], header: { some: "extension data" } }],
         }
-        const decoded = decodeProgram(encodeProgram(program))
+        const { program: decoded } = decodeProgram(encodeProgram(program))
         assert.equal(decoded.procedures[0]!.header, undefined)
     })
 
     test("an empty program round-trips to zero procedures", () =>
     {
-        const decoded = decodeProgram(encodeProgram({ procedures: [] }))
+        const { program: decoded } = decodeProgram(encodeProgram({ procedures: [] }))
         assert.deepEqual(decoded, { procedures: [] })
+    })
+
+    test("decodeProgram reports where it stopped, for a container holding more than one program back-to-back", () =>
+    {
+        const a = encodeProgram(twoProcProgram())
+        const b = encodeProgram({ procedures: [{ argCount: 0, body: [bare("RETURN")] }] })
+        const combined = Uint8Array.from([...a, ...b])
+
+        const first = decodeProgram(combined)
+        assert.deepEqual(first.program, twoProcProgram())
+        assert.equal(first.next, a.length)
+
+        const second = decodeProgram(combined, first.next)
+        assert.deepEqual(second.program, { procedures: [{ argCount: 0, body: [bare("RETURN")] }] })
+        assert.equal(second.next, combined.length)
     })
 
     test("header rows come before any body byte — a decoder never touches body N's bytes to size body 0", () =>

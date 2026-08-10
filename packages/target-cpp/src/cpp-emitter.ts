@@ -17,7 +17,7 @@
  */
 import {TypeGraph, TypeNode, child} from "@ppl/core"
 import {Rule, rule, runRuleset} from "@ppl/core"
-import {TraitRegistry, TypeNameTrait} from "@ppl/core"
+import {nameOf as declaredNameOf} from "@ppl/core"
 import {
     pInteger,
     pUnit,
@@ -65,7 +65,7 @@ export interface TypeDecl
  * this is what makes cyclic types work (forward declarations cover
  * the cycle; the ref is the name, not an expanded inline type).
  */
-export function refOf(node: TypeNode, graph: TypeGraph, traits: TraitRegistry): string
+export function refOf(node: TypeNode, graph: TypeGraph): string
 {
     const t = node.type
 
@@ -82,7 +82,7 @@ export function refOf(node: TypeNode, graph: TypeGraph, traits: TraitRegistry): 
     if(isList(t))
     {
         const elemNode = child(node, {element: true})!
-        return `std::vector<${refOf(elemNode, graph, traits)}>`
+        return `std::vector<${refOf(elemNode, graph)}>`
     }
 
     if(isUnion(t))
@@ -94,15 +94,15 @@ export function refOf(node: TypeNode, graph: TypeGraph, traits: TraitRegistry): 
         if(valueEntry && hasEmpty && ut.variants.size === 2)
         {
             const valueNode = child(node, {variant: valueEntry[0]})!
-            return `std::optional<${refOf(valueNode, graph, traits)}>`
+            return `std::optional<${refOf(valueNode, graph)}>`
         }
         // Generic union → by name
-        return nameOf(node.id, traits)
+        return nameOf(node)
     }
 
     if(isStruct(t))
     {
-        return nameOf(node.id, traits)
+        return nameOf(node)
     }
 
     return "/* unknown */"
@@ -128,10 +128,12 @@ function integerRef(t: {min: number, max: number}): string
     }
 }
 
-/** Resolve a type's C++ name: TypeNameTrait if present, else T<id>. */
-function nameOf(nodeId: number, traits: TraitRegistry): string
+/** Resolve a type's C++ name: its first-class declared name if present
+ *  (metamodel.ts's `named()`, read off `node.source` — the pre-deref
+ *  object `named()` was actually called on), else `T<id>`. */
+function nameOf(node: TypeNode): string
 {
-    return traits.get(TypeNameTrait, nodeId) ?? `T${nodeId}`
+    return declaredNameOf(node.source as any) ?? `T${node.id}`
 }
 
 /**
@@ -162,19 +164,19 @@ export function cppRules(): ReadonlyArray<Rule<TypeDecl>>
 
         // 3. Optional: union({value:T, empty:unit}) → std::optional<T>
         rule(pUnion({value: pStar(), empty: pUnit()}),
-             (_m, nodeId, graph, traits) => {
+             (_m, nodeId, graph) => {
                  const valueNode = child(graph.nodes.get(nodeId)!, {variant: "value"})!
-                 return {ref: `std::optional<${refOf(valueNode, graph, traits)}>`, deps: [valueNode.id]}
+                 return {ref: `std::optional<${refOf(valueNode, graph)}>`, deps: [valueNode.id]}
              }),
 
         // 4. Struct → C++ struct with named fields
         rule(pStructFields(pStar()),
-             (_m, nodeId, graph, traits) => {
+             (_m, nodeId, graph) => {
                  const node = graph.nodes.get(nodeId)!
-                 const name = nameOf(nodeId, traits)
+                 const name = nameOf(node)
                  const fieldLines = node.edges.map(e => {
                      const fieldName = "field" in e.step ? e.step.field : "_"
-                     return `    ${refOf(e.target, graph, traits)} ${fieldName};`
+                     return `    ${refOf(e.target, graph)} ${fieldName};`
                  })
                  return {
                      ref: name,
@@ -186,10 +188,10 @@ export function cppRules(): ReadonlyArray<Rule<TypeDecl>>
 
         // 5. Generic union → C++ struct wrapping std::variant
         rule(pUnionFields(pStar()),
-             (_m, nodeId, graph, traits) => {
+             (_m, nodeId, graph) => {
                  const node = graph.nodes.get(nodeId)!
-                 const name = nameOf(nodeId, traits)
-                 const variantTypes = node.edges.map(e => refOf(e.target, graph, traits))
+                 const name = nameOf(node)
+                 const variantTypes = node.edges.map(e => refOf(e.target, graph))
                  return {
                      ref: name,
                      forward: `struct ${name};`,
@@ -200,9 +202,9 @@ export function cppRules(): ReadonlyArray<Rule<TypeDecl>>
 
         // 6. List → std::vector<T>
         rule(pList(pStar()),
-             (_m, nodeId, graph, traits) => {
+             (_m, nodeId, graph) => {
                  const elemNode = child(graph.nodes.get(nodeId)!, {element: true})!
-                 return {ref: `std::vector<${refOf(elemNode, graph, traits)}>`, deps: [elemNode.id]}
+                 return {ref: `std::vector<${refOf(elemNode, graph)}>`, deps: [elemNode.id]}
              }),
     ]
 }
@@ -274,10 +276,8 @@ export function generateCppHeader(
 {
     // Lazy import to avoid circular dependency at module load
     const {buildTypeGraph} = require("@ppl/core")
-    const {extractTraits} = require("@ppl/core")
 
     const graph: TypeGraph = buildTypeGraph(rootType)
-    const traits: TraitRegistry = extractTraits(graph)
-    const result = runRuleset(graph, cppRules(), traits)
+    const result = runRuleset(graph, cppRules())
     return emitCppHeader(result, graph, rootName)
 }

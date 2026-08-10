@@ -149,6 +149,30 @@ export const union = (def: {[k: string]: SemanticType}, defaultVariant?: string)
  * asked for, which docs/codec-image.md §4 fixes as a build/codegen-time
  * error, not a per-message runtime trap.
  */
+// — First-class type names ————————————————————————————————
+//
+// Replaces the old symbol-bag trait mechanism (`traits.ts`, removed):
+// a name is definition-time metadata on the type object itself, read back
+// by the same reference — no registry, no per-build extraction pass. Used
+// for codegen labeling (target-cpp/target-js's `nameOf`) and for
+// `matcher.ts`'s `pNamed()` rule-matching. Deliberately a different
+// namespace from a struct/union's field/variant names: those travel on
+// the wire (docs/codec-image.md §6.3); a type's own name never does.
+
+const NAME = Symbol("name")
+
+/** Attach a name to a type object at definition time, e.g.
+ *  `named("Timestamp", struct({secs: u32, nanos: u32}))`, or
+ *  `named("Tree", (): any => union({...}))` for a recursive thunk. */
+export const named = <T extends object>(name: string, obj: T): T =>
+{
+    (obj as {[NAME]?: string})[NAME] = name
+    return obj
+}
+
+/** Read back a type's declared name, if any. */
+export const nameOf = (t: SemanticType): string | undefined => (t as {[NAME]?: string})[NAME]
+
 export function defaultValueOf(t: SemanticType): unknown
 {
     const c = derefType(t)

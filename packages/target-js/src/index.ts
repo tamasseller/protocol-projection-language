@@ -17,7 +17,7 @@
  */
 export * from "./ts-emitter"
 
-import {SemanticType, TypeGraph, TraitRegistry, buildTypeGraph, extractTraits} from "@ppl/core"
+import {SemanticType, TypeGraph, buildTypeGraph} from "@ppl/core"
 import {projectTSTypes, emitTSDeclarations} from "./ts-emitter"
 
 /**
@@ -30,8 +30,7 @@ export function generateJsTypes(
 ): string
 {
     const graph: TypeGraph = buildTypeGraph(rootType)
-    const traits: TraitRegistry = extractTraits(graph)
-    const result = projectTSTypes(graph, traits)
+    const result = projectTSTypes(graph)
     return emitTSDeclarations(result)
 }
 

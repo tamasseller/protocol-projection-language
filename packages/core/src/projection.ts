@@ -14,7 +14,6 @@
  * Pure compile-time host machinery. No IR impact.
  */
 import {TypeGraph, TypeNode, Step, child} from "./type-graph"
-import {TraitRegistry} from "./traits"
 import {
     TypePattern,
     TypeMatch,
@@ -38,7 +37,7 @@ import {
 export interface Rule<C>
 {
     readonly pattern: TypePattern
-    readonly produce: (match: MatchOf<TypePattern>, nodeId: number, graph: TypeGraph, traits: TraitRegistry) => C
+    readonly produce: (match: MatchOf<TypePattern>, nodeId: number, graph: TypeGraph) => C
 }
 
 /**
@@ -64,7 +63,7 @@ export interface Rule<C>
  */
 export function rule<P extends TypePattern, C>(
     pattern: P,
-    produce: (match: MatchOf<P>, nodeId: number, graph: TypeGraph, traits: TraitRegistry) => C,
+    produce: (match: MatchOf<P>, nodeId: number, graph: TypeGraph) => C,
 ): Rule<C>
 {
     return { pattern, produce } as Rule<C>
@@ -79,9 +78,11 @@ export function rule<P extends TypePattern, C>(
  * derive the coverage set (all positions the witness touches, except
  * under pStar holes) so descendants are skipped.
  *
- * The produce callback receives a TraitRegistry, which it may read
- * (for pre-seeded traits like names) and write (for cross-projection
- * facets like accessors).
+ * A type's own declared name (metamodel.ts's `named()`/`nameOf()`) is
+ * first-class on the type object itself — a `produce` callback that wants
+ * it reads `nameOf(graph.nodes.get(nodeId)!.source)` (the pre-deref object
+ * `named()` was actually called on), or matches `pNamed(...)` directly —
+ * no registry parameter needed.
  *
  * @returns Map<nodeId, C> — covered-but-not-directly-matched nodes are
  *   absent (they inherit the absorbing rule's capability conceptually;
@@ -90,7 +91,6 @@ export function rule<P extends TypePattern, C>(
 export function runRuleset<C>(
     graph: TypeGraph,
     rules: ReadonlyArray<Rule<C>>,
-    traits: TraitRegistry,
 ): Map<number, C>
 {
     const result = new Map<number, C>()
@@ -105,7 +105,7 @@ export function runRuleset<C>(
             const m = matchType(node.type, rule.pattern)
             if(m !== undefined)
             {
-                result.set(node.id, rule.produce(m, node.id, graph, traits))
+                result.set(node.id, rule.produce(m, node.id, graph))
                 deriveCoverage(node, rule.pattern, m, graph, covered)
                 break
             }

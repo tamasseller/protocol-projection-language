@@ -6,16 +6,15 @@
 import {test} from "node:test"
 import * as assert from "node:assert/strict"
 
-import {integer, list, struct, union, unit} from "../src/metamodel"
+import {integer, list, named, nameOf, struct, union, unit} from "../src/metamodel"
 import {buildTypeGraph, child} from "../src/type-graph"
 import {Rule, runRuleset} from "../src/projection"
-import {extractTraits, TraitRegistry, tag, defineTrait, TypeNameTrait, named} from "../src/traits"
-import {pInteger, pList, pStar, pStruct, pStructFields, pUnion, pUnit, pAnyOf} from "../src/matcher"
+import {pInteger, pList, pNamed, pStar, pStruct, pStructFields, pUnion, pUnit, pAnyOf} from "../src/matcher"
 // pList imported for completeness; not all are used in every test.
 
-// Test-local convenience: run a ruleset with traits extracted from the graph.
+// Test-local convenience: run a ruleset against the graph.
 const run = <C>(g: ReturnType<typeof buildTypeGraph>, rules: ReadonlyArray<Rule<C>>): Map<number, C> =>
-    runRuleset(g, rules, extractTraits(g))
+    runRuleset(g, rules)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////
 // Single ruleset: basic coverage
@@ -292,120 +291,85 @@ test("coverage: fully-absorbing struct rule covers all descendants", () => {
 })
 
 ////////////////////////////////////////////////////////////////////////////////////////////////
-// Traits: pre-seeding, extraction, and cross-projection communication
+// First-class names (metamodel.ts's named()/nameOf()) and pNamed() matching
 ////////////////////////////////////////////////////////////////////////////////////////////////
 
-test("traits: named() pre-seeds TypeNameTrait, extractTraits copies to registry", () => {
+test("names: named() attaches a name readable via nameOf()", () => {
     const Ts = named("Timestamp", struct({secs: integer(0, 4294967295), nanos: integer(0, 999999999)}))
-    const g = buildTypeGraph(Ts)
-    const traits = extractTraits(g)
-
-    assert.equal(traits.get(TypeNameTrait, g.root.id), "Timestamp")
-    // Children have no name trait.
-    const secsId = child(g.root, {field: "secs"})!.id
-    assert.equal(traits.get(TypeNameTrait, secsId), undefined)
+    assert.equal(nameOf(Ts), "Timestamp")
 })
 
-test("traits: unnamed nodes have no TypeNameTrait", () => {
-    const g = buildTypeGraph(struct({a: integer(0, 1)}))
-    const traits = extractTraits(g)
-    assert.equal(traits.get(TypeNameTrait, g.root.id), undefined)
+test("names: unnamed types have no name", () => {
+    assert.equal(nameOf(struct({a: integer(0, 1)})), undefined)
 })
 
-test("traits: custom trait via tag() + defineTrait()", () => {
-    const DocTrait = defineTrait<string>()
-    const T = struct({a: integer(0, 1)})
-    tag(DocTrait, "A simple struct", T)
-
-    const g = buildTypeGraph(T)
-    const traits = extractTraits(g)
-
-    assert.equal(traits.get(DocTrait, g.root.id), "A simple struct")
-    // TypeNameTrait not attached → absent.
-    assert.equal(traits.get(TypeNameTrait, g.root.id), undefined)
-})
-
-test("traits: multiple traits on the same type object", () => {
-    const DocTrait = defineTrait<string>()
-    const UnitTrait = defineTrait<string>()
-
-    const T = named("MyType", struct({a: integer(0, 1)}))
-    tag(DocTrait, "Documented", T)
-    tag(UnitTrait, "seconds", T)
-
-    const g = buildTypeGraph(T)
-    const traits = extractTraits(g)
-
-    assert.equal(traits.get(TypeNameTrait, g.root.id), "MyType")
-    assert.equal(traits.get(DocTrait, g.root.id), "Documented")
-    assert.equal(traits.get(UnitTrait, g.root.id), "seconds")
-})
-
-test("traits: named thunk (recursive type) carries name", () => {
+test("names: named thunk (recursive type) carries its name on the thunk itself", () => {
     const T = named("Tree", (): any => union({
         internal: struct({a: T, b: T}),
         leaf: integer(0, 1),
     }))
 
+    assert.equal(nameOf(T), "Tree")
+    // The struct/integer bodies reached through the thunk have no names.
     const g = buildTypeGraph(T)
-    const traits = extractTraits(g)
-
-    // The thunk is the root → name is on node 0.
-    assert.equal(traits.get(TypeNameTrait, g.root.id), "Tree")
-    // The struct and integer children have no names.
-    assert.equal(traits.get(TypeNameTrait, child(g.root, {variant: "internal"})!.id), undefined)
-    assert.equal(traits.get(TypeNameTrait, child(g.root, {variant: "leaf"})!.id), undefined)
+    assert.equal(nameOf(child(g.root, {variant: "internal"})!.type), undefined)
+    assert.equal(nameOf(child(g.root, {variant: "leaf"})!.type), undefined)
 })
 
-test("traits: produce callback reads traits via registry", () => {
+test("pNamed: matches by name alone, regardless of shape", () => {
+    const Ts = named("Timestamp", struct({secs: integer(0, 1)}))
+    const g = buildTypeGraph(Ts)
+
+    const r = run(g, [{pattern: pNamed("Timestamp"), produce: () => "found"}])
+    assert.equal(r.get(g.root.id), "found")
+})
+
+test("pNamed: a different name doesn't match", () => {
+    const Ts = named("Timestamp", struct({secs: integer(0, 1)}))
+    const g = buildTypeGraph(Ts)
+
+    const r = run(g, [
+        {pattern: pNamed("SomethingElse"), produce: () => "wrong"},
+        {pattern: pStructFields(pStar()), produce: () => "fallback"},
+    ])
+    assert.equal(r.get(g.root.id), "fallback")
+})
+
+test("pNamed: with inner, also requires the structural pattern to match", () => {
+    const Ts = named("Timestamp", struct({secs: integer(0, 1)}))
+    const g = buildTypeGraph(Ts)
+
+    // inner pattern doesn't match this struct's actual fields → falls through.
+    const r = run(g, [
+        {pattern: pNamed("Timestamp", pStruct({wrongField: pStar()})), produce: () => "wrong"},
+        {pattern: pStructFields(pStar()), produce: () => "fallback"},
+    ])
+    assert.equal(r.get(g.root.id), "fallback")
+})
+
+test("pNamed: an application author overriding a named type ahead of a generic rule", () => {
+    // The exact motivating case: preempt the generic struct rule for one
+    // declared type name, without spelling out its full shape as a pattern.
+    const Timestamp = named("Timestamp", struct({secs: integer(0, 1), nanos: integer(0, 1)}))
+    const Other = named("Other", struct({x: integer(0, 1)}))
+
+    const rules: Rule<string>[] = [
+        {pattern: pNamed("Timestamp"), produce: () => "custom-timestamp-codec"},
+        {pattern: pStructFields(pStar()), produce: () => "generic-struct"},
+    ]
+
+    assert.equal(run(buildTypeGraph(Timestamp), rules).get(0), "custom-timestamp-codec")
+    assert.equal(run(buildTypeGraph(Other), rules).get(0), "generic-struct")
+})
+
+test("produce callback can read a node's own name directly via nameOf(), no registry needed", () => {
     const Ts = named("Timestamp", struct({secs: integer(0, 4294967295)}))
     const g = buildTypeGraph(Ts)
-    const traits = extractTraits(g)
 
-    // A ruleset that uses the name trait for its capability.
-    const r = runRuleset(g, [
-        {pattern: pStructFields(pStar()), produce: (_m, nodeId, _graph, tr) => {
-            return tr.get(TypeNameTrait, nodeId) ?? `T${nodeId}`
-        }},
-    ], traits)
+    const r = run(g, [
+        {pattern: pStructFields(pStar()), produce: (_m, nodeId, graph) =>
+            nameOf(graph.nodes.get(nodeId)!.source as any) ?? `T${nodeId}`},
+    ])
 
     assert.equal(r.get(g.root.id), "Timestamp")
-})
-
-test("traits: produce callback WRITES traits (cross-projection)", () => {
-    const T = struct({a: integer(0, 1)})
-    const g = buildTypeGraph(T)
-    const traits = extractTraits(g)
-
-    // A "target" ruleset that writes an accessor trait for each field.
-    const AccessorTrait = defineTrait<string>()
-    const target = runRuleset(g, [
-        {pattern: pStructFields(pStar()), produce: (_m, nodeId, graph, tr) => {
-            const node = graph.nodes.get(nodeId)!
-            for(const e of node.edges) {
-                if("field" in e.step) tr.set(AccessorTrait, e.target.id, `obj.${e.step.field}`)
-            }
-            return "struct"
-        }},
-    ], traits)
-
-    // The "codec" ruleset reads the accessor trait.
-    const aId = child(g.root, {field: "a"})!.id
-    assert.equal(traits.get(AccessorTrait, aId), "obj.a")
-    // The struct itself has no accessor.
-    assert.equal(traits.get(AccessorTrait, g.root.id), undefined)
-})
-
-test("traits: different TraitDef instances are distinct channels", () => {
-    const A = defineTrait<string>()
-    const B = defineTrait<string>()
-
-    const T = struct({a: integer(0, 1)})
-    tag(A, "from-A", T)
-
-    const g = buildTypeGraph(T)
-    const traits = extractTraits(g)
-
-    assert.equal(traits.get(A, g.root.id), "from-A")
-    assert.equal(traits.get(B, g.root.id), undefined)  // B is a different channel
 })

@@ -9,7 +9,7 @@ import {test} from "node:test"
 import * as assert from "node:assert/strict"
 
 import {integer, list, struct, union, unit, named} from "@ppl/core"
-import {buildTypeGraph, extractTraits} from "@ppl/core"
+import {buildTypeGraph} from "@ppl/core"
 import {
     cTypeRules,
     projectCTypes,
@@ -44,8 +44,7 @@ test("c-emitter: cIntType picks smallest unsigned/signed width", () => {
 
 test("c-emitter: integer projects to fixed-width ref with no decl", () => {
     const g = buildTypeGraph(integer(0, 255))
-    const traits = extractTraits(g)
-    const r = projectCTypes(g, traits)
+    const r = projectCTypes(g)
     assert.equal(r.get(0)?.ref, "uint8_t")
     assert.equal(r.get(0)?.decl, undefined)
 })
@@ -57,8 +56,7 @@ test("c-emitter: integer projects to fixed-width ref with no decl", () => {
 test("c-emitter: struct emits typedef struct with no STL", () => {
     const T = named("Point", struct({x: integer(0, 255), y: integer(0, 65535)}))
     const g = buildTypeGraph(T)
-    const traits = extractTraits(g)
-    const r = projectCTypes(g, traits)
+    const r = projectCTypes(g)
 
     const decl = r.get(0)!
     assert.equal(decl.ref, "Point")
@@ -71,8 +69,7 @@ test("c-emitter: struct emits typedef struct with no STL", () => {
 test("c-emitter: emitCHeader never contains STL", () => {
     const T = named("Point", struct({x: integer(0, 255), y: integer(-32768, 32767)}))
     const g = buildTypeGraph(T)
-    const traits = extractTraits(g)
-    const header = emitCHeader(projectCTypes(g, traits))
+    const header = emitCHeader(projectCTypes(g))
 
     assert.ok(header.includes("#include <stdint.h>"))
     assert.ok(!header.includes("std::"))
@@ -87,8 +84,7 @@ test("c-emitter: emitCHeader never contains STL", () => {
 test("c-emitter: list becomes fixed array + count in enclosing struct", () => {
     const T = named("Buf", struct({items: list(integer(0, 255), 8)}))
     const g = buildTypeGraph(T)
-    const traits = extractTraits(g)
-    const r = projectCTypes(g, traits)
+    const r = projectCTypes(g)
 
     const decl = r.get(0)!.decl!
     assert.ok(decl.includes("uint8_t items[8];"))
@@ -102,8 +98,7 @@ test("c-emitter: list becomes fixed array + count in enclosing struct", () => {
 test("c-emitter: all-unit union emits tag byte with no data union", () => {
     const T = named("Mode", union({a: unit, b: unit}))
     const g = buildTypeGraph(T)
-    const traits = extractTraits(g)
-    const r = projectCTypes(g, traits)
+    const r = projectCTypes(g)
 
     const decl = r.get(0)!.decl!
     assert.ok(decl.includes("uint8_t tag;"))

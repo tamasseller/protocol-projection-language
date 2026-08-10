@@ -14,6 +14,8 @@ export * from "./engine/codec-extension"
 export * from "./engine/resolver"
 export * from "./engine/validate-handles"
 export * from "./engine/opcodes"
+export * from "./engine/type-tree-wire"
+export * from "./engine/codec-image"
 
 export * from "./components/binary-rules"
 export * from "./components/delta-leb128"

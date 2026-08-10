@@ -18,13 +18,13 @@
  * The example owns NOTHING generic here — no rulesets, no emitters.
  * It only:
  *   1. Defines the domain schema (schema.ts).
- *   2. Builds the shared type graph + traits once.
+ *   2. Builds the shared type graph once.
  *   3. Applies each package's projection to that single graph.
  *
  * Change the schema → all three artifacts regenerate consistently.
  * Swap a package → only that artifact changes. This is composition.
  */
-import {buildTypeGraph, extractTraits, TypeGraph, TraitRegistry} from "@ppl/core"
+import {buildTypeGraph, TypeGraph} from "@ppl/core"
 import {projectCTypes, emitCHeader, CTypeDecl} from "@ppl/target-cpp"
 import {buildCodec, buildJsonEncoder, createCodecExtension, binaryEncodeRules, binaryDecodeRules, Handle} from "@ppl/codecs"
 import {validateProgram, run, RtlProgram} from "@ppl/machine"
@@ -39,15 +39,12 @@ import {TelemetryPacket} from "./schema"
 /** The finitized type graph for TelemetryPacket. */
 export const graph: TypeGraph = buildTypeGraph(TelemetryPacket)
 
-/** Traits (type names) extracted from the schema. */
-export const traits: TraitRegistry = extractTraits(graph)
-
 // ——————————————————————————————————————————————
 // Composed artifacts
 // ——————————————————————————————————————————————
 
 /** Embedded C header (no STL) projected from the schema. */
-export const cTypes: Map<number, CTypeDecl> = projectCTypes(graph, traits)
+export const cTypes: Map<number, CTypeDecl> = projectCTypes(graph)
 export const cHeader: string = emitCHeader(cTypes)
 
 /**
@@ -118,5 +115,5 @@ export function toJson(value: unknown): string
 export const jsonSample: string = toJson(sampleTelemetryPacket)
 
 /** TypeScript declarations (desktop/server) projected from the schema. */
-export const tsTypes: Map<number, TSTypeDecl> = projectTSTypes(graph, traits)
+export const tsTypes: Map<number, TSTypeDecl> = projectTSTypes(graph)
 export const tsDeclarations: string = emitTSDeclarations(tsTypes)

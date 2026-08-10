@@ -1,7 +1,8 @@
 # Codec Extension ISA
 
 > **Status:** Implemented — ROADMAP.md item 7 (Done), including §6's byte
-> encoding. Specifies the codec extension's opcodes, calling convention,
+> encoding, plus item 11's `WRITE_SEQ`/`READ_SEQ` bulk-array pair (§3.5).
+> Specifies the codec extension's opcodes, calling convention,
 > and encoding rules the way isa-core.md specifies the generic core, and
 > plugs into the core purely through the mechanism isa-core.md §11 defines
 > (opcode range ≥128, effect declarations, literal-only operands). Unlike
@@ -230,6 +231,45 @@ point (Appendix — Deferred Design Points). `COUNT` gives the length for an
 encoder's length prefix; `OPEN_LIST` takes a capacity hint for a decoder's
 pre-allocation. The target owns all memory — no codec opcode allocates.
 
+### 3.5 Bulk sequential transfer (ROADMAP.md item 11)
+
+`ENTER_NEXT`/`CALL_CODEC_NEXT` (§3.4) cost one nested procedure call per
+list element — fine for a struct/union element, wasteful for a plain
+`List<Integer>`, where every element is otherwise just a `READ`/`WRITE`
+plus sign-extension. `WRITE_SEQ`/`READ_SEQ` fuse the whole element run
+into one op:
+
+| Op | Direction | Effect |
+|---|---|---|
+| `WRITE_SEQ iter, handle, w` | encoder | `acc` many elements, `w` bytes each, copied from `handle`'s own array storage (index `0..acc-1`) to `stream[iter]` |
+| `READ_SEQ iter, handle, w, signed` | decoder | `acc` many elements read from `stream[iter]`, sign-extended per `signed` exactly as `STORE_VAL` (§3.2) does, appended into `handle`'s array storage |
+
+`acc` (the element count) is the one thing deliberately *not* a fixed
+operand of the op itself — it's supplied the same way `WRITE`'s own value
+is (§3.2): computed however the surrounding codec body likes (a fixed-width
+prefix, LEB128, whatever), then handed in via `acc` right before the call.
+Two consequences fall out of that: the op stays agnostic to length-encoding
+convention, and by the time it runs, `stream[iter]` is guaranteed to be
+sitting at exactly the first element's byte — nothing about length-prefix
+I/O is bundled into it. That second property is what makes it a usable
+**snatch point**: a target codegen that recognizes this op knows precisely
+where the raw element run starts and ends, with nothing op-internal left to
+account for. `OPEN_LIST` still runs first on the decode side (§3.2) — this
+op only fills an already-opened list, it doesn't allocate one.
+
+`exec()`'s own semantics are always the dumb per-element pump loop —
+correct on their own, so `validateProgram`/`run` need no target-codegen
+awareness at all, and a program using these ops is fully interpretable and
+testable exactly like every other op. Recognition and specialization (a
+raw-buffer/DMA copy for a target that's opted a field into that
+representation) happens only at a target's own `raise.ts` pass (item 12),
+entirely optional and local to one instruction — the fallback for a target
+that hasn't opted in is simply the same loop, correctly, same as today.
+`binary-rules.ts`'s default `List<Integer>` rule already uses this pair in
+place of the generic per-element loop, so even the non-exotic case (a
+target's own idiomatic `std::vector<uint16_t>`/JS array) benefits once a
+target *does* choose to specialize it into a bulk copy.
+
 ---
 
 ## 4. Calling Convention Addition — Codec Entry Protocol
@@ -329,9 +369,11 @@ own ops skew longer on average than the core's: `CALL_CODEC` carries
 `codec_idx` + `ref` at minimum, `ENTER` carries `dst, src, ref`. That's an
 acceptable trade because delegation dominates real codec bodies (§8.1,
 §8.2) — a smaller number of frequent, still-not-tiny ops, rather than the
-core's evenly-spread arithmetic/comparison combo space. 119 of the 128
-codes end up assigned (§6.4) — comfortably inside budget, no pressure to
-economize further.
+core's evenly-spread arithmetic/comparison combo space. The original 15
+opcodes assigned 119 of the 128 codes, leaving 9 reserved and unused;
+`WRITE_SEQ`/`READ_SEQ` (§3.5, ROADMAP.md item 11) spend exactly that
+remaining budget (§6.4) — all 128 codes are assigned now, with no pressure
+to economize further since there's nothing left to economize.
 
 ### 6.2 Literal-ref segmentation
 
@@ -361,6 +403,7 @@ executed:
 | `ENTER`/`ENTER_NEXT` | 0 | 0 | no | no |
 | `LOAD_VAL`/`STORE_VAL`/`COUNT`/`TAG`/`OPEN_LIST` | 0 | 0 | no | no |
 | `CALL_CODEC`/`CALL_CODEC_NEXT` | `−stackArgsOf(argCount)` — pops the pushed argument block, same as `CALL` | 0 | no | **yes** — `calleeOperandIndex` is the `codec_idx` operand, `argCount` from the invoked codec's header |
+| `WRITE_SEQ`/`READ_SEQ` (§3.5) | 0 | 0 | no | no |
 
 None of the non-call ops touch TOS at all — they operate entirely on the
 handle/iterator ID space and `acc`, never pushing or popping. `CALL_CODEC`'s
@@ -406,14 +449,23 @@ handle/iterator-ID operands sitting alongside them do.
 | `SEEK` | `N + 1` = 5 | 1 code per `iter < N` + `delta` zigzag-LEB128 | `iter` LEB128 + `delta` zigzag-LEB128 |
 | `CALL_CODEC` | `N² + 1` = 17 | 1 code per `(src, ref)` pair + `codec_idx` LEB128 | `codec_idx, src, ref` all LEB128 |
 | `CALL_CODEC_NEXT` | `N + 1` = 5 | 1 code per `src < N` + `codec_idx` LEB128 | `codec_idx, src` both LEB128 |
+| `WRITE_SEQ` (§3.5) | `\|WIDTHS\|` = 3 | — (no compact form; see below) | 1 code per `w`; `iter, handle, count` all LEB128 |
+| `READ_SEQ` (§3.5) | `\|WIDTHS\|·2` = 6 | — (no compact form; see below) | 1 code per `(w, signed)`; `iter, handle, count` all LEB128 |
 
-Total: 119 codes (bytes 128..246); 247..255 (9 codes) reserved and unused,
-isa-core.md §5.3's "leave room, don't force a smaller encoding to fill
-every slot" philosophy. `test/wire.test.ts` cross-checks a representative
-byte for every compact/extended variant above, mirroring
-`bytecode.test.ts`'s own literal-table approach, plus one end-to-end test
-round-tripping a real `buildCodec`-generated program's full instruction
-stream.
+The original 15 opcodes total 119 codes (bytes 128..246), leaving
+247..255 (9 codes) reserved and unused per isa-core.md §5.3's "leave room,
+don't force a smaller encoding to fill every slot" philosophy.
+`WRITE_SEQ`/`READ_SEQ` spend exactly that remaining 9 (3 + 6), filling the
+full 128-code budget (bytes 128..255) with nothing left reserved. Neither
+gets a compact `iter`/`handle` form the way `READ`/`WRITE` do: this op
+already replaces a whole per-element loop, so its own per-*list* cost
+(a few LEB128 bytes) is amortized across every element it transfers, unlike
+`READ`/`WRITE`'s per-*element* cost — there was also no remaining
+codespace left to spend on one even if it mattered. `test/wire.test.ts`
+cross-checks a representative byte for every compact/extended variant
+above, mirroring `bytecode.test.ts`'s own literal-table approach, plus one
+end-to-end test round-tripping a real `buildCodec`-generated program's
+full instruction stream.
 
 ---
 
@@ -437,7 +489,10 @@ the existing TOS-depth accumulator. Two checks fall out:
   op per §2.2's disambiguation table, and `ref` must be in range for that
   type's field/variant table. This is the concrete answer to "a handle
   must be entered before it's read," and its sharper sibling: entered
-  against the right kind, at an index that exists.
+  against the right kind, at an index that exists. `WRITE_SEQ`/`READ_SEQ`
+  (§3.5) get the same treatment for their own `handle` operand — it must
+  resolve to a list-kind handle, the same check `COUNT`/`OPEN_LIST` already
+  get.
 - **Cross-procedure consistency** — at every `CALL_CODEC`/
   `CALL_CODEC_NEXT`, the callee's own declared object type (its `o0` type,
   fixed at the callee's build time, pinned the same way as any other
@@ -729,10 +784,12 @@ stream/handle teardown and decides the response.
   `ENTER_ACTIVE` (§3.2). Reconsider once opcode space is measured against
   real codecs.
 - **List access.** Sequential-only (§3.4) is sufficient for now; multipass
-  read works by re-entering. Random access and other target-specific
-  capabilities are deferred to a future target-capability extension point
-  (call-out ops + trait processing bound by the type mapper at codegen
-  time) — out of scope here.
+  read works by re-entering. `WRITE_SEQ`/`READ_SEQ` (§3.5, ROADMAP.md item
+  11) cover the one concrete call-out case identified so far — a bulk
+  primitive-array transfer a target codegen can specialize into a raw-
+  buffer/DMA representation. True random access, and any other target-
+  specific capability beyond that one, stay deferred to a future
+  target-capability extension point — out of scope here.
 - **Recursion depth bound.** §5's `max_data_depth(type) × max_frame_size`
   bound is derived conceptually; confirm the actual figures once concrete
   recursive schemas (e.g. self-referential structs) are run through

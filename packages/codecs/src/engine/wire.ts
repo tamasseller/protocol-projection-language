@@ -41,10 +41,16 @@
  *
  * Bands are assigned in `CODEC_OPCODES`' own declared order (opcodes.ts),
  * each reserving as many codes as its own compact/extended split needs —
- * see each `BANDS` entry below for the split. 119 of the 128 available
- * codes (bytes 128..246) end up assigned; 9 (247..255) are reserved and
- * unused, isa-core.md §5.3's "leave room, don't force a smaller encoding
- * to fill every slot" philosophy.
+ * see each `BANDS` entry below for the split. The original 15 opcodes
+ * used 119 of the 128 available codes, leaving 9 (247..255) reserved and
+ * unused per isa-core.md §5.3's "leave room, don't force a smaller
+ * encoding to fill every slot" philosophy — `WRITE_SEQ`/`READ_SEQ`
+ * (ROADMAP.md item 11) spend exactly that remaining budget (3 + 6 = 9
+ * codes: `w ∈ WIDTHS` alone for `WRITE_SEQ`, `w × signed` for `READ_SEQ`),
+ * filling the codec extension's 128-code space exactly, with `iter`/
+ * `handle`/`count` always LEB128'd on both (no compact index form — see
+ * `writeSeqBand`/`readSeqBand` below for why that split doesn't apply
+ * the same way here).
  */
 
 import type { ExtCodec, ExtInstr } from "@ppl/machine"
@@ -260,6 +266,65 @@ function callCodecNextBand(): Band
     }
 }
 
+/** `WRITE_SEQ iter, handle, w, count` (ROADMAP.md item 11) —
+ *  `operands = [iter, handle, w, count]`, `w ∈ WIDTHS`. Unlike
+ *  `readWriteBand`, `iter`/`handle` get no compact/extended split here —
+ *  this op costs one nested procedure call's worth of savings *per list*,
+ *  not per element, so the same "measure real cases" budgeting that gave
+ *  every earlier opcode a compact form doesn't apply: there are exactly
+ *  `WIDTHS.length` codes left to spend (this file's header: 9 of 128
+ *  reserved, `READ_SEQ` below spends the rest), so `w` alone is folded
+ *  into the opcode byte and `iter`/`handle`/`count` are always LEB128'd. */
+function writeSeqBand(): Band
+{
+    return {
+        width: WIDTHS.length,
+        encode: ([iter, handle, w, count]) =>
+        {
+            const widthIdx = WIDTHS.indexOf(w as typeof WIDTHS[number])
+            if (widthIdx < 0) throw new Error(`wire: WRITE_SEQ width ${w} isn't one of ${WIDTHS.join(",")} (§3.1)`)
+            return { code: widthIdx, rest: [...encodeLeb128(iter!), ...encodeLeb128(handle!), ...encodeLeb128(count!)] }
+        },
+        decode: (code, bytes, pos) =>
+        {
+            const iter = decodeLeb128(bytes, pos)
+            const handle = decodeLeb128(bytes, iter.next)
+            const count = decodeLeb128(bytes, handle.next)
+            return { operands: [iter.value, handle.value, WIDTHS[code]!, count.value], next: count.next }
+        },
+    }
+}
+
+/** `READ_SEQ iter, handle, w, signed, count` (ROADMAP.md item 11) —
+ *  `operands = [iter, handle, w, signed, count]`. `w` and `signed` both
+ *  fold into the opcode byte (`WIDTHS.length * 2` codes — the last of the
+ *  9 codes this file's header reserves for `WRITE_SEQ`/`READ_SEQ`
+ *  together, filling the codec extension's 128-code budget exactly);
+ *  `iter`/`handle`/`count` are always LEB128'd, same reasoning as
+ *  `writeSeqBand`. */
+function readSeqBand(): Band
+{
+    return {
+        width: WIDTHS.length * 2,
+        encode: ([iter, handle, w, signed, count]) =>
+        {
+            const widthIdx = WIDTHS.indexOf(w as typeof WIDTHS[number])
+            if (widthIdx < 0) throw new Error(`wire: READ_SEQ width ${w} isn't one of ${WIDTHS.join(",")} (§3.1)`)
+            const code = widthIdx * 2 + (signed! ? 1 : 0)
+            return { code, rest: [...encodeLeb128(iter!), ...encodeLeb128(handle!), ...encodeLeb128(count!)] }
+        },
+        decode: (code, bytes, pos) =>
+        {
+            const widthIdx = Math.floor(code / 2)
+            const signed = code % 2
+            const iter = decodeLeb128(bytes, pos)
+            const handle = decodeLeb128(bytes, iter.next)
+            const count = decodeLeb128(bytes, handle.next)
+            return { operands: [iter.value, handle.value, WIDTHS[widthIdx]!, signed, count.value], next: count.next }
+        },
+    }
+}
+
 const BAND_BY_OP: Readonly<Record<CodecOpcode, Band>> = {
     ENTER: enterBand(),
     ENTER_NEXT: impliedNextBand("dst-src"),
@@ -276,6 +341,8 @@ const BAND_BY_OP: Readonly<Record<CodecOpcode, Band>> = {
     SEEK: seekBand(),
     CALL_CODEC: callCodecBand(),
     CALL_CODEC_NEXT: callCodecNextBand(),
+    WRITE_SEQ: writeSeqBand(),
+    READ_SEQ: readSeqBand(),
 }
 
 /** `CODEC_OPCODES`' own declared order (opcodes.ts) fixes each band's base

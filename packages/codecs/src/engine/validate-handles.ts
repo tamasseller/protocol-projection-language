@@ -232,6 +232,24 @@ function analyzeProcedure(proc: RtlProc, procIndex: number, program: RtlProgram)
                 iterEnv.set(dst, "write")
                 return
             }
+            case "WRITE_SEQ":
+            {
+                const [iterId, handleId] = instr.operands as readonly [number, number, number]
+                requireCapability(iterOf(iterEnv, procIndex, pc, iterId, op), "write", procIndex, pc, iterId, op)
+                const t = handleOf(env, procIndex, pc, handleId, op)
+                if(t.type.kind !== SemanticTypeKinds.List)
+                    fail(procIndex, pc, `${op}: handle ${handleId} is a ${t.type.kind}, not a list`)
+                return
+            }
+            case "READ_SEQ":
+            {
+                const [iterId, handleId] = instr.operands as readonly [number, number, number, number]
+                requireCapability(iterOf(iterEnv, procIndex, pc, iterId, op), "read", procIndex, pc, iterId, op)
+                const t = handleOf(env, procIndex, pc, handleId, op)
+                if(t.type.kind !== SemanticTypeKinds.List)
+                    fail(procIndex, pc, `${op}: handle ${handleId} is a ${t.type.kind}, not a list`)
+                return
+            }
             default:
                 return assertNever(op)
         }

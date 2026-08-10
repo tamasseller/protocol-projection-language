@@ -273,15 +273,21 @@ export function encodeProgram(program: RtlProgram, extension?: Extension): Uint8
     ])
 }
 
-/** Decode a whole program from exactly `bytes` (§5.5) — reads the header
+/** Decode a whole program starting at `offset` (§5.5) — reads the header
  *  table once, up front, so every procedure's body is sliced out by exact
  *  byte length (`Uint8Array.subarray`, a view, not a copy) rather than
  *  relying on `decodeBody` to self-detect where one procedure ends and the
  *  next begins. Decoded procedures always come back with `header:
- *  undefined` — nothing wire-level to restore it from (§5.5). */
-export function decodeProgram(bytes: Uint8Array, extension?: Extension): RtlProgram
+ *  undefined` — nothing wire-level to restore it from (§5.5).
+ *
+ *  Returns `next` (the offset immediately past the last body byte), not
+ *  just the program — a container holding more than one encoded program
+ *  back-to-back (docs/codec-image.md §7) has no other way to know where
+ *  this one ends and the next begins, since nothing here is
+ *  self-delimiting from the *outside*. */
+export function decodeProgram(bytes: Uint8Array, offset: number = 0, extension?: Extension): { program: RtlProgram; next: number }
 {
-    const countR = decodeLeb128(bytes, 0)
+    const countR = decodeLeb128(bytes, offset)
     const count = countR.value
     let pos = countR.next
 
@@ -301,5 +307,5 @@ export function decodeProgram(bytes: Uint8Array, extension?: Extension): RtlProg
         return { argCount, body }
     })
 
-    return { procedures }
+    return { program: { procedures }, next: pos }
 }

@@ -1,4 +1,4 @@
-import {IntegerType, isInteger, isList, isReference, isStruct, isUnion, isUnit, kindOf, ListType, SemanticType, SemanticTypeKinds, StructType, UnionType, UnitType} from "./metamodel"
+import {IntegerType, isInteger, isList, isReference, isStruct, isUnion, isUnit, kindOf, ListType, nameOf, SemanticType, SemanticTypeKinds, StructType, UnionType, UnitType} from "./metamodel"
 
 export interface UnitPattern 
 {
@@ -336,13 +336,56 @@ export const matchStar = <P extends StarPattern>(T: SemanticType, P: P): MatchOf
     return {kind: "star"} as MatchOf<P>
 }
 
+/**
+ * Matches a type by its first-class declared name (`named()`,
+ * metamodel.ts) rather than by structural shape — what an application
+ * author overriding *where* their own custom codec applies needs: "the
+ * type declared as `Timestamp`, wherever it occurs," without spelling out
+ * that type's full structural shape as a pattern. Checked directly
+ * against `T` (thunk or concrete — whichever object `named()` was called
+ * on), before any dereferencing, since the name lives on that exact
+ * object.
+ *
+ * Without `inner`: matches any type with this name, regardless of shape.
+ * With `inner`: also requires `inner` to match (against the same,
+ * possibly-thunk `T` — `matchType` derefs as needed).
+ */
+export interface NamedPattern<I extends TypePattern | undefined = TypePattern | undefined>
+{
+    kind: "named"
+    name: string
+    inner?: I
+}
+
+export const isNamedPattern = (P: TypePattern): P is NamedPattern => (P as NamedPattern).kind === "named"
+
+export interface NamedMatch
+{
+    kind: "named"
+    /** Present only if the NamedPattern had an `inner`; carries its witness. */
+    innerMatch?: TypeMatch
+}
+
+export const matchNamed = <P extends NamedPattern>(T: SemanticType, P: P): MatchOf<P> | undefined =>
+{
+    if(nameOf(T) !== P.name) return undefined
+    if(P.inner !== undefined)
+    {
+        const m = matchType(T, P.inner)
+        if(m === undefined) return undefined
+        return {kind: "named", innerMatch: m} as MatchOf<P>
+    }
+    return {kind: "named"} as MatchOf<P>
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////
 
-export type TypePattern = UnitPattern | IntegerPattern | ListPattern | StructPattern | StructFieldsPattern | UnionPattern | UnionFieldsPattern | AnyOfPattern | StarPattern
-export type TypeMatch = UnitMatch | IntegerMatch | ListMatch | StructMatch | StructFieldsMatch | UnionMatch | UnionFieldsMatch | AnyOfMatch | StarMatch
+export type TypePattern = UnitPattern | IntegerPattern | ListPattern | StructPattern | StructFieldsPattern | UnionPattern | UnionFieldsPattern | AnyOfPattern | StarPattern | NamedPattern
+export type TypeMatch = UnitMatch | IntegerMatch | ListMatch | StructMatch | StructFieldsMatch | UnionMatch | UnionFieldsMatch | AnyOfMatch | StarMatch | NamedMatch
 
 export type MatchOf<P extends TypePattern> =
-    P extends StarPattern            ? StarMatch
+    P extends NamedPattern            ? NamedMatch
+  : P extends StarPattern            ? StarMatch
   : P extends AnyOfPattern           ? AnyOfMatch<ReturnType<P["alternatives"]>>
   : P extends ListPattern             ? ListMatch<MatchOf<P["elementPattern"]>>
   : P extends StructFieldsPattern     ? StructFieldsMatch<MatchOf<P["elementPattern"]>>
@@ -355,8 +398,11 @@ export type MatchOf<P extends TypePattern> =
 
 export function matchType<P extends TypePattern>(T: SemanticType, P: P): MatchOf<P> | undefined
 {
-    // Star and AnyOf are type-agnostic: they dispatch before the type-kind
-    // switch and re-enter matchType per alternative (which handles references).
+    // Named, Star and AnyOf are type-agnostic: they dispatch before the
+    // type-kind switch and re-enter matchType (Named checks the name on
+    // `T` itself, before any dereferencing — a thunk's name lives on the
+    // thunk object, not on whatever it derefs to).
+    if(isNamedPattern(P))        return matchNamed(T, P)
     if(isStarPattern(P))         return matchStar(T, P)
     if(isAnyOfPattern(P))        return matchAnyOf(T, P)
     if(isUnit(T))               return (isUnitPattern(P)           ? matchUnit(T, P)           : undefined) as MatchOf<P> | undefined
@@ -456,6 +502,16 @@ export const pAnyOf = <Ps extends readonly TypePattern[]>(alternatives: () => Ps
  */
 export const pStar = <I extends TypePattern | undefined = undefined>(inner?: I): StarPattern<I> => ({
     kind: "star",
+    inner,
+})
+
+/** Matches a type by its first-class declared name — see `NamedPattern`
+ *  above. `pNamed("Timestamp")` matches any type named "Timestamp"
+ *  regardless of shape; `pNamed("Timestamp", pStruct({...}))` also
+ *  requires the structural pattern to match. */
+export const pNamed = <I extends TypePattern | undefined = undefined>(name: string, inner?: I): NamedPattern<I> => ({
+    kind: "named",
+    name,
     inner,
 })
 

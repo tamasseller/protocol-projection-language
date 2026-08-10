@@ -248,12 +248,48 @@ read): `codec-extension.ts`'s `intWireSize` (called with a bare
 parameter to `{min: number, max: number}` — a real "required more than it
 used" fix the new field exposed, not a workaround.
 
-## 10. Codec image — Designed, not implemented
+## 10. Codec image — Done
 
 Depends on (8) and (9) — both Done: the encoder/decoder programs are each
 a whole multi-procedure `RtlProgram`, serializable via item 8's envelope,
 and the type tree can now carry declared defaults per field/variant, per
 codec-image.md §4/§5.
+
+**§6/§7 (the container's own byte encoding) are implemented** —
+`engine/type-tree-wire.ts` (`encodeTypeTree`/`decodeTypeTree`, §6's
+postorder stack machine, quarter-split opcode space, range-list name
+specification, opt-in `PUSH_REF` dedup) and `engine/codec-image.ts`
+(`encodeCodecImage`/`decodeCodecImage`, §7's three-section concatenation).
+One thing found only by writing the encoder, not by the design pass: §6.4
+originally keyed `PUSH_REF` dedup by the *emitted bytes* of a candidate
+subtree — which never matches a repeated composite's second occurrence,
+since its children resolve to short backrefs the first occurrence's real
+construction bytes don't have, so the two never look byte-identical even
+though they're the same shape. Fixed by keying on a structural *signature*
+(a pure function of shape — kind, range, field/variant names, recursively)
+computed *before* deciding whether to recurse into children at all, not on
+what got emitted — the wire format and `PUSH_REF`'s own encoding are
+unchanged; this is purely how the encoder decides to use it. Verified via
+`packages/codecs/test/type-tree-wire.test.ts` (representative exact-byte
+checks per opcode family, the `_EXT` escapes, both dedup cases — same
+object reused and independently-written-but-identical — and a real
+TelemetryPacket-shaped schema) and `packages/codecs/test/codec-image.test.ts`
+(a real `buildCodec`-built encoder/decoder pair, round-tripped through the
+image container and actually *run* through the VM afterward — same rigor
+item 8's own tests applied to the program envelope alone). Also needed a
+small `@ppl/machine` change: `decodeProgram` now returns `{program, next}`
+instead of just the program, since a container holding more than one
+encoded program back-to-back has no other way to know where one ends and
+the next begins — nothing about a single program is self-delimiting from
+the *outside*.
+
+Reconciliation itself (codec-image.md §2/§3 — matching a received image's
+type tree against a consumer's own, independently-built one, and the four
+relaxation rules that make graceful evolution work) is *not* this item's
+job to implement: it has no meaning independent of a codegen that
+consumes its output, so it belongs with item 12 (real target codegens),
+not here — this item's own scope is the artifact itself (the type tree
+it carries, and the container it sits in), which is now fully done.
 
 Full design lives in **`docs/codec-image.md`**, not repeated here: why the
 semantic type tree needs to travel between two independently-built
@@ -263,30 +299,162 @@ demand against it), the name-keyed reconciliation algorithm two
 independently-evolved trees need, and the four direction-crossed
 relaxation rules that make graceful protocol evolution actually work.
 
-Two things resolved along the way, footnoted here since they were
-previously open items on this list: a procedure's `RtlProc.header` (the
-`o0` `TypeNode`, item 7) turns out not to need wire encoding at all — it's
-a lowering→validation handoff entirely internal to one `buildCodec` call,
-resolved before anything is ever serialized (codec-extension.md §2.4/
-§7.1). **Still genuinely open:** the image container's own concrete byte
-layout (deferred the same "measure real cases first" way §6 was, until
-(9) lands and real defaults exist to measure against), and whether
-`GENERIC`-ABI helpers (e.g. `leb128_encode`) get their own copy per
-direction inside one image, or a shared pool.
+Three things resolved along the way, footnoted here since they were
+previously open items on this list:
 
-## 11. Core shakedown — Not started, no hard dependency
+- A procedure's `RtlProc.header` (the `o0` `TypeNode`, item 7) turns out
+  not to need wire encoding at all — it's a lowering→validation handoff
+  entirely internal to one `buildCodec` call, resolved before anything is
+  ever serialized (codec-extension.md §2.4/§7.1).
+- `GENERIC`-ABI helpers (e.g. `leb128_encode`) get their own copy per
+  direction, never a shared pool — each direction's copy is doing
+  genuinely different work (one encodes, the other decodes), so there
+  was never much real sharing on the table; not worth the complexity for
+  what little there might be. Not for now, revisit if it ever is.
+- The image container's own concrete byte layout — codec-image.md §6 (a
+  postorder stack machine for the type tree, with an opt-in `PUSH_REF` for
+  structural dedup) and §7 (the three sections — type tree, encoder
+  program, decoder program — just concatenate; each already self-frames).
 
-- Reassess `traits.ts` — suspected unused bloat; confirm and justify or
-  remove. Purely an audit; doesn't need anything else on this list to
-  land first, and could happen anytime.
-- Design the "weird" features properly (wishlist-level today): e.g. a
-  target type mapping forcing raw packet accessors instead of
-  element-by-element codec work.
+**Still genuinely open:** none of the design — §2/§3/§6/§7 are all
+decided, and §6/§7's implementation is this item's own remaining work,
+now done. §2/§3's implementation is item 12's job, not this one's.
+
+## 11. Core shakedown — Done
+
+### `traits.ts` — removed
+
+Audited, not just suspected: every concrete use anywhere in the repo
+(`target-cpp`'s two emitters, `target-js`'s emitter) read exactly one
+trait, `TypeNameTrait`, in exactly one shape — `traits.get(TypeNameTrait,
+nodeId) ?? "T" + nodeId`. The write side (`TraitRegistry.set`, pitched as
+a "cross-projection communication" channel) was never exercised by any
+rule anywhere. A second planned use — coordinating a header/type-
+definition generator with the actual code generator for a target — turned
+out unneeded: those two are far more tightly coupled than a decoupled
+annotation channel would help with. `packages/core/src/traits.ts` is gone.
+
+Names are first-class instead, for a reason beyond what traits ever
+served: an application author overriding *where* their own custom codec
+applies needs to say "the type declared as `Timestamp`, wherever it
+occurs" without spelling out that type's full structural shape as a
+pattern. `metamodel.ts`'s `named()`/`nameOf()` attach/read a name directly
+on the type object (one well-known symbol, no bag, no `extractTraits`
+pass); `matcher.ts` gained one new pattern, `pNamed(name, inner?)`,
+matched against that same name — checked before any thunk dereferencing,
+since a recursive type's name lives on the thunk itself. `runRuleset`/
+`Rule.produce` dropped their `traits: TraitRegistry` parameter entirely —
+nothing else in the whole codebase ever read or wrote one; a `produce`
+callback that wants a node's name now reads
+`nameOf(graph.nodes.get(nodeId)!.source)` directly. `target-cpp`'s two
+emitters and `target-js`'s emitter were updated to the same pattern.
+Tests: `packages/core/test/projection.runtime.test.ts`'s "First-class
+names" section (`named`/`nameOf`, `pNamed` matching with and without an
+inner pattern, the override-ahead-of-a-generic-rule case).
+
+Confirms something already suspected but worth stating plainly: a type's
+own declared name and codec-image.md §6.3's *field/variant* names are
+different namespaces. Field/variant names travel in the image because
+reconciliation matches by them (§2.1). A type's own name is a pure local,
+build-time convenience — codegen labeling, and now rule-matching — and
+never needs to cross the wire. No change to §6/§7 followed from this.
+
+### Direct-access target mapping for primitive arrays — `WRITE_SEQ`/`READ_SEQ` implemented
+
+The one "weird feature" with a concrete case behind it, not just a
+wishlist entry: when a protocol carries raw binary data or a sample
+stream (a `List<Integer>`), the ability to hand a target's own buffer
+management system a raw slice — enabling zero-copy or DMA access — can
+make or break a high-performance system.
+
+**The mechanism: two new codec opcodes**, `WRITE_SEQ`/`READ_SEQ`
+(docs/codec-extension.md §3.5) — a bulk transfer of `count` elements
+between a stream iterator and a list handle's storage, replacing the
+per-element `call_codec_next` loop `binary-rules.ts`'s generic list rule
+otherwise generates even for a plain `List<Integer>`.
+
+- `write_seq(iter, handle, width, count)` — encode. `count` elements,
+  each `width` bytes, taken from `handle`'s own array storage (index
+  `0..count-1`) and written to `iter`. No sign handling needed, same as
+  plain `WRITE` — masking a JS number's low bytes already produces the
+  correct wire pattern regardless of sign.
+- `read_seq(iter, handle, width, signed, count)` — decode. `count`
+  elements read from `iter`, sign-extended per `signed` via a
+  `signExtend(bits, raw)` helper factored out of `STORE_VAL`'s own
+  `toHostNumber` (codec-extension.ts) — that op only ever has
+  `width`/`signed`, never a full `IntegerType`, to work with — appended
+  into `handle`'s array storage.
+
+Both `width` and `signed` are plain operands, computed once at codegen
+time from the element's declared range — same choice `WRITE`/`READ`
+already made.
+
+**`count` is an explicit operand, deliberately not read internally by
+the op** — two reasons, not one: it keeps the op itself convention-
+agnostic about *how* a list's length is encoded on the wire (fixed-width
+prefix, LEB128, delta-coded, whatever a given codec rule wants), and it
+guarantees the stream iterator is sitting at exactly the first element's
+byte when the op runs — nothing about length-prefix I/O is bundled into
+it. That second property is what makes it usable as a snatch point at
+all. `OPEN_LIST` still runs first on the decode side — `read_seq` only
+fills an already-opened list, it doesn't allocate one. In the DSL, `count`
+is the one dynamic argument (`codecRules()`'s `pRtl("acc")` demand,
+mirroring `write`'s own value argument); `iter`/`handle`/`width`/`signed`
+are always codegen-time literals.
+
+**Generic semantics first, native specialization only at codegen time.**
+`exec()`'s own implementation of these two ops (`codec-extension.ts`) is
+always "count plain element transfers, in a loop" — always correct, so
+`validateProgram`/`run` need no target-codegen awareness at all, and a
+program using these ops is fully interpretable and testable exactly like
+every other op. Recognition/specialization into a raw-buffer/DMA copy is
+`raise.ts`'s job (item 12, still "sketched, not verified" — unaffected by
+this addition, since the fallback path for an op nothing recognizes *is*
+the dumb pump loop these ops already implement).
+
+Also benefits the non-exotic case: `binary-rules.ts`'s default codec
+now uses `write_seq`/`read_seq` for every `List<Integer>` unconditionally
+(`listOfIntegerEncodeRule`/`listOfIntegerDecodeRule`, preempting the
+generic `pList(pStar())` rule for this one element shape) — one op to
+recognize and specialize instead of a per-element `call_codec_next` loop,
+even before any target opts a field into the exotic direct-access
+representation.
+
+**Implemented**: `opcodes.ts` (vocabulary), `codec-extension.ts`
+(`EFFECTS`, `exec()`, `codecRules()`'s `write_seq`/`read_seq` DSL rules,
+the `signExtend` helper), `validate-handles.ts` (list-typed handle check,
+iterator capability check), `wire.ts` (`writeSeqBand`/`readSeqBand` — `w`
+alone folds into the opcode byte for `WRITE_SEQ` (3 codes), `w × signed`
+for `READ_SEQ` (6 codes), filling the extension's last 9 reserved codes
+exactly — 128/128 now assigned; `iter`/`handle`/`count` always LEB128'd,
+no compact form, since this op's cost already amortizes across a whole
+list rather than paying per element), `binary-rules.ts` (the default
+`List<Integer>` rule). Tests:
+`packages/codecs/test/write-seq-read-seq.test.ts` (DSL + VM execution,
+sign extension, `validateCodecHandles` checks, the default-codec
+integration and its struct-element fallback), plus `wire.test.ts`'s
+extended byte table and full-128-codes budget check.
+
+**Still item 12's job, not this one**: the target-type-mapping
+composability system itself (the "regular baseline + selectively-opted
+special representations" vision) and the actual `raise.ts` pattern match
+that would recognize `WRITE_SEQ`/`READ_SEQ` and emit a raw-buffer/DMA
+version for a target that's opted in. This item only built the snatch
+point; choosing what to do with it is real target-codegen work.
 
 ## 12. Real target codegens
 
 Depends on (7)-(10) for the codec-specific pieces. `target-cpp`/
 `target-js` are rushed stubs today.
+
+A target codegen that consumes a codec image (item 10) also needs
+codec-image.md §2/§3 — the name-keyed reconciliation algorithm and its
+four relaxation rules — since that's precisely what turns "here's an
+image" into "here's the native accessor code bridging it to my own
+schema." No code exists for this yet; it has no meaning independent of
+the codegen that would consume it, which is why it lives here and not on
+item 10's own list (item 10's job was the artifact itself, not what a
+consumer does with it).
 
 **Sketched, not verified** (`packages/machine/src/raise.ts`) —
 `raiseProgram`/`raiseProc`, the structural inverse of `lower.ts`: flat

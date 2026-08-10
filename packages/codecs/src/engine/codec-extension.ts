@@ -1,7 +1,7 @@
 /**
  * @ppl/codecs — Codec extension (ROADMAP.md item 7, docs/codec-extension.md)
  *
- * Implements `@ppl/machine`'s `Extension` hook for all 15 opcodes
+ * Implements `@ppl/machine`'s `Extension` hook for all 17 opcodes
  * `./opcodes.ts` names (§2/§3), plus `codecRules()`, their `ir\`...\`` DSL
  * surface. Lives here rather than `@ppl/machine` because that package must
  * stay protocol-agnostic; conceptually it's still core infrastructure, not
@@ -45,6 +45,20 @@ export function intWireSize(t: {min: number, max: number}): number
 }
 
 /**
+ * Reinterpret an unsigned `bits`-wide bit pattern as a signed JS number —
+ * two's-complement, the same reinterpretation a real target gets for free
+ * from its type system (a C `int16_t`, a JS `Int16Array`) when writing
+ * into a typed variable. Factored out of `toHostNumber` below so
+ * `READ_SEQ` — which only ever has a plain `width`/`signed` pair to work
+ * with, never a full `IntegerType` — can reuse it directly.
+ */
+function signExtend(bits: number, raw: number): number
+{
+    const signBit = 2 ** (bits - 1)
+    return raw >= signBit ? raw - 2 ** bits : raw
+}
+
+/**
  * `LOAD_VAL`/`STORE_VAL` move raw values through `acc`, which — like every
  * register in this VM (vm.ts's own `>>> 0` throughout) — only ever holds
  * an unsigned 32-bit pattern. A signed type's negative values arrive at
@@ -59,9 +73,7 @@ export function intWireSize(t: {min: number, max: number}): number
 function toHostNumber(type: IntegerType, raw: number): number
 {
     if(type.min >= 0) return raw
-    const bits = intWireSize(type) * 8
-    const signBit = 2 ** (bits - 1)
-    return raw >= signBit ? raw - 2 ** bits : raw
+    return signExtend(intWireSize(type) * 8, raw)
 }
 
 /**
@@ -148,6 +160,13 @@ const EFFECTS: Readonly<Record<CodecOpcode, ExtOpEffect>> = {
     // codec's arity itself.
     CALL_CODEC:      { tosDelta: 0, maxTransient: 0, call: { calleeOperandIndex: 0 } },
     CALL_CODEC_NEXT: { tosDelta: 0, maxTransient: 0, call: { calleeOperandIndex: 0 } },
+    // ROADMAP.md item 11: bulk transfer of `acc` (the element count) many
+    // elements between a stream iterator and a list handle's own array
+    // storage — the "snatch point" a target codegen can specialize into a
+    // raw-buffer/DMA copy; `exec()`'s own semantics are always the dumb
+    // per-element pump loop (§11's "generic semantics first" split).
+    WRITE_SEQ: { tosDelta: 0, maxTransient: 0 },
+    READ_SEQ:  { tosDelta: 0, maxTransient: 0 },
 }
 
 /** The codec extension's `Extension.rules` — lets codec bodies be authored
@@ -172,12 +191,16 @@ const EFFECTS: Readonly<Record<CodecOpcode, ExtOpEffect>> = {
  *  .argumentMatches` destructures straight into exactly-typed locals with
  *  no manual cast anywhere below.
  *
- *  `write`/`store_val` are the two ops whose real semantics *read* `acc` as
- *  an input (`stream[i].write(acc, w)`, `handle.value = acc`), so their
- *  last argument is a real `pRtl("acc")` demand instead of a literal, and
- *  their builder splices that argument's own tiled fragment in ahead of
- *  the opcode (`unaryNode`) rather than assuming the value is already
- *  sitting in `acc` by the time the call runs.
+ *  `write`/`store_val` are two ops whose real semantics *read* `acc` as an
+ *  input (`stream[i].write(acc, w)`, `handle.value = acc`), so their last
+ *  argument is a real `pRtl("acc")` demand instead of a literal, and their
+ *  builder splices that argument's own tiled fragment in ahead of the
+ *  opcode (`unaryNode`) rather than assuming the value is already sitting
+ *  in `acc` by the time the call runs. `write_seq`/`read_seq` follow the
+ *  same shape for their own dynamic operand, `count` (ROADMAP.md item
+ *  11) — never a codegen-time literal, since it's a decoder's own decoded
+ *  list length — while `iter`/`handle`/`width`/`signed` stay plain
+ *  `pConst()` literals exactly like every other index/enum operand above.
  *
  *  `call_codec`/`call_codec_next` (`call_codec(${codecProc}, src, ref)`)
  *  are call-shaped rather than value-shaped: their first argument is the
@@ -224,6 +247,26 @@ export function codecRules(_resolveLocal: (name: string) => number, resolveCalle
         {
             const [src, value] = m.argumentMatches
             return unaryNode(value.node, ["acc"], [...value.node.fragment, extInstr("STORE_VAL", [src.value])])
+        }),
+
+        // `write_seq(iter, handle, width, count)` / `read_seq(iter, handle,
+        // width, signed, count)` (ROADMAP.md item 11) — `count` is the one
+        // dynamic operand (a decoder's own decoded length, never known at
+        // codegen time), so it's the trailing `pRtl("acc")` demand, exactly
+        // like `write`'s value argument above; `iter`/`handle`/`width`
+        // (and `read_seq`'s `signed`) are always codegen-time literals.
+        rule("codec:write_seq", pBuiltinCall("write_seq", pConst(), pConst(), pConst(), pRtl("acc")), m =>
+        {
+            const [iter, handle, width, count] = m.argumentMatches
+            return unaryNode(count.node, ["acc"],
+                [...count.node.fragment, extInstr("WRITE_SEQ", [iter.value, handle.value, width.value])])
+        }),
+
+        rule("codec:read_seq", pBuiltinCall("read_seq", pConst(), pConst(), pConst(), pConst(), pRtl("acc")), m =>
+        {
+            const [iter, handle, width, signed, count] = m.argumentMatches
+            return unaryNode(count.node, ["acc"],
+                [...count.node.fragment, extInstr("READ_SEQ", [iter.value, handle.value, width.value, signed.value])])
         }),
 
         rule("codec:has_next", pBuiltinCall("has_next", pConst()), m =>
@@ -541,6 +584,56 @@ export function createCodecExtension(direction: Direction, root: Handle, buffer:
                 frames.push([child])
                 try { state.acc = state.callProc(codecIdx, []) }
                 finally { frames.pop() }
+                return
+            }
+
+            // ROADMAP.md item 11: bulk transfer, `acc` many elements, each
+            // `width` bytes, between `iterId` and `handleId`'s own array
+            // storage. Always the dumb per-element pump loop here — the
+            // "generic semantics first" half of §11's split; a target
+            // codegen recognizing this op at `raise.ts` time is free to
+            // specialize it into a raw-buffer/DMA copy instead, but nothing
+            // about `exec`/`validateProgram`/`run` needs to know that.
+            case "WRITE_SEQ":
+            {
+                const [iterId, handleId, width] = instr.operands as readonly [number, number, number]
+                const it = iterAt(iterId)
+                if(it.capability !== "write") throw new Error(`codec extension: WRITE_SEQ on read-only iterator ${iterId}`)
+                const h = frame[handleId]
+                if(!h) throw new Error(`codec extension: WRITE_SEQ on unbound handle ${handleId}`)
+                const count = state.acc
+                if(it.overwriteOnly && it.pos + width * count > buffer.length)
+                    throw new Error(`codec extension: iterator ${iterId} (a CLONE_WR fork) can't append — only i0 appends (§2.1)`)
+                const arr = get(h) as number[]
+                for(let i = 0; i < count; i++)
+                {
+                    let value = arr[i]!
+                    for(let byte = 0; byte < width; byte++)
+                    {
+                        buffer[it.pos++] = value & 0xFF
+                        value >>>= 8
+                    }
+                }
+                return
+            }
+
+            case "READ_SEQ":
+            {
+                const [iterId, handleId, width, signed] = instr.operands as readonly [number, number, number, number]
+                const it = iterAt(iterId)
+                if(it.capability !== "read") throw new Error(`codec extension: READ_SEQ on write-only iterator ${iterId}`)
+                const h = frame[handleId]
+                if(!h) throw new Error(`codec extension: READ_SEQ on unbound handle ${handleId}`)
+                const arr = get(h) as number[]
+                const count = state.acc
+                for(let i = 0; i < count; i++)
+                {
+                    let value = 0
+                    for(let byte = 0; byte < width; byte++)
+                        value |= (buffer[it.pos++] ?? 0) << (8 * byte)
+                    value = value >>> 0
+                    arr[i] = signed ? signExtend(width * 8, value) : value
+                }
                 return
             }
 
