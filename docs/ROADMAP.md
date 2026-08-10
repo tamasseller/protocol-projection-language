@@ -470,6 +470,12 @@ net `tosDelta`, not an input/output arity split); and this is unverified
 against real fixtures — reasoned by hand, not yet run against
 `packages/machine/test` or any real target consumer.
 
+## 13. Futher ideas
+
+- crypto extension via stream iterators: new handle space, openssl like api, could cover CRCs, fixed and variable length hashes (shake) and aead as well
+- better dsl syntax accessing handles: like stream[0].read/write or some declaration like syntax (could also allow allocations to be delegated to the lowerer, would be nice)
+- small **value** space merging binary codec, e.g. union tag merged with limited range number field in one of the variants, might need some annotation/hinting/some kind of meta-argument to specify what to merge with what, becasue it favors some against the others heavily compactness-wise.
+
 ---
 
 ## Known non-blocking issues
