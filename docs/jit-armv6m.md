@@ -64,7 +64,7 @@ phases: alloc-only until exhausted, then evict-LRU-and-compact (§9).
 | `r3` | `acc` |
 | `r4–r7` | TOS window, circularly renamed (§5) |
 | `r0–r2, r12` | scratch — instruction implementation, trampoline argument passing |
-| `r8–r11` | table base pointers (dispatch table, arena/LRU metadata, helper vector — §10.4) |
+| `r8–r11` | table base pointers (dispatch table, arena/LRU metadata, helper vector — §11) |
 | `sp` | operand/TOS spill stack (§2) — **never** the real C call stack while compiled code runs |
 | `lr` | transient, `BLX`-scoped only |
 
@@ -170,16 +170,15 @@ whole translator and the one most worth prototyping first.
 
 **Callee-side prologue.** The shuffle above is the *caller's* job. The
 callee has its own, smaller obligation: isa-core.md §4.6's last argument
-arrives in `acc`, not at its frame-relative home register — and nothing
-else in a procedure's own bytecode body guarantees `acc` survives
-untouched until the first instruction that reads it (in the Appendix
-worked example, `CONST #1` clobbers `acc` before `v` is ever read back).
-So every procedure with `arg_count ≥ 1` needs one implicit prologue
-instruction, emitted unconditionally (no lookahead to check whether the
-body's first real instruction happens to consume `acc` immediately) —
-copy `acc` into the last argument's canonical home register before
-translating the body at all. Same "keep the translator simple, no
-lookahead" bias as §5's unconditional spill recovery.
+arrives in `acc`, not at its frame-relative home register `phys(argidx)`
+— and nothing else in a procedure's own bytecode body guarantees `acc`
+survives untouched until the first instruction that reads it (in the
+Appendix worked example, `CONST #1` clobbers `acc` before `v` is ever read
+back). Rather than an unconditionally-emitted copy instruction, this is
+folded into §10.1's state machine as its own entry state — see §10.1's
+"Callee-side prologue as a fold" — so a procedure whose first real
+instruction reads the argument straight back (a common shape for small
+procedures) pays nothing for it at all.
 
 ---
 
@@ -256,22 +255,6 @@ per-opcode-class notes:
   one spill-stack `LDR` first. Peek/pop modes are direct consequences of
   §5's window (peek = top-of-window register in place; pop = read + shrink
   window, unconditional refill per §5).
-- **Comparison + branch fusion is required, not optional.** ARMv6-M has no
-  compare-and-set instruction (no `IT`+conditional-`MOV` equivalent to
-  materializing a real 0/1 in one or two ops the way later architectures
-  can) — synthesizing an actual boolean into `acc` from a `CMP` needs
-  ~4–5 instructions (`CMP`, branch, two immediate loads). A comparison op
-  is, in every bytecode this ISA can express, immediately consumed by
-  exactly one `BLOCK_END`/`BR_TABLE` test (isa-core.md §4.5's "lenient
-  test") — so the translator must recognize that adjacency and fuse the
-  pair directly into one `CMP` + one conditional branch, never
-  materializing an intermediate value. This is the one deliberate,
-  bounded exception to "no lookahead" elsewhere in this design: it's a
-  fixed one-instruction peek, not dataflow analysis, and without it the
-  §14 estimates for `if`/`while` conditions (assumed fused) are off by
-  roughly 5 instructions per comparison — i.e. wrong by more than the
-  estimate itself, given how often a loop condition executes. See the
-  Appendix worked example for the concrete before/after.
 - **`BR_TABLE`** — no `TBB`/`TBH` on ARMv6-M (Thumb-2 only). `N ≤ 2` (the
   overwhelming common case — `if`/`if-else`, isa-core.md §7.1) compiles to a
   plain `CMP` + conditional branch, no table at all. Larger `N` needs an
@@ -285,78 +268,183 @@ per-opcode-class notes:
 - **`MUL`** — native `MULS`, part of ARMv6-M baseline. Fine as-is.
 - **No `DIV`/`MOD`** in the ISA (isa-core.md §4.1) — nothing to synthesize.
 
-**Producer→`STORE` fusion — the same idea, generalized beyond
-comparisons.** Any instruction that produces a fresh `acc` value,
-immediately followed by `STORE rK` with `rK` currently in-window, can
-skip the copy into `r3` and write straight into `phys(rK)` instead — the
-same one-instruction-peek shape as comparison fusion above, but only
-sound if the producer's native form can target an arbitrary destination
-register rather than being forced to write back into whichever register
-holds `acc`. That's a hard ARMv6-M constraint, not a design choice:
+### 10.1 Local peephole combining: the `acc` state machine
 
-| Retargetable (`Rd` independent of the acc operand) | Not retargetable (Thumb-1 2-op encoding forces `Rd` = a source) |
-|---|---|
-| `CONST`/immediate loads (`MOVS Rd,#imm`, `LDR Rd,[PC,#imm]`) | `AND`, `EOR`/`XOR`, `ORR`, `MUL`, `BIC`, `ADC`, `SBC` |
-| `LOAD` (pure copy — fuses straight through, bypassing `acc` entirely) | shift-by-*register* (`LSL`/`LSR`/`ASR` reg-reg form) |
-| `ADD`/`SUB` (Thumb's 3-operand register or imm3 form) | comparisons not immediately branch-fused (still only ever write `acc`) |
-| shift-by-*immediate* (3-operand `Imm5` form) | `CALL`'s return value — ABI-fixed into `r3` by the shared dispatch trampoline (§7/§9), not under this call site's control |
-| `NEG`, `NOT`, `SXH`/`SXB`/`UXH`/`UXB`/`REV`/`REV16`/`REVSH` (destination-only field, doesn't read its own prior value) | |
+The three fusions this design needs (comparison+branch, a producer folding
+into a following `STORE`, and a producer folding a *preceding* value in as
+its own operand) are one mechanism, not three — worth presenting as such
+rather than as separate ad-hoc rules layered on top of each other. What
+bounds it cleanly: **every ARMv6-M ALU-class instruction is strictly
+binary** — two source operands, at most one free destination, no ternary
+form — so the combining never needs to chain more than one bytecode
+instruction deep in either direction. It resolves *at* the next
+instruction, never several ahead.
 
-The left column has a genuine 3-independent-operand (or destination-only)
-hardware encoding; the right column's Thumb-1 2-operand form reads
-whichever register the destination field names as an *input* too — a
-naive retarget there wouldn't just risk a stale value later, it would
-silently compute the wrong result immediately, a different and worse
-failure mode than the liveness question below, worth keeping distinct.
+**The state.** At any point in the walk, `acc`'s status is exactly one of:
 
-*Why this stays sound with only a one-instruction trigger, no lookahead
-past that.* The ISA has no instruction that reads `acc` without either
-overwriting it in the same instruction or being a pure capture (`STORE`,
-`PUSH`) that leaves it unchanged — inspection of every op in §4 confirms
-this; nothing "peeks" at `acc` and leaves it live for a third reader. So
-the real invariant isn't "used at most once," but close enough to be just
-as useful: a run of zero or more consecutive `STORE`/`PUSH` instructions
-can validly read the same `acc` value, terminated only by the next
-producer. That bounds the danger enough to make a purely causal scheme
-sound — track `acc_home` (a physical register, defaulting to `r3`) as one
-more piece of compile-time state, the same style §5's window already
-keeps:
+- **`CLEAN(reg)`** — already sitting in a committed physical register
+  (usually `r3`, sometimes an alias left by an earlier destination-fold).
+- **`PENDING(shape)`** — not yet emitted; `shape` is `Imm(k)` (from
+  `CONST`) or `Reg(r)` (from `LOAD` *or* `POP` — the same class, since
+  both just mean "the value already sits in some resident physical
+  register"; classifying by *result shape*, not opcode, is what keeps the
+  table small).
 
-- Fusing a producer into a following `STORE rK` sets `acc_home =
-  phys(rK)` instead of emitting the copy.
-- Every later read of "acc" (another `STORE`/`PUSH`, or an operand slot)
-  reads from `acc_home`, not a hardcoded `r3` — a second consecutive
-  `STORE`/`PUSH` in the same run just works, unmodified, since `acc_home`
-  already points at the value.
-- The only remaining danger, per the invariant above: §5's window
-  rotation evicting the *specific* physical register `acc_home` points
-  at, before a new producer ever supersedes it — only reachable if enough
-  consecutive `PUSH`es land inside the same acc-reading run to rotate
-  that exact slot out (§5's 4-deep window). Cheap, mechanical,
-  rare-to-trigger fallback bolted onto rotation logic §5 already runs:
-  emit one `MOVS r3, acc_home` first, then proceed as if `acc_home` had
-  been `r3` all along.
+**The transitions**, one bytecode instruction at a time:
 
-Not specific to this project's own `lower.ts` output either — it's a
-structural fact about any accumulator ISA with no non-consuming peek at
-`acc`, so it holds against arbitrary conforming bytecode, not just
-"well-behaved" DSL-generated programs. In practice (this project's own
+| Current state | Next instruction | Action |
+|---|---|---|
+| `CLEAN` | a producer (`CONST`/`LOAD`/`POP`) | → `PENDING(shape)`; nothing emitted yet |
+| `PENDING(shape)` | a compatible consumer (table below) | emit **one** instruction folding `shape` in as the left operand; peek one more token for a following `STORE` to fold as the destination too → `CLEAN(dest)` |
+| `PENDING(shape)` | no match in the table | **flush**: emit `shape`'s trivial materialization into `r3` → `CLEAN(r3)`; reprocess the next instruction fresh |
+| `CLEAN(reg)` | an ordinary consumer | emit normally, reading `reg`; still peek one token for a `STORE`-fold on the destination |
+
+Worked example — `LOAD rN; ADD rM; STORE rD` (three bytecode ops) — both
+slots fire on the same native instruction: `LOAD` → `PENDING(Reg(rN))`;
+`ADD rM` folds `rN` in as the left operand *and* peeks `STORE rD` to fold
+the destination → one instruction, `ADDS rD, rN, rM`.
+
+Arithmetic's two write-back-in-place addressing modes — mode 2,
+register-destination (`rN = acc ⟨op⟩ rN`), and mode 3, peek
+(`[tos-1] = acc ⟨op⟩ [tos-1]`, isa-core.md §4.1) — are this exact same
+destination-fold, just pre-supplied by the instruction's own combo instead
+of needing the one-token peek at a following `STORE`: no new
+native-encoding case (peek's destination is just `phys(tos-1)`, the same
+window register a named `rN` would map to), and — per the acc-clobbering
+convention discussed further below — both terminate the run exactly like a
+`STORE`-fold would, `acc` included.
+
+This also reframes comparison+branch fusion (ARMv6-M has no
+compare-and-set instruction, so materializing a real 0/1 from a bare `CMP`
+costs ~4–5 instructions on its own) as a *third*, more aggressive fold
+axis rather than a special case bolted on separately: the destination
+isn't redirected to a register at all, it's eliminated — a
+`BLOCK_END`/`BR_TABLE` test consumes the flags `CMP` already set, so nothing
+ever gets materialized. Three axes, one mechanism: fold a pending producer
+in as an operand (front), fold a result's destination into a following
+`STORE` (back), or skip materializing a comparison's result into any
+register at all when a branch is the only consumer (back, zero-destination
+case). Without the front-and-back folds, `if`/`while` conditions cost
+several instructions more than assumed elsewhere in this doc — real enough
+that leaving this out isn't a viable fallback design, only a
+"how much" question. See the Appendix for the concrete instruction counts
+across all four tiers (unfused, branch-fusion only, +destination-fold,
++operand-fold).
+
+**Classification is by native-encoding shape, not opcode** — a handful of
+consumer classes, and this is a hard ARMv6-M constraint, not a design
+choice:
+
+| Class | Examples | Folds a pending operand? | Folds a following `STORE`? |
+|---|---|---|---|
+| Commutative 3-op (reg-reg or reg-imm3) | `ADD` | yes, either shape, either side | yes |
+| Order-sensitive 3-op, mirror available | comparisons | `Reg` always; `Imm` via a swapped relational op (see below) | no (branch-fused instead, or writes `acc` if not) |
+| Order-sensitive 3-op, no mirror | `SUB` | `Reg` always; `Imm` only if `k=0` (`RSB`) | yes |
+| Shift-by-*immediate* (3-op) | `SHL`/`SHR`/`ASR` imm form | `Reg` (as the shifted value) | yes |
+| Destination-only, no own-value read | `NEG`, `NOT`, `SXH`/`SXB`/`UXH`/`UXB`/`REV`/`REV16`/`REVSH` | `Reg` | yes |
+| 2-op in-place, no immediate form | `AND`, `EOR`/`XOR`, `ORR`, `MUL`, `BIC`, `ADC`, `SBC`, shift-by-*register* | never — Thumb-1's 2-operand encoding reads the destination field as an input too | never |
+
+The bottom row is a genuinely different, worse failure mode than the
+ordering question below if gotten wrong: retargeting one of those would
+silently compute the wrong result immediately, not just risk a stale
+value later — pending state must always flush before one of these,
+without exception.
+
+**The one real correctness wrinkle: operand order.** `PENDING(Reg(r))`
+always folds safely into anything, regardless of the op — it's just
+skipping a copy, `r` genuinely *is* what `acc` would hold, so the
+operand's position in the encoding is unchanged. `PENDING(Imm(k))` is
+where order can bite, and it's worth a concrete pair that looks symmetric
+and isn't: `RSUB` (`operand − acc`) folds a pending `Imm(k)` cleanly via
+Thumb's `SUBIMM` (`Rd = Rn − imm3`, exactly `operand − k`) — but `SUB`
+(`acc − operand`, wanting `k − operand`) has no matching form at all in
+Thumb-1 baseline (`RSB`'s only immediate is literal `0`) and must flush
+unless `k` happens to be `0`. Comparisons get a way out `SUB` doesn't:
+since all eight relational ops are independently available (isa-core.md
+§4.2), "`k < rN`" can be recast as "`rN > k`" — same truth value, operand
+and immediate now on the sides Thumb's `CMP Rn,#imm8` actually supports —
+via a small, mechanical *swap* table (`LT_S`↔`GT_S`, `LE_S`↔`GE_S`,
+`LT_U`↔`GT_U`, `LE_U`↔`GE_U`, `EQ`↔`EQ`, `NE`↔`NE`), the same kind of
+table isa-core.md §7.3's complementary-comparison (a *negation*, not a
+swap — a different transform, same mechanical flavor) already uses one
+layer down, at lowering time rather than translation time.
+
+**Why a one-token trigger stays sound with no lookahead past that.** This
+does *not* follow from raw ISA physics — arithmetic's two write-back-in-place
+addressing modes (isa-core.md §4.1: mode 2, `rN = acc ⟨op⟩ rN`; mode 3,
+peek, `[tos-1] = acc ⟨op⟩ [tos-1]`) both read `acc` and, bit-for-bit, leave
+it untouched; neither is a producer nor `STORE`/`PUSH`. Taken as a hardware
+fact, a third reader downstream really could observe the same value. What
+actually makes the run-length argument hold is a *declared* convention this
+project's toolchain already commits to elsewhere, not a physical one:
+rtl.ts's combo table marks every write-back-in-place combo — `REG_REG`
+(mode 2) and `PEEK_PEEK` (mode 3) alike — as clobbering `acc`
+(`clobbers: ["acc"]`, `PEEK_PEEK` also clobbering `"tos"`), and raise.ts's
+`binary()` already acts on it verbatim (`this.acc = undefined // clobbered`
+for the `REG_REG` case) when reconstructing structured code from flat
+`RtlProc` bodies. So the rule this scheme leans on is "a write-back-in-place
+op terminates an acc-reading run exactly like a producer would," by the
+same contract raise.ts and the EAST-level fragment-combining logic
+(builders.ts/orchestrator.ts) already rely on — not a from-scratch
+inspection of §4. With that convention in hand, the real invariant isn't
+"used at most once," but close enough to be just as useful: a run of zero
+or more consecutive `STORE`/`PUSH` instructions can validly read the same
+`acc` value, terminated by the next producer *or* a write-back-in-place op.
+That bounds the danger enough to make a purely causal scheme
+sound with no lookahead beyond the one-token fold/flush decision above:
+
+- A second consecutive `STORE`/`PUSH` reading the same `acc` value just
+  works, unmodified, since `CLEAN`'s `reg` already points at the value —
+  no special-casing needed.
+- The only remaining danger: §5's window rotation evicting the *specific*
+  physical register a fused result now lives in, before a new producer
+  ever supersedes it — only reachable if enough consecutive `PUSH`es land
+  inside the same acc-reading run to rotate that exact slot out (§5's
+  4-deep window). Cheap, mechanical, rare-to-trigger fallback bolted onto
+  rotation logic §5 already runs: emit one `MOVS r3, reg` first, then
+  proceed as if `CLEAN(r3)` had held all along.
+
+Not specific to this project's own `lower.ts` output either — it holds
+against any bytecode that honors the acc-clobbering convention discussed
+above (not yet statically enforced — §16 item 6), not just "well-behaved"
+DSL-generated programs specifically. In practice (this project's own
 generated code included), the fallback essentially never fires — real
 generated code doesn't chain four `PUSH`es between a stored value and its
 next use — but nothing here *requires* that to be true for soundness.
 
-**Quantified on the Appendix's `leb128_len`:** `CONST #1`+`STORE 1` fuses
-to `MOVS r5, #1`; `SHR #7`+`STORE 0` fuses to `LSRS r4, r3, #7`; `ADD
-1`+`STORE 1` fuses to `ADDS r5, r3, r5` — 16 native instructions down to
-13, landing at parity with the bytecode's own 13 opcodes rather than 1.2×
-over it. See the Appendix's fused variant.
+**Callee-side prologue as a fold.** isa-core.md §4.6's last argument
+arrives in `acc`, not at its frame-relative home register `phys(argidx)`
+— and `phys(argidx)` itself currently holds stale data (whatever the
+caller's shuffle left there, never overwritten, since the calling
+convention routes this one argument through `acc` instead). Rather than
+an unconditional `MOVS phys(argidx), r3` emitted before Pass 1 even
+starts, a procedure with `arg_count ≥ 1` starts Pass 1 at `CLEAN(r3)` plus
+one standing obligation — "`phys(argidx)` isn't populated yet" — resolved
+by the same one-token machinery, plus one genuinely free case:
 
-A mirror-image sibling, not detailed here or folded into the count above:
-fusing a `LOAD` into the *next* instruction's source operand instead of a
-producer into the *following* `STORE` (e.g. `LOAD 0; SHR #7` → `LSRS r4,
-r4, #7` directly, no copy on either side) — same underlying hardware
-property (independent operand fields), applied at the front of an
-operation instead of the back. Worth the same treatment later.
+- **`LOAD argidx`** (or any acc-destination addressing mode reading
+  `argidx`) as the next instruction is a true no-op: it's asking for
+  exactly what `CLEAN(r3)` already holds, so nothing is emitted and the
+  obligation is discharged for free. Common in practice — any small
+  procedure that reads its last argument back near the top hits this.
+- **A register-mode operand reference to `argidx`** (mode 1/2/3) is
+  served by substituting `r3` for that one operand in the native
+  encoding — but since these reads are non-consuming (the value stays
+  live at that slot for later reads too, unlike `POP`), this does *not*
+  discharge the obligation, only defers it past this one instruction.
+- **Any other producer** forces the flush right there (`MOVS
+  phys(argidx), r3`) before it overwrites `acc` — the same cost as the
+  unconditional version, just possibly delayed by one token instead of
+  paid upfront regardless of whether anything ever needed it.
+- **Rotation eviction** is the same hazard as the ordinary case above,
+  with `phys(argidx)`'s stale contents as the thing at risk instead of a
+  fused result's — one more trigger for the same bolted-on
+  force-a-flush-first fallback, not a new mechanism.
+
+No lookahead deeper than the one token already in use anywhere else in
+this scheme — the obligation just persists across the same
+`STORE`/`PUSH`-shaped run already bounded above, rather than resolving
+within a single step.
 
 **Pass 2 — fixup.** Two independent jobs, not one:
 - *Branch range.* Thumb conditional branches are ±252 bytes (8-bit signed
@@ -496,7 +584,7 @@ instruction count:
 | `PUSH`/`POP`, crossing the 4-deep boundary | 1 (`STR`/`LDR`) |
 | `CONST`/`LOAD`/`STORE` | 1–2 |
 | `if`/`if-else` (`BR_TABLE` ≤2) | 2–3 (`CMP` + branch(es)) — **only with
-  the fusion §10 requires**; ~7 unfused |
+  §10.1's fusion**; ~7 unfused |
 | `CALL` | ~5–6 (shuffle + table load + `BLX` + return handling) |
 | `RETURN` | 2 (move return value to `acc` + jump to the shared
   `dispatch_return` routine, §7) |
@@ -512,13 +600,15 @@ overheads relative to native — and neither is a real disadvantage, since
 calling convention's own bookkeeping.
 
 First real data point (Appendix): a full, leaf, loop-and-comparison
-procedure expands from 24 bytecode bytes to 32 bytes of native code plus a
-4-byte literal-pool entry — 16 native instructions against 13 bytecode
-opcodes (excluding the structural `LOOP` marker), a ~1.2× instruction-count
-expansion and ~1.5× byte expansion, at the good end of the range above.
-Caveat: this example has no `CALL` and never crosses the 4-register window
-boundary, so it doesn't exercise §6's shuffle or §5's spill/fill at all —
-see §16.
+procedure (14 bytecode opcodes / 24 bytes, excluding the structural `LOOP`
+marker) comes in at 21 native instructions (42 bytes) with no fusion at
+all, 16 (32 bytes) with just branch-fusion, 13 (26 bytes) once
+destination-folding joins in, and 10 (20 bytes) with the full §10.1 scheme
+— that last figure is *below* the bytecode's own instruction count and
+byte size, not just "the good end of" some expansion range. Caveat: this
+example has no `CALL` and never crosses the 4-register window boundary, so
+it doesn't exercise §6's shuffle, §5's spill/fill, or §10.1's
+rotation-eviction fallback at all — see §16.
 
 Translation throughput itself (JIT compiling the JIT, so to speak) should
 land in the few-hundred-native-instructions-per-bytecode-instruction range
@@ -558,6 +648,28 @@ moves for the whole procedure body. So per §5's formula, `phys(0) = r4`
 rotation, no spill, no fill. This is the simple case; see §16 item 5 for
 what it doesn't exercise.
 
+The raw bytecode is 14 opcodes / 24 bytes (`CONST`, `STORE`, `LOAD`,
+`GE_U`, `BLOCK_END`, `LOAD`, `SHR`, `STORE`, `CONST`, `ADD`, `STORE`,
+`BLOCK_END`, `LOAD`, `RETURN` — excluding the structural `LOOP` marker,
+which has no native emission of its own). Four tiers below, each strictly
+subtracting one class of the naive translation's waste, land at 21, 16,
+13, and 10 native instructions respectively.
+
+**Tier 0 — no fusion at all.** Not worth a full listing, but worth stating
+precisely as the honest baseline everything else is measured against:
+materializing `GE_U #0x80`'s result as a real 0/1 costs `CMP` / `BHS .t` /
+`MOVS r3,#0` / `B .d` / `.t: MOVS r3,#1` / `.d:` (5 instructions) followed
+by a *separate* `CMP r3,#0` / `BEQ L_exit` to actually branch on it (2
+more) — 7 instructions where §10.1's branch-fusion takes 2, and every
+other bytecode op translates one-for-one with no folding at all. Total: 21
+instructions (42 bytes) — prologue (1) plus 20 for the 14 bytecode ops
+themselves (the `RETURN` and unfused-comparison-plus-test pairs each cost
+more than one instruction). 1.5× instruction-count expansion, 1.75× byte
+expansion.
+
+**Tier 1 — comparison+branch fusion only** (§10.1's "zero-destination"
+axis):
+
 ```
                                     ; --- prologue (§6) — not in the bytecode ---
         MOVS  r4, r3                ; v's home (r4) = incoming last arg (acc)
@@ -568,7 +680,7 @@ what it doesn't exercise.
 
 L_cond:                             ; LOOP condition block
         MOVS  r3, r4                ; LOAD 0: acc = v
-        CMP   r3, #0x80             ; GE_U #0x80 — fused (§10) with the
+        CMP   r3, #0x80             ; GE_U #0x80 — fused (§10.1) with the
         BLO   L_exit                ; BLOCK_END below: v<0x80 (GE_U false) → exit
 
 L_body:                             ; LOOP body block — falls through, no branch needed
@@ -588,21 +700,13 @@ L_exit:
 
 16 native instructions (32 bytes) + one 4-byte reserved-slot reference
 already amortized elsewhere (§7 — no per-procedure literal pool needed for
-this), against 13 bytecode opcodes / 24 bytecode bytes (both counts
-excluding the structural `LOOP` marker, which has no native emission of
-its own). ~1.2× instruction-count expansion, ~1.3× byte expansion — the
-good end of §14's range, as expected for a procedure with no spill and no
-call.
+this). 1.14× instruction-count expansion, 1.33× byte expansion over the
+14/24 raw bytecode. The saved 5 instructions (7→2) recur on every loop
+iteration here, which is why §10.1 treats this fusion as required rather
+than a nice-to-have.
 
-**What this would have cost unfused (§10):** materializing `GE_U #0x80`'s
-result as a real 0/1 in `acc` before testing it needs `CMP r3, #0x80` /
-`BHS .t` / `MOVS r3, #0` / `B .d` / `.t: MOVS r3, #1` / `.d:` (5
-instructions) followed by a separate `CMP r3, #0` / `BEQ L_exit` (2 more)
-— 7 instructions where the fused form takes 2. The difference (5
-instructions) recurs on every loop iteration here, which is why §10 treats
-fusion as required rather than a nice-to-have optimization.
-
-**With producer→`STORE` fusion (§10) also applied:**
+**Tier 2 — destination-fold also applied** (§10.1's "back" axis: a
+producer's result redirected into a following `STORE` instead of a copy):
 
 ```
                                     ; --- prologue (§6) — not in the bytecode ---
@@ -635,20 +739,77 @@ L_exit:
         BX    r0
 ```
 
-13 native instructions (26 bytes) + the same reserved-slot reference as
-before — down from 16/32, and now at exact parity with the bytecode's own
-13 opcodes rather than 1.2× over it (byte expansion drops to ~1.25×). Only
-three of the seven candidate producer→consumer pairs actually fuse here
-(`CONST`+`STORE`, `SHR`+`STORE`, `ADD`+`STORE`) — every `LOAD` in this
-example stays unfused because its own very next consumer is an operand
-read, not a `STORE`, which is exactly the case §10 notes as the mirror-image
-sibling opportunity, not yet folded in here.
+13 native instructions (26 bytes) — already *below* the bytecode's own 14
+opcodes, 1.08× byte expansion. Only three of the candidate
+producer→consumer pairs fuse here (`CONST`+`STORE`, `SHR`+`STORE`,
+`ADD`+`STORE`) — every `LOAD` in this tier stays unfused, because its very
+next consumer reads it as an operand, not a `STORE`. That's exactly what
+tier 3 picks up.
+
+**Tier 3 — the full §10.1 state machine** (operand-fold joins
+destination-fold — every `LOAD`'s `PENDING(Reg(...))` now gets folded
+forward into whatever reads it, instead of being flushed into `r3` first):
+
+```
+                                    ; --- prologue (§6) — not in the bytecode ---
+        MOVS  r4, r3                ; v's home (r4) = incoming last arg (acc)
+
+                                    ; CONST #1 ; STORE 1 — fused (dest-fold)
+        MOVS  r5, #1                ; n (r5) = 1, directly
+
+L_cond:                             ; LOOP condition block
+                                    ; LOAD 0 ; GE_U #0x80 ; BLOCK_END — all
+                                    ; three fused: LOAD → PENDING(Reg(r4)),
+                                    ; folded as CMP's left operand, then
+                                    ; branch-fused as before — v never
+                                    ; touches r3 at all
+        CMP   r4, #0x80
+        BLO   L_exit
+
+L_body:                             ; LOOP body block
+                                    ; LOAD 0 ; SHR #7 ; STORE 0 — all three
+                                    ; fused: r4 folded in as SHR's source
+                                    ; (operand-fold) *and* as its
+                                    ; destination (dest-fold)
+        LSRS  r4, r4, #7
+
+                                    ; CONST #1 ; ADD 1 ; STORE 1 — all
+                                    ; three fused: the pending #1 folds via
+                                    ; Thumb's ADDIMM form directly (ADD is
+                                    ; commutative, so which side the
+                                    ; immediate came from doesn't matter),
+                                    ; destination folds into n's own
+                                    ; register too
+        ADDS  r5, r5, #1
+        B     L_cond                ; BLOCK_END: back-edge
+
+L_exit:
+                                    ; LOAD 1 — PENDING(Reg(r5)), but
+                                    ; RETURN's ABI needs the value
+                                    ; specifically in r3 (§7/§9, not a
+                                    ; foldable destination) — flush
+        MOVS  r3, r5
+        LDR   r0, [r9, #dispatch_return_off]  ; RETURN (§7), unchanged
+        BX    r0
+```
+
+10 native instructions (20 bytes) — *smaller*, by both measures, than the
+bytecode it was translated from (14 opcodes / 24 bytes), while being
+directly-executable machine code with no interpretation loop at all. 0.71×
+instruction-count "expansion," 0.83× byte "expansion" — genuine
+compression, not just a favorable ratio. Every fold that fires here is
+exactly one of the three axes §10.1 names: destination-fold (`CONST`→`n`,
+`SHR`→`v`, `ADD`→`n`), operand-fold (`LOAD`→`CMP`, `LOAD`→`SHR`,
+`CONST`→`ADD`), and the mandatory zero-destination branch-fusion
+(`GE_U`+`BLOCK_END`) — nothing here needed a chain deeper than the single
+bytecode instruction on either side, confirming §10.1's claim that the
+binary-op ceiling bounds this cleanly.
 
 **Not exercised by this example** (§16 item 5): no `CALL`, so no instance
 of §6's shuffle; `tos` never moves past 1, so no instance of §5's
-spill/fill across the 4-register boundary, and so no instance of §10's
-`acc_home` rotation-eviction fallback either. A second worked example
-covering all three is the next thing worth hand-translating.
+spill/fill across the 4-register boundary, and so no instance of §10.1's
+rotation-eviction fallback either. A second worked example covering all
+three is the next thing worth hand-translating.
 
 ---
 
@@ -670,21 +831,36 @@ covering all three is the next thing worth hand-translating.
    computed rather than link-time constants.
 5. **No prototype yet, and one example isn't enough** — the Appendix's
    hand-translation of isa-core.md's `leb128_len` confirms §5's window
-   formula, §10's comparison-branch and producer→`STORE` fusion rules, and
-   §7's cheap `RETURN` path, but it's a leaf procedure with no `CALL` and a
-   `tos` that never moves — it validates none of §6's shuffle, §8's
-   pinning, §5's spill/fill across the 4-register boundary, or §10's
-   `acc_home` rotation-eviction fallback. A second worked example that
-   actually calls another procedure and pushes past 4 live values is the
-   next real signal to get, before §6's open shuffle-bound question
-   (item 1) can be settled with any confidence.
-6. **Producer→`STORE` fusion's `acc_home` scheme (§10) is reasoned, not
-   implemented or tested** — the soundness argument rests on "no
-   instruction reads `acc` without overwriting or capturing it," checked
-   by inspection of §4's opcode list here, not by a mechanical proof or a
-   test that actually exercises the rotation-eviction fallback path. Worth
-   a dedicated small test case (a producer immediately followed by a
-   `STORE`, then enough `PUSH`es to rotate the aliased register out before
-   the next real producer) once there's a translator to run it against.
-   The mirror-image `LOAD`-into-operand fusion (§10's noted sibling) isn't
-   designed in any more detail than the one paragraph mentioning it.
+   formula and §10.1's fusion state machine (all three axes — see the
+   Appendix's tier 3) plus §7's cheap `RETURN` path, but it's a leaf
+   procedure with no `CALL` and a `tos` that never moves — it validates
+   none of §6's shuffle, §8's pinning, §5's spill/fill across the
+   4-register boundary, or §10.1's rotation-eviction fallback. A second
+   worked example that actually calls another procedure and pushes past 4
+   live values is the next real signal to get, before §6's open
+   shuffle-bound question (item 1) can be settled with any confidence.
+6. **§10.1's `CLEAN`/`PENDING` state machine is reasoned, not implemented
+   or tested** — the soundness argument rests on "every op either
+   overwrites `acc`, is a pure capture (`STORE`/`PUSH`), or is a
+   write-back-in-place combo (`REG_REG`/`PEEK_PEEK`), which is declared
+   (not physically forced) to clobber `acc` the same way." That declaration
+   already exists and is already load-bearing elsewhere — rtl.ts's combo
+   table (`REG_REG`/`PEEK_PEEK`: `clobbers: ["acc", ...]`) and raise.ts's
+   `binary()` (`this.acc = undefined // clobbered`) — but nothing enforces
+   it as a static guarantee today: `validate.ts`'s §8 checks (TOS balance,
+   call-graph acyclicity, stack-depth, dead code, header/block
+   well-formedness) have no `acc`-liveness pass, and `vm.ts`'s interpreter
+   doesn't poison `acc` after a `REG_REG`/`PEEK_PEEK` write the way
+   raise.ts does — so a hand-crafted program that violates the convention
+   would silently compute the bit-accurate-by-luck answer under `vm.ts`
+   rather than get caught. Worth closing before a real translator leans on
+   it: a `validate.ts` acc-liveness check (structurally similar to its
+   existing per-procedure walk) plus matching `vm.ts` poisoning, with test
+   cases for both. Separately, a dedicated small JIT test case (a producer
+   immediately followed by a `STORE`, then enough `PUSH`es to rotate the
+   aliased register out before the next real producer) is worth adding once
+   there's a translator to run it against. The consumer-class table (§10.1)
+   is also reasoned per-op by hand, not derived mechanically from
+   armv6.h's own encoder signatures — worth cross-checking the two once a
+   translator exists, since a transcription error there would silently
+   misclassify one op's foldability rather than fail loudly.

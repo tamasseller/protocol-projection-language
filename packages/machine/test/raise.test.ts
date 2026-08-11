@@ -19,7 +19,7 @@ import assert from "node:assert/strict"
 import { ir, proc } from "../src/ir"
 import { lowerProc, lowerProgram } from "../src/lower"
 import { run, evalBinary, evalUnary } from "../src/vm"
-import { raiseProgram } from "../src/raise"
+import { raiseProgram, ExprKind, StmtKind } from "../src/raise"
 import type { Expr, Stmt, RaisedProc } from "../src/raise"
 import { extInstr } from "../src/rtl"
 import type { RtlProgram } from "../src/rtl"
@@ -68,12 +68,12 @@ function evalRaisedProgram(
     {
         switch(e.kind)
         {
-            case "const": return e.value >>> 0
-            case "slot": return slots[e.index] ?? 0
-            case "binary": return evalBinary(evalExpr(e.left, slots), evalExpr(e.right, slots), e.op)
-            case "unary": return evalUnary(evalExpr(e.value, slots), e.op)
-            case "call": return callProc(e.calleeIndex, e.args.map(a => evalExpr(a, slots)))
-            case "ext":
+            case ExprKind.Const: return e.value >>> 0
+            case ExprKind.Slot: return slots[e.index] ?? 0
+            case ExprKind.Binary: return evalBinary(evalExpr(e.left, slots), evalExpr(e.right, slots), e.op)
+            case ExprKind.Unary: return evalUnary(evalExpr(e.value, slots), e.op)
+            case ExprKind.Call: return callProc(e.calleeIndex, e.args.map(a => evalExpr(a, slots)))
+            case ExprKind.Ext:
             {
                 // readsAcc (ExtOpEffect.readsAcc, extension.ts) ops carry
                 // their acc-sourced input as args' trailing entry (raise.ts's
@@ -105,7 +105,7 @@ function evalRaisedProgram(
         const state: ExecState = {
             get acc() { return result },
             set acc(v: number) { result = v >>> 0 },
-            push() { throw new Error(`evalRaised: EXT ${ext} pushed in the tosDelta<=0 (acc-result) shape`) },
+            push() { throw new Error(`evalRaised: EXT ${ext} pushed — raise.ts guarantees tosDelta ≤ 0, so an EXT op never pushes`) },
             pop() { if(cursor < 0) throw new Error(`evalRaised: EXT ${ext} popped more than raised`); return poppedArgs[cursor--] },
             reg(i) { return slots[i] ?? 0 },
             setReg(i, v) { slots[i] = v >>> 0 },
@@ -115,42 +115,18 @@ function evalRaisedProgram(
         return result
     }
 
-    /** tosDelta > 0 shape (extMulti): one call, `slotsOut.length` discrete
-     *  results landed directly into fresh slots — proves the raise.ts fix
-     *  (this used to be modeled as N separate same-shaped Expr["ext"]
-     *  nodes, which would have called `exec` N times here, once per
-     *  result, instead of once total). */
-    function execExtMulti(slotsOut: readonly number[], ext: string, operands: readonly number[], slots: number[]): void
-    {
-        if(!extension?.exec) throw new Error(`evalRaised: EXT ${ext} with no extension registered`)
-        const produced: number[] = []
-        const state: ExecState = {
-            acc: 0,
-            push(v: number) { produced.push(v >>> 0) },
-            pop() { throw new Error(`evalRaised: EXT ${ext} popped in the tosDelta>0 (extMulti) shape`) },
-            reg(i) { return slots[i] ?? 0 },
-            setReg(i, v) { slots[i] = v >>> 0 },
-            callProc,
-        }
-        extension.exec(extInstr(ext, operands), state)
-        if(produced.length !== slotsOut.length)
-            throw new Error(`evalRaised: EXT ${ext} pushed ${produced.length} value(s), expected ${slotsOut.length}`)
-        slotsOut.forEach((slot, k) => { slots[slot] = produced[k] })
-    }
-
     function execStmts(stmts: readonly Stmt[], slots: number[]): void
     {
         for(const s of stmts)
         {
             switch(s.kind)
             {
-                case "assign": slots[s.slot] = evalExpr(s.value, slots); break
-                case "exprStmt": evalExpr(s.value, slots); break
-                case "extMulti": execExtMulti(s.slots, s.ext, s.operands, slots); break
-                case "return": throw new RaisedReturn(evalExpr(s.value, slots))
-                case "trap": throw new RaisedTrap(s.code)
+                case StmtKind.Assign: slots[s.slot] = evalExpr(s.value, slots); break
+                case StmtKind.ExprStmt: evalExpr(s.value, slots); break
+                case StmtKind.Return: throw new RaisedReturn(evalExpr(s.value, slots))
+                case StmtKind.Trap: throw new RaisedTrap(s.code)
 
-                case "dispatch":
+                case StmtKind.Dispatch:
                 {
                     const idx = evalExpr(s.test, slots)
                     const chosen = idx >= 0 && idx < s.cases.length ? s.cases[idx] : undefined
@@ -158,7 +134,7 @@ function evalRaisedProgram(
                     break
                 }
 
-                case "loop":
+                case StmtKind.Loop:
                     for(;;)
                     {
                         execStmts(s.cond, slots)
@@ -512,18 +488,16 @@ const sumTwoProgram: RtlProgram = {
 }
 
 /**
- * tosDelta: +2 — one call, two discrete stack results. Exactly the shape
- * the raise.ts fix (extMulti) exists for: modeled as N separate
- * Expr["ext"] nodes (one per result), this would call `exec` N times
- * instead of once — `callCount` catches that regression directly.
+ * tosDelta: +2 — a net stack push. A perfectly valid `run()`-executable VM
+ * op (`state.push` is generic), but `raiseProgram` bans declaring one at
+ * all — see `ExtOpEffect.tosDelta`'s own doc comment for why.
  */
-function splitExtension(callCount: { n: number }): Extension
+function pushingExtension(): Extension
 {
     return {
         effects: { SPLIT_REG: { tosDelta: 2, maxTransient: 0 } },
         exec: (instr, state) =>
         {
-            callCount.n++
             const v = state.reg(instr.operands[0]!)
             state.push(v & 0xFF)
             state.push((v >>> 8) & 0xFF)
@@ -531,13 +505,13 @@ function splitExtension(callCount: { n: number }): Extension
     }
 }
 
-const splitProgram: RtlProgram = {
+const pushingProgram: RtlProgram = {
     procedures: [{
         argCount: 0,
         body: [
             { op: "CONST", imm: 0x1234 },
             { op: "PUSH" }, // slot 0 = 0x1234
-            extInstr("SPLIT_REG", [0]), // reads reg 0, pushes lo then hi (slots 1, 2)
+            extInstr("SPLIT_REG", [0]), // reads reg 0, pushes lo then hi
             { op: "POP" }, // acc = hi
             { op: "ADD", combo: "POP_ACC" }, // acc = hi + lo — just needs to be *some* function of both
             { op: "RETURN" },
@@ -561,22 +535,14 @@ describe("raise: EXT — tosDelta ≤ 0 (opaque acc result)", () =>
         assert.ok(raisedResult.ok, `raised tree trapped (code ${raisedResult.trapCode})`)
         assert.equal(raisedResult.acc, vmResult.acc)
     })
-})
 
-describe("raise: EXT — tosDelta > 0 (extMulti: one call, N discrete results)", () =>
-{
-    test("splits a register into two stack results via exactly one call, agreeing with run()", () =>
+    test("tosDelta: +2 is banned — run() executes it fine, raiseProgram throws", () =>
     {
-        const vmCallCount = { n: 0 }
-        const vmResult = run(splitProgram, splitExtension(vmCallCount))
-        assert.ok(vmResult.ok)
-        assert.equal(vmCallCount.n, 1, "run(): exec should run exactly once")
+        const ext = pushingExtension()
+        const vmResult = run(pushingProgram, ext)
+        assert.ok(vmResult.ok, "run(): a net-positive EXT op is a perfectly ordinary VM op")
 
-        const raisedCallCount = { n: 0 }
-        const raisedResult = evalRaisedProgram(raiseProgram(splitProgram, splitExtension(raisedCallCount)), splitExtension(raisedCallCount))
-        assert.ok(raisedResult.ok, `raised tree trapped (code ${raisedResult.trapCode})`)
-        assert.equal(raisedResult.acc, vmResult.acc, "raised tree disagrees with run()")
-        assert.equal(raisedCallCount.n, 1, "evalRaised: exec should run exactly once, not once per result (the extMulti fix)")
+        assert.throws(() => raiseProgram(pushingProgram, ext), /tosDelta > 0/)
     })
 })
 

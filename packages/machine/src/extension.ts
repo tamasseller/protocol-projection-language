@@ -27,7 +27,12 @@ import type { ExtInstr } from "./rtl"
 export interface ExtOpEffect
 {
     /** Net TOS depth change contributed by the op itself, mirroring
-     *  `ComboMeta.tosDelta` for core ops. */
+     *  `ComboMeta.tosDelta` for core ops. Must be `<= 0` — `raise.ts`
+     *  throws on a positive value: no DSL rule (`rules.ts`'s
+     *  `leafNode`/`unaryNode`, or an extension's own `rules()`) can ever
+     *  build a call-like node with more than one `output` location, so a
+     *  net stack push isn't representable as raise.ts's single opaque
+     *  `Expr["ext"]` result and nothing can construct one anyway. */
     tosDelta: number
     /** Peak *transient* TOS depth the op reaches above its own entry depth
      *  while executing — e.g. an op that pushes two temporaries and pops

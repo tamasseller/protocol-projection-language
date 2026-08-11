@@ -35,20 +35,49 @@ import type {Extension} from "./extension"
 // Output tree
 // ─────────────────────────────────────────────────────────────────────────────
 
-export type Expr =
-    | {kind: "const"; value: number}
-    | {kind: "slot"; index: number}
-    | {kind: "binary"; op: BinaryOpcode; left: Expr; right: Expr}
-    | {kind: "unary"; op: UnaryOpcode; value: Expr}
-    | {kind: "call"; calleeIndex: number; args: Expr[]}
+export const enum ExprKind
+{
+    /** A literal numeric constant — a raised CONST, or the fixed pure-zero
+     *  value `Raiser.unknownAcc()` seeds/resets acc with. */
+    Const = "const",
+    /** A read of a local variable slot (`s<index>`) — the raised
+     *  counterpart of a LOAD, or of a POP materializing the popped slot. */
+    Slot = "slot",
+    /** A two-operand ALU/compare op (rtl.ts's `BinaryOpcode`) — every
+     *  IMM_ACC/REG_ACC/POP_ACC/PEEK_PEEK combo `Raiser.binary()` collapses
+     *  into this one shape. */
+    Binary = "binary",
+    /** A one-operand op: NEG/NOT/CLZ/REVBITS. */
+    Unary = "unary",
+    /** A direct CALL to another procedure by index — `args` already
+     *  includes the callee's last argument (acc at call time), per
+     *  isa-core.md §4.6's calling convention. */
+    Call = "call",
     /** Opaque extension result — see the EXT case in Raiser for why this
      *  can't be decomposed further than "some inputs, one opaque shape" from
      *  a generic ExtOpEffect alone. */
-    | {kind: "ext"; ext: string; operands: readonly number[]; args: Expr[]}
+    Ext = "ext",
+}
 
-export type Stmt =
-    | {kind: "assign"; slot: number; value: Expr}
-    | {kind: "exprStmt"; value: Expr}
+export type Expr =
+    | {kind: ExprKind.Const; value: number}
+    | {kind: ExprKind.Slot; index: number}
+    | {kind: ExprKind.Binary; op: BinaryOpcode; left: Expr; right: Expr}
+    | {kind: ExprKind.Unary; op: UnaryOpcode; value: Expr}
+    | {kind: ExprKind.Call; calleeIndex: number; args: Expr[]}
+    | {kind: ExprKind.Ext; ext: string; operands: readonly number[]; args: Expr[]}
+
+export const enum StmtKind
+{
+    /** Write to an existing slot — a STORE, a PUSH's materialization into a
+     *  fresh one, or a binary op's REG_REG/PEEK_PEEK combo clobbering a
+     *  register in place. */
+    Assign = "assign",
+    /** Evaluate an expression purely for a side effect, discarding the
+     *  result — an unread CALL/EXT result, or an impure pending acc value
+     *  flushed by `killAcc()` before it would otherwise be silently
+     *  dropped. */
+    ExprStmt = "exprStmt",
     /** One BR_TABLE, raised whole: `cases.length` arms, selected by
      *  `test === i`; `test >= cases.length` falls through with none taken —
      *  if/if-else/switch are all this same shape at the RTL level
@@ -58,23 +87,24 @@ export type Stmt =
      *  code that already falls out of the enclosing statement list as
      *  whatever comes right after this one — isa-core.md's switch lowering
      *  appends it outside the BR_TABLE entirely, not as a guarded arm. */
-    | {kind: "dispatch"; test: Expr; cases: Stmt[][]}
+    Dispatch = "dispatch",
     /** One LOOP: `cond` statements compute `test`, evaluated before every
      *  iteration (including the first); `body` runs while `test` is
      *  non-zero. */
-    | {kind: "loop"; cond: Stmt[]; test: Expr; body: Stmt[]}
-    | {kind: "return"; value: Expr}
-    | {kind: "trap"; code: number}
-    /** One EXT call whose effect nets `slots.length` (> 0) discrete stack
-     *  results — a statement, not an `Expr`, because it must run exactly
-     *  once: unlike the tosDelta≤0 `Expr["ext"]` case (a single opaque
-     *  value, safely re-referenced by however many places embed it), an
-     *  op producing N results has no single value to hand back from an
-     *  expression position, and modeling it as N separate same-shaped
-     *  `Expr["ext"]` nodes (one per result) would call it N times instead
-     *  of once — wrong for anything with a side effect beyond its return
-     *  values (a stream read consuming N bytes in one call, say). */
-    | {kind: "extMulti"; slots: readonly number[]; ext: string; operands: readonly number[]}
+    Loop = "loop",
+    /** A procedure RETURN. */
+    Return = "return",
+    /** A procedure TRAP. */
+    Trap = "trap",
+}
+
+export type Stmt =
+    | {kind: StmtKind.Assign; slot: number; value: Expr}
+    | {kind: StmtKind.ExprStmt; value: Expr}
+    | {kind: StmtKind.Dispatch; test: Expr; cases: Stmt[][]}
+    | {kind: StmtKind.Loop; cond: Stmt[]; test: Expr; body: Stmt[]}
+    | {kind: StmtKind.Return; value: Expr}
+    | {kind: StmtKind.Trap; code: number}
 
 export interface RaisedProc
 {
@@ -88,7 +118,7 @@ export interface RaisedProc
     body: Stmt[]
 }
 
-const slotExpr = (index: number): Expr => ({kind: "slot", index})
+const slotExpr = (index: number): Expr => ({kind: ExprKind.Slot, index})
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Entry points
@@ -146,7 +176,7 @@ class Raiser
 
     private static unknownAcc(): PendingAcc
     {
-        return {expr: {kind: "const", value: 0}, pure: true}
+        return {expr: {kind: ExprKind.Const, value: 0}, pure: true}
     }
 
     constructor(
@@ -193,7 +223,7 @@ class Raiser
      *  code that reloads acc from scratch). */
     private killAcc(stmts: Stmt[]): void
     {
-        if(this.acc && !this.acc.pure) stmts.push({kind: "exprStmt", value: this.acc.expr})
+        if(this.acc && !this.acc.pure) stmts.push({kind: StmtKind.ExprStmt, value: this.acc.expr})
         this.acc = undefined
     }
 
@@ -205,7 +235,7 @@ class Raiser
      *  re-evaluating) whatever produced it. */
     private materialize(stmts: Stmt[], index: number): void
     {
-        stmts.push({kind: "assign", slot: index, value: this.readAcc()})
+        stmts.push({kind: StmtKind.Assign, slot: index, value: this.readAcc()})
         this.setAcc(slotExpr(index), true)
     }
 
@@ -229,7 +259,7 @@ class Raiser
     private closedBlock(): Stmt[]
     {
         const {stmts, trailing} = this.blockBody()
-        if(trailing && !trailing.pure) stmts.push({kind: "exprStmt", value: trailing.expr})
+        if(trailing && !trailing.pure) stmts.push({kind: StmtKind.ExprStmt, value: trailing.expr})
         this.acc = Raiser.unknownAcc()
         return stmts
     }
@@ -268,7 +298,7 @@ class Raiser
             {
                 case "CONST":
                     this.killAcc(stmts)
-                    this.setAcc({kind: "const", value: i.imm}, true)
+                    this.setAcc({kind: ExprKind.Const, value: i.imm}, true)
                     this.pc++
                     continue
 
@@ -312,14 +342,14 @@ class Raiser
                 {
                     const prev = this.acc
                     if(!prev) throw new Error(`raise: ${i.op} with no acc value at pc ${this.pc}`)
-                    this.setAcc({kind: "unary", op: i.op, value: prev.expr}, prev.pure)
+                    this.setAcc({kind: ExprKind.Unary, op: i.op, value: prev.expr}, prev.pure)
                     this.pc++
                     continue
                 }
 
                 case "RETURN":
                 {
-                    stmts.push({kind: "return", value: this.readAcc()})
+                    stmts.push({kind: StmtKind.Return, value: this.readAcc()})
                     this.acc = undefined
                     this.pc++
                     return {stmts}
@@ -327,7 +357,7 @@ class Raiser
 
                 case "TRAP":
                     this.killAcc(stmts)
-                    stmts.push({kind: "trap", code: i.imm})
+                    stmts.push({kind: StmtKind.Trap, code: i.imm})
                     this.pc++
                     return {stmts}
 
@@ -350,7 +380,7 @@ class Raiser
                     for(let k = 0; k < n; k++)
                         cases.push(this.withBlock(() => this.closedBlock()))
 
-                    stmts.push({kind: "dispatch", test: prev.expr, cases})
+                    stmts.push({kind: StmtKind.Dispatch, test: prev.expr, cases})
                     continue
                 }
 
@@ -373,7 +403,7 @@ class Raiser
 
                     const body = this.withBlock(() => this.closedBlock())
 
-                    stmts.push({kind: "loop", cond: condStmts, test: trailing.expr, body})
+                    stmts.push({kind: StmtKind.Loop, cond: condStmts, test: trailing.expr, body})
                     continue
                 }
 
@@ -396,7 +426,7 @@ class Raiser
                     }
                     else this.killAcc(stmts)
 
-                    this.setAcc({kind: "call", calleeIndex: i.calleeIndex, args}, false)
+                    this.setAcc({kind: ExprKind.Call, calleeIndex: i.calleeIndex, args}, false)
                     this.pc++
                     continue
                 }
@@ -406,56 +436,38 @@ class Raiser
                     const effect = this.extension?.effects?.[i.ext]
                     if(!effect) throw new Error(`raise: EXT ${i.ext}: no effect declared — pass the matching Extension to raiseProgram`)
 
-                    // Only tosDelta is knowable generically here — ExtOpEffect
-                    // says nothing about how many discrete inputs vs. outputs
-                    // an op has beyond the net, nor whether it writes acc. A
-                    // net-negative op is modeled as "pops -tosDelta operands,
-                    // produces one opaque acc result" (Expr["ext"], safely
-                    // re-referenced by however many places embed it — it's
-                    // one value); a net-positive op as one `extMulti`
-                    // statement — the call runs exactly once, landing
-                    // tosDelta discrete results directly in fresh slots, acc
-                    // left untouched. Correct for the common shapes (one
-                    // stream-read producing one value; one stream-write
-                    // consuming some), not a general decomposition — an op
-                    // with *both* multiple discrete inputs and outputs at
-                    // once needs a richer contract than ExtOpEffect currently
-                    // declares.
-                    //
-                    // `readsAcc` is handled before any of that: capture
-                    // *this* acc value (whatever produced it — a slot read, a
-                    // CONST, another ext's result) as this op's own trailing
-                    // arg instead of killing it — see ExtOpEffect.readsAcc's
-                    // doc comment for why this can't just fall out of the
-                    // tosDelta accounting below.
+                    // tosDelta > 0 (a net stack push) is never reachable
+                    // through the DSL: every rule that can build a call-like
+                    // node (rules.ts's leafNode/unaryNode, and every
+                    // extension's own `rules()`) hands back exactly one
+                    // RtlNode with one `output` location — there's no DSL
+                    // surface for "this call names two new locals at once."
+                    // The only way to get one is to hand-build an RtlInstr[]
+                    // directly, which no real codec/extension does — so
+                    // rather than carry a second `Stmt` shape (`extMulti`)
+                    // solely to represent a case nothing can construct, this
+                    // is asserted here instead.
+                    if(effect.tosDelta > 0)
+                        throw new Error(`raise: EXT ${i.ext} at pc ${this.pc}: tosDelta > 0 (a net stack push) isn't supported — no DSL rule can construct one`)
+
+                    // `readsAcc` capture: *this* acc value (whatever produced
+                    // it — a slot read, a CONST, another ext's result)
+                    // becomes this op's own trailing arg instead of being
+                    // killed — see ExtOpEffect.readsAcc's doc comment for why
+                    // this can't just fall out of the tosDelta accounting
+                    // below.
                     const priorAcc = effect.readsAcc ? this.acc : undefined
                     if(effect.readsAcc && !priorAcc)
                         throw new Error(`raise: EXT ${i.ext} at pc ${this.pc}: reads acc but none is set`)
                     if(!effect.readsAcc) this.killAcc(stmts)
                     else this.acc = undefined // consumed below, not flushed
-                    if(effect.tosDelta <= 0)
-                    {
-                        const n = -effect.tosDelta
-                        if(this.tos < n) throw new Error(`raise: EXT ${i.ext} at pc ${this.pc}: only ${this.tos} value(s) on the stack, need ${n}`)
-                        this.tos -= n
-                        const args = Array.from({length: n}, (_, k) => slotExpr(this.tos + k))
-                        if(priorAcc) args.push(priorAcc.expr)
-                        this.setAcc({kind: "ext", ext: i.ext, operands: i.operands, args}, false)
-                    }
-                    else
-                    {
-                        // extMulti has no expression position to carry a
-                        // trailing arg through (it's a statement, not an
-                        // Expr) — no current codec op needs this combination,
-                        // so it's left unimplemented rather than silently
-                        // dropping priorAcc the same way this whole fix
-                        // exists to stop happening.
-                        if(priorAcc) throw new Error(`raise: EXT ${i.ext} at pc ${this.pc}: readsAcc with tosDelta > 0 isn't supported`)
-                        const slots = Array.from({length: effect.tosDelta}, (_, k) => this.tos + k)
-                        stmts.push({kind: "extMulti", slots, ext: i.ext, operands: i.operands})
-                        this.tos += effect.tosDelta
-                        this.bumpPeak()
-                    }
+
+                    const n = -effect.tosDelta
+                    if(this.tos < n) throw new Error(`raise: EXT ${i.ext} at pc ${this.pc}: only ${this.tos} value(s) on the stack, need ${n}`)
+                    this.tos -= n
+                    const args = Array.from({length: n}, (_, k) => slotExpr(this.tos + k))
+                    if(priorAcc) args.push(priorAcc.expr)
+                    this.setAcc({kind: ExprKind.Ext, ext: i.ext, operands: i.operands, args}, false)
                     this.pc++
                     continue
                 }
@@ -474,29 +486,29 @@ class Raiser
         switch(i.combo)
         {
             case "IMM_ACC":
-                this.setAcc({kind: "binary", op: i.op, left: prev.expr, right: {kind: "const", value: i.imm}}, prev.pure)
+                this.setAcc({kind: ExprKind.Binary, op: i.op, left: prev.expr, right: {kind: ExprKind.Const, value: i.imm}}, prev.pure)
                 break
 
             case "REG_ACC":
-                this.setAcc({kind: "binary", op: i.op, left: prev.expr, right: slotExpr(i.target)}, prev.pure)
+                this.setAcc({kind: ExprKind.Binary, op: i.op, left: prev.expr, right: slotExpr(i.target)}, prev.pure)
                 break
 
             case "REG_REG":
-                stmts.push({kind: "assign", slot: i.target, value: {kind: "binary", op: i.op, left: prev.expr, right: slotExpr(i.target)}})
+                stmts.push({kind: StmtKind.Assign, slot: i.target, value: {kind: ExprKind.Binary, op: i.op, left: prev.expr, right: slotExpr(i.target)}})
                 this.acc = undefined // clobbered (rtl.ts's COMBO.REG_REG)
                 break
 
             case "POP_ACC":
                 if(this.tos <= 0) throw new Error(`raise: ${i.op} POP_ACC with empty stack at pc ${this.pc}`)
                 this.tos--
-                this.setAcc({kind: "binary", op: i.op, left: prev.expr, right: slotExpr(this.tos)}, prev.pure)
+                this.setAcc({kind: ExprKind.Binary, op: i.op, left: prev.expr, right: slotExpr(this.tos)}, prev.pure)
                 break
 
             case "PEEK_PEEK":
             {
                 if(this.tos <= 0) throw new Error(`raise: ${i.op} PEEK_PEEK with empty stack at pc ${this.pc}`)
                 const top = this.tos - 1
-                stmts.push({kind: "assign", slot: top, value: {kind: "binary", op: i.op, left: prev.expr, right: slotExpr(top)}})
+                stmts.push({kind: StmtKind.Assign, slot: top, value: {kind: ExprKind.Binary, op: i.op, left: prev.expr, right: slotExpr(top)}})
                 this.acc = undefined // clobbered (rtl.ts's COMBO.PEEK_PEEK)
                 break
             }

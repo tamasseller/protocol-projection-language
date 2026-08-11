@@ -3,8 +3,10 @@
  * extension.md §3)
  *
  * The single source of truth for the 17 mnemonics `codec-extension.ts`'s
- * `codecRules()`/`EFFECTS`/`exec()` and `validate-handles.ts`'s static
- * checks all dispatch on — every op in §3, including the stream-fork
+ * `codecRules()`/`EFFECTS`/`exec()`, `validate-handles.ts`'s static
+ * checks, and `@ppl/target-js`'s `codec-codegen.ts` (a third, cross-package
+ * dispatch site — same `isCodecOpcode`/`assertNever` idiom) all dispatch
+ * on — every op in §3, including the stream-fork
  * class (`HAS_NEXT`/`CLONE_RD`/`CLONE_WR`/`SEEK`) and the bulk-array
  * transfer pair (`WRITE_SEQ`/`READ_SEQ`, ROADMAP.md item 11). A typo in
  * any one wouldn't be caught by anything otherwise (`ExtInstr.ext` is a

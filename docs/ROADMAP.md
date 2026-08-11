@@ -613,22 +613,29 @@ Two real bugs surfaced and fixed, not just documented:
   `tosDelta > 0` branch modeled "one call producing N stack results" as N
   separate same-shaped `Expr["ext"]` nodes — correct only if the op is a
   pure function of its inputs, wrong for anything with a real side effect.
-  Fixed with a new `Stmt` variant, `extMulti`, that calls once and lands
-  all N results directly — currently unreachable by any real codec opcode
-  (every one of them is `tosDelta: 0`) but a real, load-bearing correctness
-  gap for anything hitting this branch in the future.
+  First fixed with a new `Stmt` variant, `extMulti`, that called once and
+  landed all N results directly — then, once the codec codegen work
+  (below) made clear that `tosDelta > 0` is unreachable by *any* real
+  extension (rules.ts's `leafNode`/`unaryNode`, and every extension's own
+  `rules()`, only ever build a call-like node with one `output` location —
+  there's no DSL surface for "this call names two new locals at once"),
+  `extMulti` was removed outright: `raise.ts` now throws on
+  `tosDelta > 0` instead of carrying a second `Stmt` shape to represent a
+  case nothing can construct.
 
-`EXT` is still an approximation in one sense the fix doesn't touch: a
-generic `ExtOpEffect` gives a net `tosDelta`, not a full input/output arity
-split, so an op with *both* multiple discrete inputs and outputs at once
-still isn't decomposable — not a real gap today (no such opcode exists),
-documented as such in `raise.ts`'s own EXT case.
+`EXT` is still an approximation in one sense: a generic `ExtOpEffect` gives
+a net `tosDelta`, not a full input/output arity split, so an op with
+multiple discrete *inputs* still can't be decomposed further than "some
+inputs, one opaque shape" — not a real gap today (every real op's inputs
+are either popped operands or `readsAcc`'s single implicit one).
 
 ### JS compiled-source codec codegen — implemented, three more `raise.ts` bugs found
 
 `generateJsCodecs`/`generateCodecModule`
-(`packages/target-js/src/components/codec-codegen.ts`) turns a
-`buildCodec`-produced `RtlProgram` pair into literal TypeScript source —
+(`packages/target-js/src/engine/codec-module.ts`, on top of
+`engine/codec-codegen.ts`'s per-procedure tree walk, `engine/line-builder.ts`'s
+indenting output, and `engine/codec-type-nav.ts`'s `TypeNode` helpers) turns
+a `buildCodec`-produced `RtlProgram` pair into literal TypeScript source —
 one real `function` per procedure, real `if`/`while`/`switch`, direct
 calls between the generated functions — instead of shipping the RTL
 program and interpreting it. Built directly on `raise.ts` (control-flow

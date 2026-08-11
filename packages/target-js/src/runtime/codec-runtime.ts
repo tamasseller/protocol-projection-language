@@ -1,7 +1,7 @@
 /**
  * @ppl/target-js — Runtime support for compiled codec functions
  *
- * `components/codec-codegen.ts` turns a raised (`@ppl/machine`'s raise.ts)
+ * `engine/codec-codegen.ts` turns a raised (`@ppl/machine`'s raise.ts)
  * codec program into real control flow — real `function`s, real `if`/
  * `while`, direct calls between the generated functions instead of an
  * index into a procedure table — with every `ENTER`'s `ref` resolved to a
@@ -143,7 +143,17 @@ export interface Iter { pos: number; capability: "read" | "write"; overwriteOnly
  *  same reason (`createCodecExtension`'s own doc comment: "run-wide,
  *  un-reset-by-frame state"). Handle-table slots, by contrast, are real
  *  local variables in generated code — genuinely local to one procedure
- *  call, never threaded through `Ctx`. */
+ *  call, never threaded through `Ctx`.
+ *
+ *  `buffer` is `number[]`, not `Uint8Array`, purely so encoding has a sink
+ *  it can *grow* (`write`'s own `buffer[it.pos++] = ...` past the current
+ *  length) — a fixed-size Uint8Array can't do that. This is an internal
+ *  contract only: `generateCodecModule`'s generated `encode`/`decode`
+ *  entry points convert at the boundary (`new Uint8Array(buffer)` /
+ *  `Array.from(bytes)`), so the *public* API a caller actually sees is
+ *  `Uint8Array` in, `Uint8Array` out — the standard cross-runtime binary
+ *  type, not this module's own internal growable-array detail leaking
+ *  out. */
 export interface Ctx { buffer: number[]; iters: Iter[] }
 
 function iterAt(ctx: Ctx, id: number): Iter

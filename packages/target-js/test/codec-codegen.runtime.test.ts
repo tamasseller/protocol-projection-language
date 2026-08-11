@@ -1,5 +1,6 @@
 /**
- * @ppl/target-js/test — Compiled codec codegen (components/codec-codegen.ts)
+ * @ppl/target-js/test — Compiled codec codegen (engine/codec-codegen.ts +
+ * engine/codec-module.ts's generateCodecModule entry point)
  *
  * A differential check, not a shape check: for every fixture, build the
  * real interpreted path (`run()` + `createCodecExtension`, @ppl/codecs'
@@ -16,7 +17,7 @@ import { struct, union, unit, list, u8, integer, named, optional, buildTypeGraph
 import { run } from "@ppl/machine"
 import { buildCodec, binaryEncodeRules, binaryDecodeRules, createCodecExtension } from "@ppl/codecs"
 
-import { generateCodecModule } from "../src/components/codec-codegen"
+import { generateCodecModule } from "../src/engine/codec-module"
 import { loadGenerated } from "./load-generated"
 
 function interpretedEncode(rootType: SemanticType, value: unknown): number[]
@@ -48,7 +49,7 @@ function interpretedDecode(rootType: SemanticType, bytes: readonly number[]): un
     return wrapper.root
 }
 
-function loadCompiled(rootType: SemanticType, name: string): { encode: (v: unknown) => number[]; decode: (b: number[]) => unknown }
+function loadCompiled(rootType: SemanticType, name: string): { encode: (v: unknown) => Uint8Array; decode: (b: Uint8Array) => unknown }
 {
     const encodeProgram = buildCodec(rootType, binaryEncodeRules, undefined)
     const decodeProgram = buildCodec(rootType, binaryDecodeRules, undefined)
@@ -63,10 +64,13 @@ function assertMatchesInterpreted(rootType: SemanticType, name: string, value: u
 
     const expectedBytes = interpretedEncode(rootType, value)
     const actualBytes = encode(value)
-    assert.deepEqual(actualBytes, expectedBytes, "compiled encode disagrees with the interpreted path")
+    // The public boundary is Uint8Array (codec-runtime.ts's own doc
+    // comment on Ctx.buffer explains why) — compare contents, not
+    // TypedArray-vs-plain-Array identity.
+    assert.deepEqual(Array.from(actualBytes), expectedBytes, "compiled encode disagrees with the interpreted path")
 
     const expectedDecoded = interpretedDecode(rootType, expectedBytes)
-    const actualDecoded = decode(expectedBytes)
+    const actualDecoded = decode(new Uint8Array(expectedBytes))
     assert.deepEqual(actualDecoded, expectedDecoded, "compiled decode disagrees with the interpreted path")
 
     assert.deepEqual(decode(encode(value)), value, "compiled round trip (encode then decode) doesn't recover the original value")

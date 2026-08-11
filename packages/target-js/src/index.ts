@@ -13,9 +13,10 @@
  *    — build the graph and emit in a single call.
  *
  * Codec (encoder/decoder) generation: compiled-source JS, not an
- * interpreter call — `components/codec-codegen.ts`'s `generateCodecModule`
+ * interpreter call — `engine/codec-module.ts`'s `generateCodecModule`
  * turns a `buildCodec`-produced `RtlProgram` pair (`@ppl/codecs`) into
- * literal `encode`/`decode` functions, one JS `function` per procedure,
+ * literal `encode`/`decode` functions, one JS `function` per procedure
+ * (the per-procedure tree walk itself lives in `engine/codec-codegen.ts`),
  * built on `@ppl/machine`'s `raise.ts` for control-flow shape and
  * `@ppl/codecs`'s `resolveProcedureTypes` for field/variant names.
  * `runtime/codec-runtime.ts` is the small, genuinely-dynamic primitive set
@@ -23,23 +24,27 @@
  * generated code calls into — see that module's own doc comment.
  *
  * Grouped like `@ppl/codecs` (docs/ARCHITECTURE.md's "Mappings" layering):
- * `engine/` is the generic on-demand resolver primitive
- * (`TsRule`/`createTsResolver`/`projectTSTypes`/`emitTSDeclarations`),
- * `components/` is the concrete, swappable rule library built on it
- * (`tsTypeRules`, `generateCodecModule`), `runtime/` is what the
- * *generated* code depends on at its own run time, not what this package
- * depends on to generate it.
+ * `engine/` is fixed infrastructure with no swappable convention of its
+ * own — the generic TS-type resolver primitive
+ * (`TsRule`/`createTsResolver`/`projectTSTypes`/`emitTSDeclarations`) *and*
+ * `generateCodecModule` (opinion-free about wire format — it compiles
+ * whichever `CodecRule` convention actually built the program, same
+ * reasoning as `@ppl/codecs/src/engine/codec-extension.ts`'s own
+ * placement); `components/` is the concrete, swappable rule library built
+ * on the resolver primitive (`tsTypeRules`, `ts-alternative-rules.ts`);
+ * `runtime/` is what the *generated* code depends on at its own run time,
+ * not what this package depends on to generate it.
  */
 export * from "./engine/resolver"
+export * from "./engine/codec-module"
 export * from "./components/ts-emitter"
 export * from "./components/ts-alternative-rules"
-export * from "./components/codec-codegen"
 export * from "./runtime/codec-runtime"
 
 import type {SemanticType} from "@ppl/core"
 import {projectTSTypes, emitTSDeclarations} from "./engine/resolver"
 import {tsTypeRules} from "./components/ts-emitter"
-import {generateCodecModule} from "./components/codec-codegen"
+import {generateCodecModule} from "./engine/codec-module"
 import {buildCodec, binaryEncodeRules, binaryDecodeRules} from "@ppl/codecs"
 
 /**
