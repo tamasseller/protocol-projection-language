@@ -58,6 +58,24 @@ export interface ExtOpEffect
      *  first (e.g. a codec's object handle), but the invocation itself runs
      *  through the same machinery a plain `CALL` does. */
     call?: { calleeOperandIndex: number }
+    /** True for an op whose real input includes whatever `acc` already
+     *  holds, *in addition to* whatever `-tosDelta` says it pops off the
+     *  stack — the codec extension's `WRITE`/`STORE_VAL`/`WRITE_SEQ`/
+     *  `READ_SEQ` (codec-extension.ts) are the motivating case: their
+     *  `ir\`...\`` rule always places a value-producing sub-fragment
+     *  (`load_val(0)`, a plain slot read, …) immediately before the op with
+     *  nothing in between, so at `exec()` time `state.acc` already holds
+     *  it — no stack push/pop involved, because `tosDelta` for these is 0.
+     *  `raise.ts` needs this declared explicitly: without it, its own
+     *  acc-tracking (which treats "about to overwrite acc" as license to
+     *  either flush-and-discard or drop a pure reference) has no way to
+     *  know this op is about to *read* that value rather than clobber it,
+     *  and the resulting tree silently loses the data-flow edge — every
+     *  `vm.ts`-based consumer (`run()`) is unaffected (it always reads the
+     *  real `acc` register directly), but any tree-based consumer of
+     *  `raise.ts`'s own output loses it entirely. Defaults to falsy —
+     *  every existing effect this doesn't apply to is unaffected. */
+    readsAcc?: boolean
 }
 
 /** The subset of VM state one extension opcode's `exec` is allowed to

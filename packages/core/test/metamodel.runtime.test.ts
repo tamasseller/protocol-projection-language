@@ -8,7 +8,7 @@
 import {test} from "node:test"
 import * as assert from "node:assert/strict"
 
-import {defaultValueOf, i8, integer, list, struct, u8, union, unit} from "../src/metamodel"
+import {defaultValueOf, i8, integer, list, optional, struct, u8, union, unit} from "../src/metamodel"
 
 ////////////////////////////////////////////////////////////////////////////////////////////////
 // integer: default defaults to 0, third argument overrides it
@@ -46,6 +46,25 @@ test("union: defaultVariant naming a non-existent variant throws", () => {
 
 test("union: defaultVariant naming a non-unit variant throws", () => {
     assert.throws(() => union({ok: integer(0, 1), err: unit}, "ok"))
+})
+
+////////////////////////////////////////////////////////////////////////////////////////////////
+// optional: sugar for union({value: T, empty: unit}, "empty")
+////////////////////////////////////////////////////////////////////////////////////////////////
+
+test("optional: exposes exactly the value/empty variants target rules match on", () => {
+    const T = optional(u8)
+    assert.deepEqual([...T.variants.keys()], ["value", "empty"])
+    assert.equal(T.variants.get("value"), u8)
+    assert.equal(T.variants.get("empty"), unit)
+})
+
+test("optional: \"empty\" is the declared defaultVariant, for free", () => {
+    assert.equal(optional(u8).defaultVariant, "empty")
+})
+
+test("defaultValueOf: optional falls back to \"empty\" absent a real value", () => {
+    assert.deepEqual(defaultValueOf(optional(u8)), {variant: "empty", value: undefined})
 })
 
 ////////////////////////////////////////////////////////////////////////////////////////////////

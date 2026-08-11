@@ -903,3 +903,12 @@ RETURN
 combo lets the ALU op store directly into `n`'s own register instead of
 routing back through `acc` and a separate `STORE`. Both are valid; a
 lowerer picks whichever is cheaper.
+
+```
+	[tos] (isa R0): r4 
+	[tos] (isa R1): r1, [tos - 1] (isa R0): r4
+	[tos] (isa R2): r6, [tos - 1] (isa R1): r5, [tos - 2] (isa R0): r4
+	[tos] (isa R3): r7, [tos - 1] (isa R2): r6, [tos - 2] (isa R1): r5, [tos - 3] (isa R0): r4
+	[tos] (isa R4): r4, [tos - 1] (isa R3): r7, [tos - 2] (isa R2): r6, [tos - 3] (isa R1): r5, [tos - 4] (isa R0): op stack top
+    ...
+```

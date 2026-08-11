@@ -40,7 +40,10 @@ class Trap
     constructor(readonly code: number, readonly steps: number) {}
 }
 
-function evalBinary(L: number, R: number, op: RtlInstr["op"]): number
+/** Exported for reuse by raise.ts's own test suite (a differential check
+ *  against this exact opcode semantics, not a second hand-copied
+ *  implementation that could quietly drift from it) — no other consumer. */
+export function evalBinary(L: number, R: number, op: RtlInstr["op"]): number
 {
     switch(op)
     {
@@ -68,7 +71,8 @@ function evalBinary(L: number, R: number, op: RtlInstr["op"]): number
     }
 }
 
-function evalUnary(V: number, op: RtlInstr["op"]): number
+/** Exported for the same reason as evalBinary above. */
+export function evalUnary(V: number, op: RtlInstr["op"]): number
 {
     switch(op)
     {

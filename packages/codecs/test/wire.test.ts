@@ -97,21 +97,23 @@ const rows: Row[] = [
     { byte: 245, instr: extInstr("CALL_CODEC_NEXT", [9, 3]) },
     { byte: 246, instr: extInstr("CALL_CODEC_NEXT", [9, 4]) },
 
-    // WRITE_SEQ iter, handle, width, count — base 247, one code per width
-    // (ROADMAP.md item 11): iter/handle/count always LEB128'd, never a
-    // compact index form (this file's own header explains why).
-    { byte: 247, instr: extInstr("WRITE_SEQ", [0, 1, 1, 10]) },
-    { byte: 248, instr: extInstr("WRITE_SEQ", [0, 1, 2, 10]) },
-    { byte: 249, instr: extInstr("WRITE_SEQ", [0, 1, 4, 10]) },
+    // WRITE_SEQ iter, handle, width — base 247, one code per width
+    // (ROADMAP.md item 11): iter/handle always LEB128'd, never a compact
+    // index form (this file's own header explains why). No `count`
+    // operand — it's a trailing pRtl("acc") DSL demand, read from `acc`
+    // at runtime, never part of the instruction itself.
+    { byte: 247, instr: extInstr("WRITE_SEQ", [0, 1, 1]) },
+    { byte: 248, instr: extInstr("WRITE_SEQ", [0, 1, 2]) },
+    { byte: 249, instr: extInstr("WRITE_SEQ", [0, 1, 4]) },
 
-    // READ_SEQ iter, handle, width, signed, count — base 250, one code per
-    // (width, signed) pair.
-    { byte: 250, instr: extInstr("READ_SEQ", [0, 1, 1, 0, 10]) },
-    { byte: 251, instr: extInstr("READ_SEQ", [0, 1, 1, 1, 10]) },
-    { byte: 252, instr: extInstr("READ_SEQ", [0, 1, 2, 0, 10]) },
-    { byte: 253, instr: extInstr("READ_SEQ", [0, 1, 2, 1, 10]) },
-    { byte: 254, instr: extInstr("READ_SEQ", [0, 1, 4, 0, 10]) },
-    { byte: 255, instr: extInstr("READ_SEQ", [0, 1, 4, 1, 10]) },
+    // READ_SEQ iter, handle, width, signed — base 250, one code per
+    // (width, signed) pair. Same no-`count`-operand reasoning as WRITE_SEQ.
+    { byte: 250, instr: extInstr("READ_SEQ", [0, 1, 1, 0]) },
+    { byte: 251, instr: extInstr("READ_SEQ", [0, 1, 1, 1]) },
+    { byte: 252, instr: extInstr("READ_SEQ", [0, 1, 2, 0]) },
+    { byte: 253, instr: extInstr("READ_SEQ", [0, 1, 2, 1]) },
+    { byte: 254, instr: extInstr("READ_SEQ", [0, 1, 4, 0]) },
+    { byte: 255, instr: extInstr("READ_SEQ", [0, 1, 4, 1]) },
 ]
 
 describe("wire.ts — representative byte table", () =>

@@ -389,18 +389,26 @@ Both `width` and `signed` are plain operands, computed once at codegen
 time from the element's declared range — same choice `WRITE`/`READ`
 already made.
 
-**`count` is an explicit operand, deliberately not read internally by
-the op** — two reasons, not one: it keeps the op itself convention-
-agnostic about *how* a list's length is encoded on the wire (fixed-width
-prefix, LEB128, delta-coded, whatever a given codec rule wants), and it
-guarantees the stream iterator is sitting at exactly the first element's
-byte when the op runs — nothing about length-prefix I/O is bundled into
-it. That second property is what makes it usable as a snatch point at
-all. `OPEN_LIST` still runs first on the decode side — `read_seq` only
-fills an already-opened list, it doesn't allocate one. In the DSL, `count`
-is the one dynamic argument (`codecRules()`'s `pRtl("acc")` demand,
-mirroring `write`'s own value argument); `iter`/`handle`/`width`/`signed`
-are always codegen-time literals.
+**`count` is read from `acc`, deliberately not baked into the
+instruction's own operands** — two reasons, not one: it keeps the op
+itself convention-agnostic about *how* a list's length is encoded on the
+wire (fixed-width prefix, LEB128, delta-coded, whatever a given codec rule
+wants), and it guarantees the stream iterator is sitting at exactly the
+first element's byte when the op runs — nothing about length-prefix I/O
+is bundled into it. That second property is what makes it usable as a
+snatch point at all. `OPEN_LIST` still runs first on the decode side —
+`read_seq` only fills an already-opened list, it doesn't allocate one. In
+the DSL, `count` is the one dynamic argument (`codecRules()`'s
+`pRtl("acc")` demand, mirroring `write`'s own value argument, *not* a
+`pConst()` literal like every other argument here) — `ExtInstr.operands`
+for `WRITE_SEQ`/`READ_SEQ` is `[iter, handle, width]`/`[iter, handle,
+width, signed]` only, `count` never included. `wire.ts`'s own encode/decode
+`Band`s originally assumed a 4th/5th `count` operand that never actually
+exists — a real bug (`encodeLeb128: undefined is not a u32` the moment a
+real program's `WRITE_SEQ`/`READ_SEQ` instruction was wire-encoded, caught
+by item 12's `resolveProcedureTypes` shakedown, which was the first thing
+to round-trip such a program through `bytecode.ts`) — fixed alongside
+item 12's own writeup.
 
 **Generic semantics first, native specialization only at codegen time.**
 `exec()`'s own implementation of these two ops (`codec-extension.ts`) is
@@ -493,6 +501,80 @@ rules, two `unreachable`).
 Depends on (7)-(10) for the codec-specific pieces. `target-cpp`/
 `target-js` are rushed stubs today.
 
+### JS/TS type codegen — composable, engine/components split — implemented
+
+`target-js` rebuilt onto the same `{pattern, produce}`-with-swappable-rule-
+list shape `@ppl/codecs` established, and split into `engine/` (the
+generic `TsRule`/`createTsResolver`/`projectTSTypes`/`emitTSDeclarations`
+primitive, no opinion on representation) vs `components/` (the concrete,
+swappable rule libraries), mirroring `@ppl/codecs/src/engine` vs
+`src/components` exactly. `target-cpp` still runs on the older `Rule<C>`/
+`runRuleset` primitive (`@ppl/core/projection.ts`), unchanged — this item
+is JS/TS only so far.
+
+`components/ts-emitter.ts` is the default mapping (`tsTypeRules`);
+`components/ts-alternative-rules.ts` adds opt-in alternatives an app author
+can prepend for specific shapes: unit-as-`undefined`, integer-as-`bigint`
+past `Number`'s safe range, byte-list-as-`Uint8Array`, capacity-≤1-list-as-
+optional, general-union-as-class-hierarchy, struct-as-class. One new
+`@ppl/core` primitive fell out of this: `optional(T)`
+(`metamodel.ts`) — sugar for `union({value: T, empty: unit}, "empty")`,
+the exact shape `target-cpp/cpp-emitter.ts`'s existing `std::optional<T>`
+rule already matches by name; `optionalUnionRule` in
+`ts-alternative-rules.ts` matches the same shape, so a schema authored with
+`optional(T)` gets a matching idiomatic representation on both targets for
+free. Codec (encoder/decoder) generation for JS/TS was still the
+`generateJsCodecs` stub at this point — see the compiled-codegen section
+below, where it stops being one.
+
+### `resolveProcedureTypes` — recovering per-procedure types without `header`
+
+Groundwork for the still-pending real codec codegen (below): a raised
+(`raise.ts`) `ENTER`'s `ref` operand is a bare positional index into a
+struct/union's field/variant table — meaningless to a target backend
+without knowing *which* type that procedure handles. `createCodecResolver`
+stamps that onto each `Procedure.header`, but `header` doesn't survive a
+program that didn't come from a fresh, in-process `buildCodec` call — a
+codec image decoded off the wire, or any program round-tripped through
+`bytecode.ts`, always comes back with `header: undefined`
+(bytecode.ts §5.5). `packages/codecs/src/engine/procedure-types.ts`'s
+`resolveProcedureTypes(program, rootType)` recovers it anyway: a recursive
+descent from the known root (always supplied externally, regardless of
+where the `RtlProgram` itself came from) over `ENTER`/`ENTER_NEXT`/
+`CALL_CODEC`/`CALL_CODEC_NEXT`, replaying `computeChild`/`computeNext`'s
+own navigation at the type level. One shared, target-independent
+primitive — needed by both the compiled-source codegen (a fixed local
+schema) and the dynamic image-bridging path (reconcile/resolve, item 11),
+not two independently-derived mechanisms.
+
+Building this (and its test suite, which round-trips real programs
+through `bytecode.ts` to prove header-independence) surfaced two real,
+pre-existing bugs, unrelated to raise.ts and caught only because nothing
+had exercised these specific combinations before:
+
+- **`binary-rules.ts`'s `classifyHoistableFields` broke on a
+  self-referential hoistable union field.** It called
+  `derefType`/`concreteKindOf` directly on a struct field's raw
+  (possibly-thunk) type; for a recursive schema, that re-invokes the
+  thunk fresh, producing variant-payload objects never registered in
+  `TypeGraph`'s cycle-safe identity map, so a later `resolve()` on one of
+  them threw "not reachable." Fixed by reading the field's type off
+  `resolve(f.type, ctx).header` (the real `TypeNode`, resolver.ts) instead
+  of re-deriving it — the same class of bug, and the same fix shape
+  (route through the graph's own canonical nodes, never re-invoke a
+  thunk directly), `resolveProcedureTypes` itself needed one level down
+  (see its own file header).
+- **`wire.ts`'s `WRITE_SEQ`/`READ_SEQ` `Band`s wire-encoded a `count`
+  operand that was never real.** `count` is a `pRtl("acc")` DSL demand
+  (item 11's own writeup, now corrected) — never part of
+  `ExtInstr.operands` — but `writeSeqBand`/`readSeqBand` assumed a 4th/5th
+  operand slot for it, throwing `encodeLeb128: undefined is not a u32`
+  the moment a real program's `WRITE_SEQ`/`READ_SEQ` instruction was
+  actually wire-encoded. `wire.test.ts`'s own hand-written fixtures
+  shared the same wrong assumption, self-consistently, which is how this
+  stayed hidden — nothing had round-tripped a *real*, `buildCodec`-built
+  program containing one of these opcodes through `bytecode.ts` before.
+
 A target codegen that consumes a codec image (item 10) also needs
 codec-image.md §2/§3 — the name-keyed reconciliation algorithm and its
 four relaxation rules — since that's precisely what turns "here's an
@@ -503,26 +585,123 @@ schema." That algorithm is now implemented (item 11's
 actually *calling* `reconcile()`/`resolve()` and turning the result into
 native accessor code for a specific target.
 
-**Sketched, not verified** (`packages/machine/src/raise.ts`) —
-`raiseProgram`/`raiseProc`, the structural inverse of `lower.ts`: flat
-`RtlInstr[]` back to a `Stmt`/`Expr` tree both targets can walk instead of
-independently re-deriving block structure. Lives in `@ppl/machine` since
-it's target-language-agnostic. Every stack write materializes into a named
-slot immediately (no deferred/inlined substitution — that needs an
-interference analysis this doesn't attempt); trivially correct, costs
-nothing a target's own copy propagation won't fold back away.
+### `raise.ts` shakedown — verified, two bugs found and fixed
 
-Two gaps: `EXT` raises only approximately (a generic `ExtOpEffect` gives a
-net `tosDelta`, not an input/output arity split); and this is unverified
-against real fixtures — reasoned by hand, not yet run against
-`packages/machine/test` or any real target consumer.
+`raiseProgram`/`raiseProc` (`packages/machine/src/raise.ts`) — the
+structural inverse of `lower.ts`: flat `RtlInstr[]` back to a `Stmt`/`Expr`
+tree both targets can walk instead of independently re-deriving block
+structure. Had zero consumers and zero tests before now — "sketched, not
+verified." `packages/machine/test/raise.test.ts` is a differential check,
+not a shape check: lower + `run()` via the real VM (ground truth), then
+raise + evaluate the same procedure via a tiny tree-walking evaluator built
+on `vm.ts`'s own exported opcode semantics (`evalBinary`/`evalUnary`, newly
+exported for exactly this reuse), asserting the two agree — across most of
+`e2e.test.ts`'s own proven (source, expected) corpus plus dedicated `CALL`/
+`EXT` fixtures, including hand-built `RtlProgram`s for `EXT` shapes no DSL
+syntax reaches.
+
+Two real bugs surfaced and fixed, not just documented:
+- **Top-level fall-off crash**: a procedure body that's *entirely* an
+  if/else where both branches return (nothing follows, and lower.ts
+  correctly omits any trailing instruction since the VM never falls
+  through a terminating case) made `blockBody()`'s loop try to read past
+  the true end of the instruction array and throw. Every *nested* block
+  always gets a real closing `BLOCK_END` (confirmed by inspecting actual
+  lowered bytecode) — only the outermost procedure body can legitimately
+  run off the end, so that case is now a clean block-end, not an error.
+- **Multi-result `EXT` ran its side effect N times instead of once**: the
+  `tosDelta > 0` branch modeled "one call producing N stack results" as N
+  separate same-shaped `Expr["ext"]` nodes — correct only if the op is a
+  pure function of its inputs, wrong for anything with a real side effect.
+  Fixed with a new `Stmt` variant, `extMulti`, that calls once and lands
+  all N results directly — currently unreachable by any real codec opcode
+  (every one of them is `tosDelta: 0`) but a real, load-bearing correctness
+  gap for anything hitting this branch in the future.
+
+`EXT` is still an approximation in one sense the fix doesn't touch: a
+generic `ExtOpEffect` gives a net `tosDelta`, not a full input/output arity
+split, so an op with *both* multiple discrete inputs and outputs at once
+still isn't decomposable — not a real gap today (no such opcode exists),
+documented as such in `raise.ts`'s own EXT case.
+
+### JS compiled-source codec codegen — implemented, three more `raise.ts` bugs found
+
+`generateJsCodecs`/`generateCodecModule`
+(`packages/target-js/src/components/codec-codegen.ts`) turns a
+`buildCodec`-produced `RtlProgram` pair into literal TypeScript source —
+one real `function` per procedure, real `if`/`while`/`switch`, direct
+calls between the generated functions — instead of shipping the RTL
+program and interpreting it. Built directly on `raise.ts` (control-flow
+shape) and `resolveProcedureTypes`/`resolveHandleTypes` (turning a raised
+`ENTER`'s bare `ref` into a real field/variant *name*, statically, at
+generation time). `packages/target-js/src/runtime/codec-runtime.ts` is the
+small set of genuinely-dynamic primitives the generated code calls into
+(buffer position, byte read/write, the `(container, key)` indirection a
+decoder needs) — everything else `codec-extension.ts`'s interpreter does
+at runtime (schema-edge lookup, opcode dispatch) is resolved once, at
+generation time, and baked into the call site directly. Scope is any
+program built from the 17 codec-extension opcodes, not just the binary
+family — `delta-leb128.ts`/`json.ts`/a user's own `CodecRule`s all compile
+to the same opcode vocabulary via `codecRules()`.
+
+`procedure-types.ts` gained `resolveHandleTypes`/`childNode`/`nextNode`
+(exported, previously private to `resolveProcedureTypes`'s own walk) —
+the codegen needs the same per-instruction navigation, but interleaved
+with its own code emission over the *raised* tree rather than run once
+over the flat pre-raise body, so it couldn't just call
+`resolveProcedureTypes` and reuse the result.
+
+Building this — specifically, actually running the generated code against
+real schemas and diffing against the interpreted path
+(`target-js/test/codec-codegen.runtime.test.ts`) — surfaced three more
+real `raise.ts` bugs, none caught by item 12's own shakedown because none
+of its fixtures had these specific shapes:
+
+- **A whole class of EXT ops that read pre-existing `acc` as an implicit
+  extra input lost that input entirely.** `WRITE`/`STORE_VAL`/`WRITE_SEQ`/
+  `READ_SEQ` (codec-extension.ts) all declare `tosDelta: 0` but actually
+  read whatever's already in `acc` at `exec()` time — e.g.
+  `write(0, N, load_val(0))` lowers to `LOAD_VAL` then `WRITE` with
+  nothing in between, `state.acc` carrying the value across. `raise.ts`'s
+  EXT case modeled an op's real inputs as *only* its `-tosDelta` popped
+  stack values, so this implicit read was silently dropped — confirmed by
+  raising a real integer-encode leaf and finding `WRITE`'s `args` empty.
+  Fixed with a new `ExtOpEffect.readsAcc` flag (`extension.ts`): when set,
+  raise.ts captures the pending acc value as the op's own trailing `args`
+  entry instead of killing it, and the four codec ops that need it are
+  now marked. `run()` itself was never affected (it reads the real
+  register directly) — this only mattered for a tree-based consumer.
+- **A truly empty procedure body crashed instead of returning 0.** A bare
+  `return;` with nothing before it (`unitRule`'s own generated procedure —
+  an empty `ir\`\`` fragment, `return;` appended by `resolver.ts`'s
+  `ensureTerminated`) is legal: `vm.ts`'s `runProc` seeds `let acc = 0` at
+  the start of every call, so a bare return there really does return 0.
+  `raise.ts` modeled "no value tracked yet" as `undefined` and threw on
+  reading it. Fixed by seeding the Raiser's initial acc to a pure `const 0`
+  instead.
+- **A pending, unflushed side-effecting value right before a `LOOP` was
+  silently dropped.** `listEncodeRule`'s own body is
+  `write(0, W, left); while (left != 0) { ... }` — the `WRITE` call
+  produces a pending (impure) acc value that nothing consumes before the
+  loop starts. Every *other* "acc is about to become untrustworthy" point
+  in `raise.ts` goes through `killAcc()` (flush first if impure); `LOOP`'s
+  own handling did a raw `this.acc = undefined` instead, discarding the
+  pending `WRITE` statement outright — confirmed by a generated
+  `encode_proc` missing its list length-prefix write entirely. Fixed by
+  routing it through `killAcc()` like everywhere else.
+
+Both bugs from item 12's own writeup plus these three now bring `raise.ts`
+to five found-by-actually-using-it fixes total — each one a real gap no
+amount of re-reading the code surfaced, only exercising it against real
+programs did.
 
 ## 13. Futher ideas
 
-- crypto extension via stream iterators: new handle space, openssl like api, could cover CRCs, fixed and variable length hashes (shake) and aead as well
-- better dsl syntax accessing handles: like stream[0].read/write or some declaration like syntax (could also allow allocations to be delegated to the lowerer, would be nice)
+- crypto extension: new handle space, openssl like api, could cover CRCs, fixed and variable length hashes (shake) and aead as well, data I/O via stream iterators
+- better dsl syntax for accessing handles: like stream[0].read/write or some declaration-like syntax (could also allow handle index allocations to be delegated to the lowerer, would be nice)
 - small **value** space merging binary codec, e.g. union tag merged with limited range number field in one of the variants, might need some annotation/hinting/some kind of meta-argument to specify what to merge with what, becasue it favors some against the others heavily compactness-wise.
 - target side transformation (unit of measurement)
+- MCU JIT compiler (Generic Core → ARMv6-M, runtime-injected fragments, on-demand compile/evict/compact) — see docs/jit-armv6m.md
 
 ---
 

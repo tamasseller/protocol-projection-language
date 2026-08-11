@@ -2,6 +2,8 @@ import {test} from "node:test"
 import * as assert from "node:assert/strict"
 
 import "./ts-emitter.runtime.test"
+import "./ts-alternative-rules.runtime.test"
+import "./codec-codegen.runtime.test"
 
 import {generateJsTypes, generateJsCodecs} from "../src/index"
 import {struct, integer, named} from "@ppl/core"

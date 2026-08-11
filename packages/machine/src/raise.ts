@@ -65,6 +65,16 @@ export type Stmt =
     | {kind: "loop"; cond: Stmt[]; test: Expr; body: Stmt[]}
     | {kind: "return"; value: Expr}
     | {kind: "trap"; code: number}
+    /** One EXT call whose effect nets `slots.length` (> 0) discrete stack
+     *  results — a statement, not an `Expr`, because it must run exactly
+     *  once: unlike the tosDelta≤0 `Expr["ext"]` case (a single opaque
+     *  value, safely re-referenced by however many places embed it), an
+     *  op producing N results has no single value to hand back from an
+     *  expression position, and modeling it as N separate same-shaped
+     *  `Expr["ext"]` nodes (one per result) would call it N times instead
+     *  of once — wrong for anything with a side effect beyond its return
+     *  values (a stream read consuming N bytes in one call, say). */
+    | {kind: "extMulti"; slots: readonly number[]; ext: string; operands: readonly number[]}
 
 export interface RaisedProc
 {
@@ -112,7 +122,32 @@ class Raiser
     private pc = 0
     private tos: number
     private peak: number
-    private acc: PendingAcc | undefined
+    // vm.ts's runProc seeds the real register `let acc = 0` at the start
+    // of every call (vm.ts:152) and never resets it at a block/dispatch/
+    // loop boundary — BLOCK_END only ever restores `tos` (§8.1), so acc
+    // simply persists as whatever the machine last wrote, branch-dependent
+    // as that may be. A bare `return;`/`trap(...)` right after a
+    // dispatch/loop closes, with nothing in between setting a fresh value,
+    // is therefore legal and well-defined at the VM level — and a real
+    // shape: `resolver.ts`'s `ensureTerminated` appends exactly this after
+    // a `unionEncodeRule`/`unionDecodeRule`/`listEncodeRule`/... body,
+    // none of which end in their own `return`. Modeling "acc's value here
+    // isn't tracked by this raiser instance" as `undefined` and having
+    // readAcc() throw on it was wrong for this whole class of case.
+    //
+    // What raise.ts genuinely *can't* track is which specific expression
+    // is in acc when it depends on which of several branches ran (a real
+    // phi/merge) — but every such site in this codebase is exactly the
+    // "meaningless trailing return" case above, so `unknownAcc()` picks a
+    // safe, always-valid stand-in (pure CONST 0, never flushed as a
+    // statement) rather than building merge-slot machinery nothing here
+    // needs yet.
+    private acc: PendingAcc | undefined = Raiser.unknownAcc()
+
+    private static unknownAcc(): PendingAcc
+    {
+        return {expr: {kind: "const", value: 0}, pure: true}
+    }
 
     constructor(
         private readonly body: readonly RtlInstr[],
@@ -187,25 +222,39 @@ class Raiser
     }
 
     /** Raise one case/loop-body block, discarding (but not silently
-     *  dropping — flushing if impure) whatever trailing acc value it left. */
+     *  dropping — flushing if impure) whatever trailing acc value it left.
+     *  What the *outer* continuation sees afterward is `unknownAcc()`, not
+     *  `undefined` — see its own doc comment for why that's the correct
+     *  model here, not just a crash-avoidance workaround. */
     private closedBlock(): Stmt[]
     {
         const {stmts, trailing} = this.blockBody()
         if(trailing && !trailing.pure) stmts.push({kind: "exprStmt", value: trailing.expr})
-        this.acc = undefined
+        this.acc = Raiser.unknownAcc()
         return stmts
     }
 
     /**
      * Raise straight-line + nested-construct statements until this block's
      * own close: an explicit BLOCK_END (consumed, not itself emitted — it's
-     * pure structure) or a direct RETURN/TRAP. A terminator closes its own
-     * block with no following BLOCK_END (isa-core.md §4.5/§7.2; lower.ts's
-     * closeBlock never emits one for a statement list ending that way), so
-     * this loop recognizes the same three closing conditions vm.ts's
-     * skipBlocks does. Returns the trailing acc value on a BLOCK_END close
-     * (needed by LOOP's condition sub-block as `test`) — undefined on a
-     * RETURN/TRAP close, since both already consumed or discarded it.
+     * pure structure), a direct RETURN/TRAP, or the true end of the
+     * procedure body. A terminator closes its own block with no following
+     * BLOCK_END (isa-core.md §4.5/§7.2; lower.ts's closeBlock never emits
+     * one for a statement list ending that way), so this loop recognizes
+     * the same three closing conditions vm.ts's skipBlocks does — plus a
+     * fourth this module alone needs to recognize: running off the true
+     * end of `this.body` with no BLOCK_END. That's only reachable for the
+     * *outermost* call (`top()`): every nested block (a BR_TABLE case, a
+     * LOOP sub-block) is always properly closed by lower.ts, either with a
+     * real BLOCK_END or because its own last statement is directly a
+     * RETURN/TRAP — confirmed structurally, not merely assumed. The
+     * top-level procedure body has no enclosing BLOCK_END of its own, so
+     * when every path through it already terminates (e.g. a bare
+     * `if(c) return a; else return b;` with nothing following), there is
+     * genuinely nothing left to read once both branches are raised.
+     * Returns the trailing acc value on a BLOCK_END close (needed by
+     * LOOP's condition sub-block as `test`) — undefined on a RETURN/TRAP
+     * or true-end close, since none of those three leave a usable value.
      */
     private blockBody(): {stmts: Stmt[]; trailing?: PendingAcc}
     {
@@ -213,7 +262,7 @@ class Raiser
         for(;;)
         {
             const i = this.body[this.pc]
-            if(i === undefined) throw new Error(`raise: ran off the end of the procedure body`)
+            if(i === undefined) return {stmts}
 
             switch(i.op)
             {
@@ -308,7 +357,15 @@ class Raiser
                 case "LOOP":
                 {
                     this.pc++
-                    this.acc = undefined
+                    // Not a raw reset: whatever's pending here is whatever
+                    // ran immediately before this LOOP (e.g. listEncodeRule's
+                    // own `write(0, W, left);` right before its `while`) —
+                    // whose side effect must still land in `stmts`, exactly
+                    // like every other "acc's about to become untrustworthy"
+                    // point in this file (killAcc's own doc comment). A bare
+                    // `this.acc = undefined` here silently dropped it — the
+                    // bug this comment is now here to stop reintroducing.
+                    this.killAcc(stmts)
 
                     const {stmts: condStmts, trailing} = this.withBlock(() => this.blockBody())
                     if(!trailing) throw new Error(`raise: LOOP condition block left no test value at pc ${this.pc}`)
@@ -351,33 +408,53 @@ class Raiser
 
                     // Only tosDelta is knowable generically here — ExtOpEffect
                     // says nothing about how many discrete inputs vs. outputs
-                    // an op has beyond the net, nor whether it reads/writes
-                    // acc. A net-negative op is modeled as "pops -tosDelta
-                    // operands, produces one opaque acc result"; a
-                    // net-non-negative op as "produces tosDelta opaque
-                    // results directly on the stack, acc left untouched by
-                    // it". Correct for the common shapes (one stream-read
-                    // producing one value; one stream-write consuming some),
-                    // not a general decomposition — an op with *both*
-                    // multiple discrete inputs and outputs at once needs a
-                    // richer contract than ExtOpEffect currently declares.
-                    this.killAcc(stmts)
+                    // an op has beyond the net, nor whether it writes acc. A
+                    // net-negative op is modeled as "pops -tosDelta operands,
+                    // produces one opaque acc result" (Expr["ext"], safely
+                    // re-referenced by however many places embed it — it's
+                    // one value); a net-positive op as one `extMulti`
+                    // statement — the call runs exactly once, landing
+                    // tosDelta discrete results directly in fresh slots, acc
+                    // left untouched. Correct for the common shapes (one
+                    // stream-read producing one value; one stream-write
+                    // consuming some), not a general decomposition — an op
+                    // with *both* multiple discrete inputs and outputs at
+                    // once needs a richer contract than ExtOpEffect currently
+                    // declares.
+                    //
+                    // `readsAcc` is handled before any of that: capture
+                    // *this* acc value (whatever produced it — a slot read, a
+                    // CONST, another ext's result) as this op's own trailing
+                    // arg instead of killing it — see ExtOpEffect.readsAcc's
+                    // doc comment for why this can't just fall out of the
+                    // tosDelta accounting below.
+                    const priorAcc = effect.readsAcc ? this.acc : undefined
+                    if(effect.readsAcc && !priorAcc)
+                        throw new Error(`raise: EXT ${i.ext} at pc ${this.pc}: reads acc but none is set`)
+                    if(!effect.readsAcc) this.killAcc(stmts)
+                    else this.acc = undefined // consumed below, not flushed
                     if(effect.tosDelta <= 0)
                     {
                         const n = -effect.tosDelta
                         if(this.tos < n) throw new Error(`raise: EXT ${i.ext} at pc ${this.pc}: only ${this.tos} value(s) on the stack, need ${n}`)
                         this.tos -= n
                         const args = Array.from({length: n}, (_, k) => slotExpr(this.tos + k))
+                        if(priorAcc) args.push(priorAcc.expr)
                         this.setAcc({kind: "ext", ext: i.ext, operands: i.operands, args}, false)
                     }
                     else
                     {
-                        for(let k = 0; k < effect.tosDelta; k++)
-                        {
-                            stmts.push({kind: "assign", slot: this.tos, value: {kind: "ext", ext: i.ext, operands: i.operands, args: []}})
-                            this.tos++
-                            this.bumpPeak()
-                        }
+                        // extMulti has no expression position to carry a
+                        // trailing arg through (it's a statement, not an
+                        // Expr) — no current codec op needs this combination,
+                        // so it's left unimplemented rather than silently
+                        // dropping priorAcc the same way this whole fix
+                        // exists to stop happening.
+                        if(priorAcc) throw new Error(`raise: EXT ${i.ext} at pc ${this.pc}: readsAcc with tosDelta > 0 isn't supported`)
+                        const slots = Array.from({length: effect.tosDelta}, (_, k) => this.tos + k)
+                        stmts.push({kind: "extMulti", slots, ext: i.ext, operands: i.operands})
+                        this.tos += effect.tosDelta
+                        this.bumpPeak()
                     }
                     this.pc++
                     continue

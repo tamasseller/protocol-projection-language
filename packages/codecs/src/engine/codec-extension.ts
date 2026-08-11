@@ -139,16 +139,31 @@ function ensureDecodedStructExists(handle: Handle, direction: Direction): Handle
  *  returns. */
 type Frame = Handle[]
 
-const EFFECTS: Readonly<Record<CodecOpcode, ExtOpEffect>> = {
+/** Exported so a consumer of `raise.ts`'s output (a JS/C codegen — neither
+ *  lives in this package) can call `raiseProgram(program, {effects:
+ *  CODEC_EFFECTS})` without needing a real `Handle`/buffer just to get at
+ *  `exec()`'s own `Extension` object — `raiseProgram` only ever reads
+ *  `.effects`, never `.exec`/`.rules`/`.codec`. */
+export const CODEC_EFFECTS: Readonly<Record<CodecOpcode, ExtOpEffect>> = {
     ENTER:      { tosDelta: 0, maxTransient: 0 },
     ENTER_NEXT: { tosDelta: 0, maxTransient: 0 },
     LOAD_VAL:   { tosDelta: 0, maxTransient: 0 },
-    STORE_VAL:  { tosDelta: 0, maxTransient: 0 },
+    // STORE_VAL/WRITE/WRITE_SEQ/READ_SEQ's real value/count argument is
+    // codecRules()'s trailing pRtl("acc") demand (each rule's own doc
+    // comment) — lowered as "compute it into acc, then this op, nothing in
+    // between," never a stack push/pop, so tosDelta alone doesn't capture
+    // it. `readsAcc` (ExtOpEffect.readsAcc, @ppl/machine/extension.ts) is
+    // exactly this declaration; without it raise.ts's own reconstructed
+    // tree loses the value entirely (found building the JS codegen on top
+    // of raise.ts's output — run() itself was never affected, since it
+    // reads the real acc register directly regardless of what raise.ts
+    // does with it).
+    STORE_VAL:  { tosDelta: 0, maxTransient: 0, readsAcc: true },
     COUNT:      { tosDelta: 0, maxTransient: 0 },
     TAG:        { tosDelta: 0, maxTransient: 0 },
     OPEN_LIST:  { tosDelta: 0, maxTransient: 0 },
     READ:       { tosDelta: 0, maxTransient: 0 },
-    WRITE:      { tosDelta: 0, maxTransient: 0 },
+    WRITE:      { tosDelta: 0, maxTransient: 0, readsAcc: true },
     HAS_NEXT:   { tosDelta: 0, maxTransient: 0 },
     CLONE_RD:   { tosDelta: 0, maxTransient: 0 },
     CLONE_WR:   { tosDelta: 0, maxTransient: 0 },
@@ -165,8 +180,8 @@ const EFFECTS: Readonly<Record<CodecOpcode, ExtOpEffect>> = {
     // storage — the "snatch point" a target codegen can specialize into a
     // raw-buffer/DMA copy; `exec()`'s own semantics are always the dumb
     // per-element pump loop (§11's "generic semantics first" split).
-    WRITE_SEQ: { tosDelta: 0, maxTransient: 0 },
-    READ_SEQ:  { tosDelta: 0, maxTransient: 0 },
+    WRITE_SEQ: { tosDelta: 0, maxTransient: 0, readsAcc: true },
+    READ_SEQ:  { tosDelta: 0, maxTransient: 0, readsAcc: true },
 }
 
 /** The codec extension's `Extension.rules` — lets codec bodies be authored
@@ -642,6 +657,6 @@ export function createCodecExtension(direction: Direction, root: Handle, buffer:
         }
     }
 
-    return { effects: EFFECTS, exec, codec: codecWireCodec }
+    return { effects: CODEC_EFFECTS, exec, codec: codecWireCodec }
 }
 

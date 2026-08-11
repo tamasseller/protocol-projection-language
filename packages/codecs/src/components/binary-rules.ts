@@ -28,10 +28,10 @@
  * `structDecodeRule`, and `HOIST_MAX_VARIANTS` for the break-even point.
  */
 
-import type { IrFragment } from "@ppl/machine"
+import type { IrFragment, Procedure } from "@ppl/machine"
 import { ir } from "@ppl/machine"
-import type { SemanticType, UnionType, IntegerPattern, UnitPattern, StructFieldsMatch } from "@ppl/core"
-import { concreteKindOf, derefType, SemanticTypeKinds } from "@ppl/core"
+import type { SemanticType, UnionType, IntegerPattern, UnitPattern, StructFieldsMatch, TypeNode } from "@ppl/core"
+import { SemanticTypeKinds } from "@ppl/core"
 import { pInteger, pUnit, pList, pUnionFields, pStructFields, pStar } from "@ppl/core"
 import { intWireSize } from "../engine/codec-extension"
 import type { CodecRule } from "../engine/resolver"
@@ -175,17 +175,35 @@ const BITMAP_MAX_BITS = 32   // one register's worth (vm.ts's ALU is 32-bit)
 const bitsFor = (variantCount: number): number =>
     variantCount <= 1 ? 0 : Math.ceil(Math.log2(variantCount))
 
-function classifyHoistableFields(fieldMatches: StructFieldsMatch["fieldMatches"]): ReadonlyMap<number, HoistedField>
+/**
+ * `f.type` may still be a reference thunk — for a self-referential schema
+ * (a recursive union-typed field), dereferencing it directly (the old
+ * `concreteKindOf`/`derefType` approach) re-invokes the thunk fresh,
+ * producing brand-new variant-payload objects that were never registered
+ * in the `TypeGraph`'s cycle-breaking identity map (`@ppl/core/type-
+ * graph.ts`'s `byObject`) — a later `resolve(v, ...)` on one of those then
+ * fails with "not reachable". `resolve(f.type, ctx)` goes through the
+ * *same* graph the rest of this rule already trusts: its `Procedure`'s
+ * `header` (resolver.ts) is the exact `TypeNode` — already deref'd once,
+ * already identity-safe — that `f.type` maps to. Calling `resolve` here
+ * merely to peek at `.header`, without ever splicing the returned
+ * `Procedure` into any `ir` text, adds nothing to the final program:
+ * reachability is driven by which procedures actually get interpolated,
+ * not by how many times `resolve` was called.
+ */
+function classifyHoistableFields(
+    fieldMatches: StructFieldsMatch["fieldMatches"],
+    resolve: (childType: SemanticType, ctx: void) => Procedure,
+): ReadonlyMap<number, HoistedField>
 {
     const byField = new Map<number, HoistedField>()
     let bitOffset = 0
 
     fieldMatches.forEach((f, fieldIndex) =>
     {
-        // `f.type` may still be a reference thunk — concreteKindOf/derefType
-        // follow it through (kindOf alone would just report "reference").
-        if(concreteKindOf(f.type) !== SemanticTypeKinds.Union) return
-        const unionType = derefType(f.type) as UnionType
+        const fieldType = (resolve(f.type, undefined).header as TypeNode).type
+        if(fieldType.kind !== SemanticTypeKinds.Union) return
+        const unionType = fieldType as UnionType
         const variantCount = unionType.variants.size
         if(variantCount > HOIST_MAX_VARIANTS) return
         const bits = bitsFor(variantCount)
@@ -204,7 +222,7 @@ function classifyHoistableFields(fieldMatches: StructFieldsMatch["fieldMatches"]
 
 const structEncodeRule = codecRule(pStructFields(pStar()), (match, _ctx: void, resolve) =>
 {
-    const hoisted = classifyHoistableFields(match.fieldMatches)
+    const hoisted = classifyHoistableFields(match.fieldMatches, resolve)
     const totalBits = [...hoisted.values()].reduce((sum, h) => sum + h.bits, 0)
     const bitmapBytes = Math.ceil(totalBits / 8)
     const O_FIELD = 1 // scratch handle slot for whichever field is being processed
@@ -236,7 +254,7 @@ const structEncodeRule = codecRule(pStructFields(pStar()), (match, _ctx: void, r
 const structDecodeRule = codecRule(pStructFields(pStar()), (match, _ctx: void, resolve) =>
 {
     // ── Meta: pure JS bookkeeping, no DSL text yet ──────────────────────
-    const hoisted = classifyHoistableFields(match.fieldMatches)
+    const hoisted = classifyHoistableFields(match.fieldMatches, resolve)
     const totalBits = [...hoisted.values()].reduce((sum, h) => sum + h.bits, 0)
     const bitmapBytes = Math.ceil(totalBits / 8)
     const O_FIELD = 1

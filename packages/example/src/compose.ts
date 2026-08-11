@@ -28,7 +28,7 @@ import {buildTypeGraph, TypeGraph} from "@ppl/core"
 import {projectCTypes, emitCHeader, CTypeDecl} from "@ppl/target-cpp"
 import {buildCodec, buildJsonEncoder, createCodecExtension, binaryEncodeRules, binaryDecodeRules, Handle} from "@ppl/codecs"
 import {validateProgram, run, RtlProgram} from "@ppl/machine"
-import {projectTSTypes, emitTSDeclarations, TSTypeDecl} from "@ppl/target-js"
+import {projectTSTypes, emitTSDeclarations, tsTypeRules, TSTypeDecl} from "@ppl/target-js"
 
 import {TelemetryPacket} from "./schema"
 
@@ -115,5 +115,5 @@ export function toJson(value: unknown): string
 export const jsonSample: string = toJson(sampleTelemetryPacket)
 
 /** TypeScript declarations (desktop/server) projected from the schema. */
-export const tsTypes: Map<number, TSTypeDecl> = projectTSTypes(graph)
+export const tsTypes: Map<number, TSTypeDecl> = projectTSTypes(TelemetryPacket, tsTypeRules)
 export const tsDeclarations: string = emitTSDeclarations(tsTypes)

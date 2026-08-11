@@ -133,6 +133,19 @@ export const union = (def: {[k: string]: SemanticType}, defaultVariant?: string)
 }
 
 /**
+ * An optional value: sugar for the 2-variant `union({value: T, empty:
+ * unit}, "empty")` shape target/codec rules already recognize by exact
+ * name (e.g. `target-cpp/cpp-emitter.ts`'s `std::optional<T>` rule,
+ * `target-js`'s `T | null` rule) — one blessed constructor instead of each
+ * schema author hand-rolling a union and hoping they used the same two
+ * variant names those rules match on. `"empty"` is the declared
+ * `defaultVariant` for free, so a decoder reconciling against a narrower
+ * image tree (docs/codec-image.md §3.2) falls back to "absent" without the
+ * schema author declaring anything extra.
+ */
+export const optional = (T: SemanticType): UnionType => union({value: T, empty: unit}, "empty")
+
+/**
  * The value a decoder/encoder substitutes when a field/variant has no
  * source value of its own on one side of a reconciled pair of trees
  * (docs/codec-image.md §3.1/§3.3): `undefined` for `unit` (no data to
