@@ -9,7 +9,8 @@
     "packages/codecs",
     "packages/target-cpp",
     "packages/target-js",
-    "packages/example"
+    "packages/example",
+    "jit-armv6m/prototype"
   ],
   "scripts": {
     "build": "npm run build --workspaces",
