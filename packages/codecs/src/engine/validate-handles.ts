@@ -43,12 +43,12 @@
  * re-derivation of §8.1-§8.5).
  */
 
-import type {RtlProgram, RtlProc, RtlInstr, ExtInstr} from "@ppl/machine"
+import type {RtlProgram, RtlProc, RtlInstr} from "@ppl/machine"
 import {isExtInstr} from "@ppl/machine"
 import type {TypeNode} from "@ppl/core"
 import {SemanticTypeKinds} from "@ppl/core"
-import type {CodecOpcode} from "./opcodes"
-import {isCodecOpcode, assertNever} from "./opcodes"
+import {assertNever} from "./opcodes"
+import type {CodecExtInstr} from "./codec-ext-instr"
 
 type HandleEnv = Map<number, TypeNode>
 
@@ -112,7 +112,7 @@ function requireCapability(cap: IterCapability, need: "read" | "write", procInde
         fail(procIndex, pc, `${opName}: iterator ${id} is ${cap}-only, not ${need}`)
 }
 
-function checkCalleeType(program: RtlProgram, codecIdx: number, childType: TypeNode, procIndex: number, pc: number, opName: string): void
+function checkCalleeType(program: RtlProgram<CodecExtInstr>, codecIdx: number, childType: TypeNode, procIndex: number, pc: number, opName: string): void
 {
     const callee = program.procedures[codecIdx]
     if(!callee) fail(procIndex, pc, `${opName}: no such procedure ${codecIdx}`)
@@ -130,128 +130,128 @@ function checkCalleeType(program: RtlProgram, codecIdx: number, childType: TypeN
             `delegated-to child's actual type (node ${childType.id}) — a field/variant is being decoded with the wrong codec`)
 }
 
-function analyzeProcedure(proc: RtlProc, procIndex: number, program: RtlProgram): void
+function analyzeProcedure(proc: RtlProc<CodecExtInstr>, procIndex: number, program: RtlProgram<CodecExtInstr>): void
 {
     const header = proc.header as TypeNode | undefined
     const body = proc.body
 
-    function handleExt(instr: ExtInstr, env: HandleEnv, iterEnv: IterEnv, pc: number): void
+    // Switching on `instr.ext` directly (not a separately-assigned `op`
+    // local) is what lets each case below narrow `instr` itself to its
+    // own variant and read named fields straight off it.
+    function handleExt(instr: CodecExtInstr, env: HandleEnv, iterEnv: IterEnv, pc: number): void
     {
-        if(!isCodecOpcode(instr.ext)) fail(procIndex, pc, `unrecognized codec opcode "${instr.ext}"`)
-        const op: CodecOpcode = instr.ext
-
-        switch(op)
+        switch(instr.ext)
         {
             case "ENTER":
             {
-                const [dst, src, ref] = instr.operands as readonly [number, number, number]
-                env.set(dst, childOf(handleOf(env, procIndex, pc, src, op), ref, procIndex, pc, op))
+                const {dst, src, ref} = instr
+                env.set(dst, childOf(handleOf(env, procIndex, pc, src, instr.ext), ref, procIndex, pc, instr.ext))
                 return
             }
             case "ENTER_NEXT":
             {
-                const [dst, src] = instr.operands as readonly [number, number]
-                env.set(dst, nextOf(handleOf(env, procIndex, pc, src, op), procIndex, pc, op))
+                const {dst, src} = instr
+                env.set(dst, nextOf(handleOf(env, procIndex, pc, src, instr.ext), procIndex, pc, instr.ext))
                 return
             }
             case "LOAD_VAL":
             case "STORE_VAL":
             {
-                const [src] = instr.operands as readonly [number]
-                const t = handleOf(env, procIndex, pc, src, op)
+                const {src} = instr
+                const t = handleOf(env, procIndex, pc, src, instr.ext)
                 if(t.type.kind !== SemanticTypeKinds.Integer)
-                    fail(procIndex, pc, `${op}: handle ${src} is a ${t.type.kind}, not a primitive value`)
+                    fail(procIndex, pc, `${instr.ext}: handle ${src} is a ${t.type.kind}, not a primitive value`)
                 return
             }
             case "COUNT":
             case "OPEN_LIST":
             {
-                const [src] = instr.operands as readonly [number]
-                const t = handleOf(env, procIndex, pc, src, op)
+                const {src} = instr
+                const t = handleOf(env, procIndex, pc, src, instr.ext)
                 if(t.type.kind !== SemanticTypeKinds.List)
-                    fail(procIndex, pc, `${op}: handle ${src} is a ${t.type.kind}, not a list`)
+                    fail(procIndex, pc, `${instr.ext}: handle ${src} is a ${t.type.kind}, not a list`)
                 return
             }
             case "TAG":
             {
-                const [src] = instr.operands as readonly [number]
-                const t = handleOf(env, procIndex, pc, src, op)
+                const {src} = instr
+                const t = handleOf(env, procIndex, pc, src, instr.ext)
                 if(t.type.kind !== SemanticTypeKinds.Union)
                     fail(procIndex, pc, `TAG: handle ${src} is a ${t.type.kind}, not a union`)
                 return
             }
             case "CALL_CODEC":
             {
-                const [codecIdx, src, ref] = instr.operands as readonly [number, number, number]
-                const childType = childOf(handleOf(env, procIndex, pc, src, op), ref, procIndex, pc, op)
-                checkCalleeType(program, codecIdx, childType, procIndex, pc, op)
+                const {calleeIndex, src, ref} = instr
+                const childType = childOf(handleOf(env, procIndex, pc, src, instr.ext), ref, procIndex, pc, instr.ext)
+                checkCalleeType(program, calleeIndex, childType, procIndex, pc, instr.ext)
                 return
             }
             case "CALL_CODEC_NEXT":
             {
-                const [codecIdx, src] = instr.operands as readonly [number, number]
-                const childType = nextOf(handleOf(env, procIndex, pc, src, op), procIndex, pc, op)
-                checkCalleeType(program, codecIdx, childType, procIndex, pc, op)
+                const {calleeIndex, src} = instr
+                const childType = nextOf(handleOf(env, procIndex, pc, src, instr.ext), procIndex, pc, instr.ext)
+                checkCalleeType(program, calleeIndex, childType, procIndex, pc, instr.ext)
                 return
             }
             case "READ":
             {
-                const [iterId] = instr.operands as readonly [number, number]
-                requireCapability(iterOf(iterEnv, procIndex, pc, iterId, op), "read", procIndex, pc, iterId, op)
+                const {iter: iterId} = instr
+                requireCapability(iterOf(iterEnv, procIndex, pc, iterId, instr.ext), "read", procIndex, pc, iterId, instr.ext)
                 return
             }
             case "WRITE":
             {
-                const [iterId] = instr.operands as readonly [number, number]
-                requireCapability(iterOf(iterEnv, procIndex, pc, iterId, op), "write", procIndex, pc, iterId, op)
+                const {iter: iterId} = instr
+                requireCapability(iterOf(iterEnv, procIndex, pc, iterId, instr.ext), "write", procIndex, pc, iterId, instr.ext)
                 return
             }
             case "HAS_NEXT":
             {
-                const [iterId] = instr.operands as readonly [number]
-                requireCapability(iterOf(iterEnv, procIndex, pc, iterId, op), "read", procIndex, pc, iterId, op)
+                const {iter: iterId} = instr
+                requireCapability(iterOf(iterEnv, procIndex, pc, iterId, instr.ext), "read", procIndex, pc, iterId, instr.ext)
                 return
             }
             case "SEEK":
             {
-                const [iterId] = instr.operands as readonly [number, number]
-                iterOf(iterEnv, procIndex, pc, iterId, op) // bounds only — either capability may seek
+                const {iter: iterId} = instr
+                iterOf(iterEnv, procIndex, pc, iterId, instr.ext) // bounds only — either capability may seek
                 return
             }
             case "CLONE_RD":
             {
-                const [src, dst] = instr.operands as readonly [number, number]
-                iterOf(iterEnv, procIndex, pc, src, op) // src's own capability doesn't matter (§2.1)
+                const {src, dst} = instr
+                iterOf(iterEnv, procIndex, pc, src, instr.ext) // src's own capability doesn't matter (§2.1)
                 iterEnv.set(dst, "read")
                 return
             }
             case "CLONE_WR":
             {
-                const [src, dst] = instr.operands as readonly [number, number]
-                iterOf(iterEnv, procIndex, pc, src, op)
+                const {src, dst} = instr
+                iterOf(iterEnv, procIndex, pc, src, instr.ext)
                 iterEnv.set(dst, "write")
                 return
             }
             case "WRITE_SEQ":
             {
-                const [iterId, handleId] = instr.operands as readonly [number, number, number]
-                requireCapability(iterOf(iterEnv, procIndex, pc, iterId, op), "write", procIndex, pc, iterId, op)
-                const t = handleOf(env, procIndex, pc, handleId, op)
+                const {iter: iterId, handle: handleId} = instr
+                requireCapability(iterOf(iterEnv, procIndex, pc, iterId, instr.ext), "write", procIndex, pc, iterId, instr.ext)
+                const t = handleOf(env, procIndex, pc, handleId, instr.ext)
                 if(t.type.kind !== SemanticTypeKinds.List)
-                    fail(procIndex, pc, `${op}: handle ${handleId} is a ${t.type.kind}, not a list`)
+                    fail(procIndex, pc, `${instr.ext}: handle ${handleId} is a ${t.type.kind}, not a list`)
                 return
             }
             case "READ_SEQ":
             {
-                const [iterId, handleId] = instr.operands as readonly [number, number, number, number]
-                requireCapability(iterOf(iterEnv, procIndex, pc, iterId, op), "read", procIndex, pc, iterId, op)
-                const t = handleOf(env, procIndex, pc, handleId, op)
+                const {iter: iterId, handle: handleId} = instr
+                requireCapability(iterOf(iterEnv, procIndex, pc, iterId, instr.ext), "read", procIndex, pc, iterId, instr.ext)
+                const t = handleOf(env, procIndex, pc, handleId, instr.ext)
                 if(t.type.kind !== SemanticTypeKinds.List)
-                    fail(procIndex, pc, `${op}: handle ${handleId} is a ${t.type.kind}, not a list`)
+                    fail(procIndex, pc, `${instr.ext}: handle ${handleId} is a ${t.type.kind}, not a list`)
                 return
             }
             default:
-                return assertNever(op)
+                return assertNever(instr)
         }
     }
 
@@ -268,7 +268,7 @@ function analyzeProcedure(proc: RtlProc, procIndex: number, program: RtlProgram)
         for(; ;)
         {
             if(pc >= body.length) fail(procIndex, pc, `ran off the end without finding this block's own close`)
-            const instr: RtlInstr = body[pc]!
+            const instr: RtlInstr<CodecExtInstr> = body[pc]!
 
             if(instr.op === "BLOCK_END") return {nextPc: pc + 1, terminated: false}
             if(instr.op === "RETURN" || instr.op === "TRAP") return {nextPc: pc + 1, terminated: true}
@@ -306,7 +306,7 @@ function analyzeProcedure(proc: RtlProc, procIndex: number, program: RtlProgram)
  * was built for a different type than the one it's actually being handed.
  * Run alongside `validateProgram`, not instead of it.
  */
-export function validateCodecHandles(program: RtlProgram): void
+export function validateCodecHandles(program: RtlProgram<CodecExtInstr>): void
 {
     program.procedures.forEach((proc, i) => analyzeProcedure(proc, i, program))
 }

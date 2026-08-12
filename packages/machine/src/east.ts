@@ -16,18 +16,18 @@ import type {
     UnaryOperator,
 } from "./ast"
 
-import type { OutputLocation, Resource, RtlInstr } from "./rtl"
+import type { OutputLocation, Resource, RtlInstr, ExtOpPayload } from "./rtl"
 
 export type { OutputLocation, Resource, ComboName } from "./rtl"
 
-export interface RtlNode
+export interface RtlNode<E extends { ext: string } = ExtOpPayload>
 {
     type: "RtlNode"
     /** Output locations — always an array. Singleton `[loc]` for ordinary rules;
      *  multi-element for the assignment rule (`[acc, reg(target)]`). Downstream
      *  consumers match by `.includes(demand)` uniformly. */
     output: OutputLocation[]
-    fragment: RtlInstr[]
+    fragment: RtlInstr<E>[]
     clobbers: Resource[]
     /** Net TOS depth change from executing this fragment. Set once at build. */
     tosDelta: number
@@ -38,65 +38,65 @@ export interface RtlNode
 // EAST variants of internal AST nodes — children widened to EastExpression.
 // Leaf nodes (Literal, Identifier) are reused from the AST.
 
-export interface EastBinary
+export interface EastBinary<E extends { ext: string } = ExtOpPayload>
 {
     type: "BinaryExpression"
     operator: BinaryOperator
-    left: EastExpression
-    right: EastExpression
+    left: EastExpression<E>
+    right: EastExpression<E>
 }
 
-export interface EastUnary
+export interface EastUnary<E extends { ext: string } = ExtOpPayload>
 {
     type: "UnaryExpression"
     operator: UnaryOperator
-    argument: EastExpression
+    argument: EastExpression<E>
     prefix: true
 }
 
-export interface EastAssign
+export interface EastAssign<E extends { ext: string } = ExtOpPayload>
 {
     type: "AssignmentExpression"
     operator: AssignmentOperator
     left: Identifier
-    right: EastExpression
+    right: EastExpression<E>
 }
 
-export interface EastCall
+export interface EastCall<E extends { ext: string } = ExtOpPayload>
 {
     type: "CallExpression"
     callee: Identifier
-    arguments: EastExpression[]
+    arguments: EastExpression<E>[]
 }
 
-export type EastExpression =
+export type EastExpression<E extends { ext: string } = ExtOpPayload> =
     | Literal
     | Identifier
-    | EastBinary
-    | EastUnary
-    | EastAssign
-    | EastCall
-    | RtlNode
+    | EastBinary<E>
+    | EastUnary<E>
+    | EastAssign<E>
+    | EastCall<E>
+    | RtlNode<E>
 
-export const isRtlNode = (N: EastExpression): N is RtlNode =>
+export const isRtlNode = <E extends { ext: string } = ExtOpPayload>(N: EastExpression<E>): N is RtlNode<E> =>
     N.type === "RtlNode"
 
-export const isLiteral = (N: EastExpression): N is Literal =>
+export const isLiteral = <E extends { ext: string } = ExtOpPayload>(N: EastExpression<E>): N is Literal =>
     N.type === "Literal"
 
-export const isIdentifier = (N: EastExpression): N is Identifier =>
+export const isIdentifier = <E extends { ext: string } = ExtOpPayload>(N: EastExpression<E>): N is Identifier =>
     N.type === "Identifier"
 
-export const isEastBinary = (N: EastExpression): N is EastBinary =>
+export const isEastBinary = <E extends { ext: string } = ExtOpPayload>(N: EastExpression<E>): N is EastBinary<E> =>
     N.type === "BinaryExpression"
 
-export const isEastUnary = (N: EastExpression): N is EastUnary =>
+export const isEastUnary = <E extends { ext: string } = ExtOpPayload>(N: EastExpression<E>): N is EastUnary<E> =>
     N.type === "UnaryExpression"
 
-export const isEastAssign = (N: EastExpression): N is EastAssign =>
+export const isEastAssign = <E extends { ext: string } = ExtOpPayload>(N: EastExpression<E>): N is EastAssign<E> =>
     N.type === "AssignmentExpression"
 
-export const isEastCall = (N: EastExpression): N is EastCall =>
+export const isEastCall = <E extends { ext: string } = ExtOpPayload>(N: EastExpression<E>): N is EastCall<E> =>
     N.type === "CallExpression"
 
 export type { AssignmentOperator, BinaryOperator, UnaryOperator } from "./ast"

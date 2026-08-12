@@ -24,8 +24,8 @@
  * for a worked example of the two bounds actually differing.
  */
 
-import type { RtlProc, RtlProgram, RtlInstr } from "./rtl"
-import { isCallInstr, isExtInstr, isStackComboInstr } from "./rtl"
+import type { RtlProc, RtlProgram, RtlInstr, ExtOpPayload } from "./rtl"
+import { isExtInstr, isStackComboInstr } from "./rtl"
 import type { Extension, ExtOpEffect } from "./extension"
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -57,7 +57,7 @@ export interface ProgramStats
 /** How many of a call-shaped op's `argCount` logical arguments are actually
  *  popped off the stack — all but the last, which arrives in `acc` instead
  *  (rtl.ts's `call` doc comment). Shared by `CALL`'s own bookkeeping, an
- *  extension's call-shaped `effect.call`, and `totalDepthOf`'s frame-base
+ *  extension's call-shaped `effect.calleeOf`, and `totalDepthOf`'s frame-base
  *  computation, so the three stay in agreement about the convention. */
 function stackArgsOf(argCount: number): number
 {
@@ -96,11 +96,11 @@ interface WalkOutcome
  * defense against malicious bytecode — see the cryptographic-signing
  * discussion in ROADMAP.md for where *that* concern actually belongs).
  */
-function walkProcedure(
-    proc: RtlProc,
-    program: RtlProgram,
+function walkProcedure<E extends { ext: string } = ExtOpPayload>(
+    proc: RtlProc<E>,
+    program: RtlProgram<E>,
     procIndex: number,
-    effects: Readonly<Record<string, ExtOpEffect>> | undefined,
+    effects: Readonly<Record<string, ExtOpEffect<E>>> | undefined,
 ): WalkOutcome
 {
     const body = proc.body
@@ -127,7 +127,7 @@ function walkProcedure(
             // at) never got its own close at all.
             if(pc >= body.length) fail(pc, `ran off the end without finding this block's own close (RETURN/TRAP/BLOCK_END)`)
 
-            const instr: RtlInstr = body[pc]!
+            const instr: RtlInstr<E> = body[pc]!
             peak = Math.max(peak, tos)
 
             if(instr.op === "BLOCK_END") return { nextPc: pc + 1, terminated: false }
@@ -149,7 +149,7 @@ function walkProcedure(
                 pc++; continue
             }
 
-            if(isCallInstr(instr))
+            if(instr.op === "CALL")
             {
                 const callee = program.procedures[instr.calleeIndex]
                 if(!callee) fail(pc, `CALL ${instr.calleeIndex}: no such procedure`)
@@ -168,12 +168,11 @@ function walkProcedure(
 
                 peak = Math.max(peak, tos + effect.maxTransient)
 
-                if(effect.call)
+                if(effect.calleeOf)
                 {
-                    const { calleeOperandIndex } = effect.call
-                    const calleeIndex = instr.operands[calleeOperandIndex]
+                    const calleeIndex = effect.calleeOf(instr)
                     if(calleeIndex === undefined)
-                        fail(pc, `EXT ${instr.ext}: call effect references operand ${calleeOperandIndex}, but only ${instr.operands.length} present`)
+                        fail(pc, `EXT ${instr.ext}: call effect declared but didn't resolve a callee for this instruction`)
                     const callee = program.procedures[calleeIndex]
                     if(!callee) fail(pc, `EXT ${instr.ext}: no such procedure ${calleeIndex}`)
                     // The resolved callee's own argCount header decides the
@@ -238,9 +237,9 @@ function walkProcedure(
  * graph has a cycle (§8.2) — acyclicity and the tight depth fall out of the
  * same walk.
  */
-function totalDepthOf(
+function totalDepthOf<E extends { ext: string } = ExtOpPayload>(
     index: number,
-    program: RtlProgram,
+    program: RtlProgram<E>,
     perProcedure: readonly WalkOutcome[],
     memo: Map<number, number>,
     visiting: Set<number>,
@@ -266,7 +265,7 @@ function totalDepthOf(
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-export function validateProgram(program: RtlProgram, extension?: Extension): ProgramStats
+export function validateProgram<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E>, extension?: Extension<E>): ProgramStats
 {
     if(program.procedures.length === 0) throw new Error(`empty program`)
 

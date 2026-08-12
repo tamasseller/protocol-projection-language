@@ -17,7 +17,9 @@ import assert from "node:assert/strict"
 
 import type { TypeNode } from "@ppl/core"
 import { struct, union, unit, u8, i16, list, integer, buildTypeGraph } from "@ppl/core"
-import { ir, proc, lowerProgram, validateProgram, run, extInstr, bare } from "@ppl/machine"
+import { ir, proc, lowerProgram, validateProgram, run, bare } from "@ppl/machine"
+import { cloneRdInstr, cloneWrInstr, readSeqInstr, writeSeqInstr } from "../src/engine/codec-ext-instr"
+import type { CodecExtInstr } from "../src/engine/codec-ext-instr"
 import type { RtlProgram, RtlProc } from "@ppl/machine"
 
 import { createCodecExtension, codecRules } from "../src/engine/codec-extension"
@@ -26,7 +28,7 @@ import { validateCodecHandles } from "../src/engine/validate-handles"
 import { buildCodec } from "../src/engine/resolver"
 import { binaryEncodeRules, binaryDecodeRules } from "../src/components/binary-rules"
 
-function lower(entry: ReturnType<typeof proc>): RtlProgram
+function lower(entry: ReturnType<typeof proc>): RtlProgram<CodecExtInstr>
 {
     return lowerProgram(entry, { rules: codecRules })
 }
@@ -134,7 +136,7 @@ function itemNode(): TypeNode
     return buildTypeGraph(list(u8)).root
 }
 
-function fixture(body: RtlProc["body"], header?: TypeNode): RtlProgram
+function fixture(body: RtlProc<CodecExtInstr>["body"], header?: TypeNode): RtlProgram<CodecExtInstr>
 {
     return { procedures: [{ argCount: 0, body, header }] }
 }
@@ -163,30 +165,30 @@ describe("validateCodecHandles: WRITE_SEQ / READ_SEQ", () =>
     test("rejects WRITE_SEQ on a non-list handle", () =>
     {
         const header = buildTypeGraph(u8).root
-        const program = fixture([extInstr("WRITE_SEQ", [0, 0, 1]), bare("RETURN")], header)
+        const program = fixture([writeSeqInstr(0, 0, 1), bare("RETURN")], header)
         assert.throws(() => validateCodecHandles(program), /not a list/)
     })
 
     test("rejects READ_SEQ on a non-list handle", () =>
     {
         const header = buildTypeGraph(u8).root
-        const program = fixture([extInstr("READ_SEQ", [0, 0, 1, 0]), bare("RETURN")], header)
+        const program = fixture([readSeqInstr(0, 0, 1, 0), bare("RETURN")], header)
         assert.throws(() => validateCodecHandles(program), /not a list/)
     })
 
     test("rejects WRITE_SEQ on a read-only iterator", () =>
     {
         const header = itemNode()
-        const program = fixture([extInstr("WRITE_SEQ", [0, 0, 1]), bare("RETURN")], header)
+        const program = fixture([writeSeqInstr(0, 0, 1), bare("RETURN")], header)
         // i0's capability is "any" in this validator (direction-agnostic —
         // see validate-handles.ts's own file header), so exercise a
         // definitely-read-only fork instead.
-        const withFork: RtlProgram = {
+        const withFork: RtlProgram<CodecExtInstr> = {
             procedures: [{
                 argCount: 0,
                 body: [
-                    extInstr("CLONE_RD", [0, 1]),
-                    extInstr("WRITE_SEQ", [1, 0, 1]),
+                    cloneRdInstr(0, 1),
+                    writeSeqInstr(1, 0, 1),
                     bare("RETURN"),
                 ],
                 header,
@@ -198,12 +200,12 @@ describe("validateCodecHandles: WRITE_SEQ / READ_SEQ", () =>
     test("rejects READ_SEQ on a write-only iterator", () =>
     {
         const header = itemNode()
-        const withFork: RtlProgram = {
+        const withFork: RtlProgram<CodecExtInstr> = {
             procedures: [{
                 argCount: 0,
                 body: [
-                    extInstr("CLONE_WR", [0, 1]),
-                    extInstr("READ_SEQ", [1, 0, 1, 0]),
+                    cloneWrInstr(0, 1),
+                    readSeqInstr(1, 0, 1, 0),
                     bare("RETURN"),
                 ],
                 header,
@@ -214,7 +216,7 @@ describe("validateCodecHandles: WRITE_SEQ / READ_SEQ", () =>
 
     test("rejects WRITE_SEQ on a handle never entered in this procedure", () =>
     {
-        const program = fixture([extInstr("WRITE_SEQ", [0, 1, 1]), bare("RETURN")], itemNode())
+        const program = fixture([writeSeqInstr(0, 1, 1), bare("RETURN")], itemNode())
         assert.throws(() => validateCodecHandles(program), /never entered/)
     })
 })

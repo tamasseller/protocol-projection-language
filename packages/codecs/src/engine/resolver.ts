@@ -59,6 +59,7 @@ import { matchType, kindOf, buildTypeGraph } from "@ppl/core"
 import type { IrFragment, Procedure, RtlProgram } from "@ppl/machine"
 import { declareProc, defineProc, ir, lowerProgram } from "@ppl/machine"
 import { codecRules } from "./codec-extension"
+import type { CodecExtInstr } from "./codec-ext-instr"
 
 /**
  * One codec rule: a structural filter (`pattern`) and a producer
@@ -215,7 +216,7 @@ export function createCodecResolver<Ctx>(
  * to resolve the root, one to lower the result, nothing this function
  * itself needs to own that `createCodecResolver` doesn't already provide.
  */
-export function buildCodec<Ctx>(root: SemanticType, rules: readonly CodecRule<Ctx>[], initialCtx: Ctx): RtlProgram
+export function buildCodec<Ctx>(root: SemanticType, rules: readonly CodecRule<Ctx>[], initialCtx: Ctx): RtlProgram<CodecExtInstr>
 {
     const resolve = createCodecResolver(rules)
     return lowerProgram(resolve(root, initialCtx), { rules: codecRules })

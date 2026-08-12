@@ -1,4 +1,5 @@
 import {COMPARISON_OPS, RtlInstr} from "./rtl"
+import type {ExtOpPayload} from "./rtl"
 
 /** Bytes an unsigned LEB128 encoding of a u32 value would need — 7 payload
  *  bits per byte, up to 5 bytes for the full 32-bit range. */
@@ -22,7 +23,7 @@ function leb128Bytes(n: number): number
  * combo gets a 1-byte form only for `#0` (§4.2); `CONST` gets a 1-byte form
  * for `0..15` (§4.4).
  */
-export function instrBytes(instr: RtlInstr): number
+export function instrBytes<E extends { ext: string } = ExtOpPayload>(instr: RtlInstr<E>): number
 {
     if (instr.op === "CALL") return 2
     if (instr.op === "BR_TABLE" || instr.op === "TRAP") return 2

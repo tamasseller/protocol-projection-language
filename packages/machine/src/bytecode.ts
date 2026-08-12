@@ -21,7 +21,7 @@
  * point rather than misinterpreting the byte or failing generically.
  */
 
-import type { RtlInstr, RtlProc, RtlProgram, BinaryOpcode, UnaryOpcode } from "./rtl"
+import type { RtlInstr, RtlProc, RtlProgram, BinaryOpcode, UnaryOpcode, ExtOpPayload } from "./rtl"
 import type { Extension } from "./extension"
 
 // ── LEB128 ───────────────────────────────────────────────────────────────
@@ -95,7 +95,7 @@ const UNARY_OPS: readonly UnaryOpcode[] = ["NEG", "NOT", "CLZ", "REVBITS"]
  *  addressing table doesn't have — isa-core.md §4.2 — which nothing in
  *  `rules.ts` should ever produce, but the codec checks anyway rather than
  *  silently emitting a wrong byte). */
-export function encodeInstr(instr: RtlInstr, extension?: Extension): number[]
+export function encodeInstr<E extends { ext: string } = ExtOpPayload>(instr: RtlInstr<E>, extension?: Extension<E>): number[]
 {
     if (instr.op === "EXT")
     {
@@ -162,7 +162,7 @@ export function encodeInstr(instr: RtlInstr, extension?: Extension): number[]
 }
 
 /** Encode a full instruction stream (one procedure's body — no header). */
-export function encodeBody(body: readonly RtlInstr[], extension?: Extension): Uint8Array
+export function encodeBody<E extends { ext: string } = ExtOpPayload>(body: readonly RtlInstr<E>[], extension?: Extension<E>): Uint8Array
 {
     return Uint8Array.from(body.flatMap(instr => encodeInstr(instr, extension)))
 }
@@ -171,7 +171,7 @@ export function encodeBody(body: readonly RtlInstr[], extension?: Extension): Ui
 
 /** Decode one instruction starting at `bytes[offset]`. Returns the decoded
  *  instruction and the offset of the byte just past it. */
-export function decodeInstr(bytes: Uint8Array, offset: number, extension?: Extension): { instr: RtlInstr; next: number }
+export function decodeInstr<E extends { ext: string } = ExtOpPayload>(bytes: Uint8Array, offset: number, extension?: Extension<E>): { instr: RtlInstr<E>; next: number }
 {
     if (offset >= bytes.length)
         throw new Error(`decodeInstr: ran off the end of the buffer at offset ${offset}`)
@@ -240,9 +240,9 @@ export function decodeInstr(bytes: Uint8Array, offset: number, extension?: Exten
  *  procedure's own byte range, sliced out by `decodeProgram` below, per
  *  §5.5). Throws if a trailing partial instruction would run past the end
  *  of the buffer. */
-export function decodeBody(bytes: Uint8Array, extension?: Extension): RtlInstr[]
+export function decodeBody<E extends { ext: string } = ExtOpPayload>(bytes: Uint8Array, extension?: Extension<E>): RtlInstr<E>[]
 {
-    const instrs: RtlInstr[] = []
+    const instrs: RtlInstr<E>[] = []
     let pos = 0
     while (pos < bytes.length)
     {
@@ -261,7 +261,7 @@ export function decodeBody(bytes: Uint8Array, extension?: Extension): RtlInstr[]
  *  header comment and §5.5 for why extension header fields never need to
  *  cross the wire (nothing has ever needed them to survive
  *  serialization). */
-export function encodeProgram(program: RtlProgram, extension?: Extension): Uint8Array
+export function encodeProgram<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E>, extension?: Extension<E>): Uint8Array
 {
     const bodies = program.procedures.map(proc => encodeBody(proc.body, extension))
     const table = program.procedures.flatMap((proc, i) =>
@@ -285,7 +285,7 @@ export function encodeProgram(program: RtlProgram, extension?: Extension): Uint8
  *  back-to-back (docs/codec-image.md §7) has no other way to know where
  *  this one ends and the next begins, since nothing here is
  *  self-delimiting from the *outside*. */
-export function decodeProgram(bytes: Uint8Array, offset: number = 0, extension?: Extension): { program: RtlProgram; next: number }
+export function decodeProgram<E extends { ext: string } = ExtOpPayload>(bytes: Uint8Array, offset: number = 0, extension?: Extension<E>): { program: RtlProgram<E>; next: number }
 {
     const countR = decodeLeb128(bytes, offset)
     const count = countR.value
@@ -300,7 +300,7 @@ export function decodeProgram(bytes: Uint8Array, offset: number = 0, extension?:
         pos = bodyLengthR.next
     }
 
-    const procedures: RtlProc[] = headers.map(({ argCount, bodyLength }) =>
+    const procedures: RtlProc<E>[] = headers.map(({ argCount, bodyLength }) =>
     {
         const body = decodeBody(bytes.subarray(pos, pos + bodyLength), extension)
         pos += bodyLength

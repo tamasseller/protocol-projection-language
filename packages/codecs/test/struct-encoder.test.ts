@@ -3,7 +3,7 @@
  *
  * `{x: u32, y: u16, flag: u8}`, encoder and decoder, each delegating per
  * field to a small fixed-width number codec via `CALL_CODEC` — exactly
- * §8.1's worked example. Hand-built `RtlProgram`s (no `ir`/lowering
+ * §8.1's worked example. Hand-built `RtlProgram<CodecExtInstr>`s (no `ir`/lowering
  * pipeline involved — see codec-extension.ts's file header and
  * extension.test.ts's "a call-shaped op actually invokes its callee" test
  * in @ppl/machine for why: a codec procedure's target is a *reference* to
@@ -17,8 +17,10 @@ import { describe, test } from "node:test"
 import assert from "node:assert/strict"
 
 import { struct, u8, u16, u32, buildTypeGraph } from "@ppl/core"
-import { extInstr, bare, validateProgram, run } from "@ppl/machine"
-import type { RtlProgram } from "@ppl/machine"
+import { bare, validateProgram, run } from "@ppl/machine"
+import { callCodecInstr, loadValInstr, readInstr, storeValInstr, writeInstr } from "../src/engine/codec-ext-instr"
+import type { CodecExtInstr } from "../src/engine/codec-ext-instr"
+import type { RtlProgram, RtlInstr } from "@ppl/machine"
 
 import { createCodecExtension } from "../src/engine/codec-extension"
 import type { Handle } from "../src/engine/codec-extension"
@@ -30,27 +32,27 @@ const graph = buildTypeGraph(structType)
  *  for decode, `width` bytes, little-endian (codec-extension.md §8.1's
  *  "unfused core spelling" collapsed to the minimum: no ENTER needed since
  *  `o0` already *is* the primitive, per §3.2's value-access table). */
-function numberCodecBody(direction: "encode" | "decode", width: number)
+function numberCodecBody(direction: "encode" | "decode", width: number): RtlInstr<CodecExtInstr>[]
 {
     return direction === "encode"
-        ? [extInstr("LOAD_VAL", [0]), extInstr("WRITE", [0, width]), bare("RETURN")]
-        : [extInstr("READ", [0, width]), extInstr("STORE_VAL", [0]), bare("RETURN")]
+        ? [loadValInstr(0), writeInstr(0, width), bare("RETURN")]
+        : [readInstr(0, width), storeValInstr(0), bare("RETURN")]
 }
 
 /** The entry procedure: delegate each field, in declaration order, to its
  *  number codec — codec-extension.md §8.1 verbatim (procedure indices
  *  1/2/3 for x/y/flag, assigned below in `program`). */
-function structCodecBody()
+function structCodecBody(): RtlInstr<CodecExtInstr>[]
 {
     return [
-        extInstr("CALL_CODEC", [1, 0, 0]), // x    (field #0) -> codec_u32
-        extInstr("CALL_CODEC", [2, 0, 1]), // y    (field #1) -> codec_u16
-        extInstr("CALL_CODEC", [3, 0, 2]), // flag (field #2) -> codec_u8
+        callCodecInstr(1, 0, 0), // x    (field #0) -> codec_u32
+        callCodecInstr(2, 0, 1), // y    (field #1) -> codec_u16
+        callCodecInstr(3, 0, 2), // flag (field #2) -> codec_u8
         bare("RETURN"),
     ]
 }
 
-function program(direction: "encode" | "decode"): RtlProgram
+function program(direction: "encode" | "decode"): RtlProgram<CodecExtInstr>
 {
     return {
         procedures: [

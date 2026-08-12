@@ -26,7 +26,7 @@
  */
 import {buildTypeGraph, TypeGraph} from "@ppl/core"
 import {projectCTypes, emitCHeader, CTypeDecl} from "@ppl/target-cpp"
-import {buildCodec, buildJsonEncoder, createCodecExtension, binaryEncodeRules, binaryDecodeRules, Handle} from "@ppl/codecs"
+import {buildCodec, buildJsonEncoder, createCodecExtension, binaryEncodeRules, binaryDecodeRules, Handle, CodecExtInstr} from "@ppl/codecs"
 import {validateProgram, run, RtlProgram} from "@ppl/machine"
 import {projectTSTypes, emitTSDeclarations, tsTypeRules, TSTypeDecl} from "@ppl/target-js"
 
@@ -55,10 +55,10 @@ export const cHeader: string = emitCHeader(cTypes)
  * itself (which of `binaryEncodeRules`/`binaryDecodeRules` runs is what
  * actually picks the direction now — see binary-rules.ts).
  */
-export const encodeProgram: RtlProgram = buildCodec(TelemetryPacket, binaryEncodeRules, undefined)
-export const decodeProgram: RtlProgram = buildCodec(TelemetryPacket, binaryDecodeRules, undefined)
+export const encodeProgram: RtlProgram<CodecExtInstr> = buildCodec(TelemetryPacket, binaryEncodeRules, undefined)
+export const decodeProgram: RtlProgram<CodecExtInstr> = buildCodec(TelemetryPacket, binaryDecodeRules, undefined)
 
-function runCodec(program: RtlProgram, ext: ReturnType<typeof createCodecExtension>): void
+function runCodec(program: RtlProgram<CodecExtInstr>, ext: ReturnType<typeof createCodecExtension>): void
 {
     validateProgram(program, ext)
     const result = run(program, ext)
@@ -102,7 +102,7 @@ export const decodedSample: unknown = decodeTelemetryPacket(encodedSample)
 /** Pretty-printed JSON of the same schema, from the same `graph.root` —
  *  encoder-only (json.ts's own file header), demonstrating the codec
  *  model isn't binary-only any more than it's bidirectional-only. */
-export const jsonProgram: RtlProgram = buildJsonEncoder(TelemetryPacket)
+export const jsonProgram: RtlProgram<CodecExtInstr> = buildJsonEncoder(TelemetryPacket)
 
 export function toJson(value: unknown): string
 {

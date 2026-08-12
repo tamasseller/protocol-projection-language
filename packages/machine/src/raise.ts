@@ -26,9 +26,17 @@
  * semantics, just with named locals instead of an indexed array — and it
  * costs nothing a target compiler's own copy propagation won't fold back
  * away where it's actually safe to.
+ *
+ * `<E>` (defaulted to `ExtOpPayload`, rtl.ts) mirrors `RtlInstr<E>`'s own
+ * type parameter: `Expr`'s `Ext` arm carries `E`'s own fields directly
+ * (spread in alongside `kind`/`args`) rather than a flat `{ext, operands}`
+ * pair, so a concrete extension with named-field operands (e.g.
+ * `@ppl/codecs`'s `CodecExtInstr`) gets those same names on the raised
+ * tree — a target backend consuming `Expr<CodecExtInstr>` reads `e.dst`/
+ * `e.src`/`e.ref` directly, never a positional `operands[N]`.
  */
 
-import type {RtlInstr, RtlProc, RtlProgram, BinaryOpcode, UnaryOpcode} from "./rtl"
+import type {RtlInstr, RtlProc, RtlProgram, BinaryOpcode, UnaryOpcode, RegCombo, StackCombo, ExtOpPayload} from "./rtl"
 import type {Extension} from "./extension"
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -59,13 +67,13 @@ export const enum ExprKind
     Ext = "ext",
 }
 
-export type Expr =
+export type Expr<E extends { ext: string } = ExtOpPayload> =
     | {kind: ExprKind.Const; value: number}
     | {kind: ExprKind.Slot; index: number}
-    | {kind: ExprKind.Binary; op: BinaryOpcode; left: Expr; right: Expr}
-    | {kind: ExprKind.Unary; op: UnaryOpcode; value: Expr}
-    | {kind: ExprKind.Call; calleeIndex: number; args: Expr[]}
-    | {kind: ExprKind.Ext; ext: string; operands: readonly number[]; args: Expr[]}
+    | {kind: ExprKind.Binary; op: BinaryOpcode; left: Expr<E>; right: Expr<E>}
+    | {kind: ExprKind.Unary; op: UnaryOpcode; value: Expr<E>}
+    | {kind: ExprKind.Call; calleeIndex: number; args: Expr<E>[]}
+    | ({kind: ExprKind.Ext} & E & {args: Expr<E>[]})
 
 export const enum StmtKind
 {
@@ -98,15 +106,15 @@ export const enum StmtKind
     Trap = "trap",
 }
 
-export type Stmt =
-    | {kind: StmtKind.Assign; slot: number; value: Expr}
-    | {kind: StmtKind.ExprStmt; value: Expr}
-    | {kind: StmtKind.Dispatch; test: Expr; cases: Stmt[][]}
-    | {kind: StmtKind.Loop; cond: Stmt[]; test: Expr; body: Stmt[]}
-    | {kind: StmtKind.Return; value: Expr}
+export type Stmt<E extends { ext: string } = ExtOpPayload> =
+    | {kind: StmtKind.Assign; slot: number; value: Expr<E>}
+    | {kind: StmtKind.ExprStmt; value: Expr<E>}
+    | {kind: StmtKind.Dispatch; test: Expr<E>; cases: Stmt<E>[][]}
+    | {kind: StmtKind.Loop; cond: Stmt<E>[]; test: Expr<E>; body: Stmt<E>[]}
+    | {kind: StmtKind.Return; value: Expr<E>}
     | {kind: StmtKind.Trap; code: number}
 
-export interface RaisedProc
+export interface RaisedProc<E extends { ext: string } = ExtOpPayload>
 {
     argCount: number
     /** High-water mark of live slot indices — the frame size a target
@@ -115,16 +123,16 @@ export interface RaisedProc
      *  figure; recomputed here rather than threaded in from validate.ts so
      *  this module has no dependency on it). */
     peakSlots: number
-    body: Stmt[]
+    body: Stmt<E>[]
 }
 
-const slotExpr = (index: number): Expr => ({kind: ExprKind.Slot, index})
+const slotExpr = <E extends { ext: string } = ExtOpPayload>(index: number): Expr<E> => ({kind: ExprKind.Slot, index})
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Entry points
 // ─────────────────────────────────────────────────────────────────────────────
 
-export function raiseProgram(program: RtlProgram, extension?: Extension): RaisedProc[]
+export function raiseProgram<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E>, extension?: Extension<E>): RaisedProc<E>[]
 {
     return program.procedures.map(proc => raiseProc(proc, program, extension))
 }
@@ -134,9 +142,9 @@ export function raiseProgram(program: RtlProgram, extension?: Extension): Raised
  *  (isa-core.md §4.6's last-arg-in-acc convention) — mirrors vm.ts's CALL
  *  case reaching into `program.procedures[calleeIndex]` for the same
  *  reason. */
-export function raiseProc(proc: RtlProc, program: RtlProgram, extension?: Extension): RaisedProc
+export function raiseProc<E extends { ext: string } = ExtOpPayload>(proc: RtlProc<E>, program: RtlProgram<E>, extension?: Extension<E>): RaisedProc<E>
 {
-    const raiser = new Raiser(proc.body, proc.argCount, program, extension)
+    const raiser = new Raiser<E>(proc.body, proc.argCount, program, extension)
     const body = raiser.top()
     return {argCount: proc.argCount, peakSlots: raiser.peakSlots, body}
 }
@@ -145,9 +153,9 @@ export function raiseProc(proc: RtlProc, program: RtlProgram, extension?: Extens
 // Raiser — one procedure body's worth of cursor + symbolic acc/stack state
 // ─────────────────────────────────────────────────────────────────────────────
 
-type PendingAcc = {expr: Expr; pure: boolean}
+type PendingAcc<E extends { ext: string } = ExtOpPayload> = {expr: Expr<E>; pure: boolean}
 
-class Raiser
+class Raiser<E extends { ext: string } = ExtOpPayload>
 {
     private pc = 0
     private tos: number
@@ -172,18 +180,25 @@ class Raiser
     // safe, always-valid stand-in (pure CONST 0, never flushed as a
     // statement) rather than building merge-slot machinery nothing here
     // needs yet.
-    private acc: PendingAcc | undefined = Raiser.unknownAcc()
+    private acc: PendingAcc<E> | undefined = this.unknownAcc()
 
-    private static unknownAcc(): PendingAcc
+    // Instance method (not static) purely so it can be typed against this
+    // Raiser instance's own `E` — a static member has no access to a
+    // generic class's instance type parameter, but the field initializer
+    // above (and `closedBlock()` below) both need one. Available on the
+    // prototype before any field initializer runs, regardless of its
+    // position in the class body, so referencing it from `acc`'s own
+    // initializer above is safe.
+    private unknownAcc(): PendingAcc<E>
     {
         return {expr: {kind: ExprKind.Const, value: 0}, pure: true}
     }
 
     constructor(
-        private readonly body: readonly RtlInstr[],
+        private readonly body: readonly RtlInstr<E>[],
         argCount: number,
-        private readonly program: RtlProgram,
-        private readonly extension?: Extension,
+        private readonly program: RtlProgram<E>,
+        private readonly extension?: Extension<E>,
     )
     {
         this.tos = argCount
@@ -195,7 +210,7 @@ class Raiser
     /** The top-level procedure body: never wrapped by its own BR_TABLE case
      *  or LOOP sub-block, so it has no entryTos of its own to restore — it
      *  simply runs to its own RETURN/TRAP. */
-    top(): Stmt[]
+    top(): Stmt<E>[]
     {
         return this.closedBlock()
     }
@@ -205,13 +220,13 @@ class Raiser
         if(this.tos > this.peak) this.peak = this.tos
     }
 
-    private readAcc(): Expr
+    private readAcc(): Expr<E>
     {
         if(!this.acc) throw new Error(`raise: read of acc before it was ever set at pc ${this.pc}`)
         return this.acc.expr
     }
 
-    private setAcc(expr: Expr, pure: boolean): void
+    private setAcc(expr: Expr<E>, pure: boolean): void
     {
         this.acc = {expr, pure}
     }
@@ -221,7 +236,7 @@ class Raiser
      *  it would lose an unobserved side effect (a CALL/EXT result nothing
      *  ever consumed, e.g. a bare `foo();` statement immediately followed by
      *  code that reloads acc from scratch). */
-    private killAcc(stmts: Stmt[]): void
+    private killAcc(stmts: Stmt<E>[]): void
     {
         if(this.acc && !this.acc.pure) stmts.push({kind: StmtKind.ExprStmt, value: this.acc.expr})
         this.acc = undefined
@@ -233,7 +248,7 @@ class Raiser
      *  STORE/PUSH leave acc's bits untouched, so a later read of "the same
      *  value" reads back through the slot rather than re-embedding (and
      *  re-evaluating) whatever produced it. */
-    private materialize(stmts: Stmt[], index: number): void
+    private materialize(stmts: Stmt<E>[], index: number): void
     {
         stmts.push({kind: StmtKind.Assign, slot: index, value: this.readAcc()})
         this.setAcc(slotExpr(index), true)
@@ -256,11 +271,11 @@ class Raiser
      *  What the *outer* continuation sees afterward is `unknownAcc()`, not
      *  `undefined` — see its own doc comment for why that's the correct
      *  model here, not just a crash-avoidance workaround. */
-    private closedBlock(): Stmt[]
+    private closedBlock(): Stmt<E>[]
     {
         const {stmts, trailing} = this.blockBody()
         if(trailing && !trailing.pure) stmts.push({kind: StmtKind.ExprStmt, value: trailing.expr})
-        this.acc = Raiser.unknownAcc()
+        this.acc = this.unknownAcc()
         return stmts
     }
 
@@ -286,9 +301,9 @@ class Raiser
      * LOOP's condition sub-block as `test`) — undefined on a RETURN/TRAP
      * or true-end close, since none of those three leave a usable value.
      */
-    private blockBody(): {stmts: Stmt[]; trailing?: PendingAcc}
+    private blockBody(): {stmts: Stmt<E>[]; trailing?: PendingAcc<E>}
     {
-        const stmts: Stmt[] = []
+        const stmts: Stmt<E>[] = []
         for(;;)
         {
             const i = this.body[this.pc]
@@ -376,7 +391,7 @@ class Raiser
                     this.acc = undefined
                     this.pc++
 
-                    const cases: Stmt[][] = []
+                    const cases: Stmt<E>[][] = []
                     for(let k = 0; k < n; k++)
                         cases.push(this.withBlock(() => this.closedBlock()))
 
@@ -415,7 +430,7 @@ class Raiser
                     if(this.tos < stackArgs)
                         throw new Error(`raise: CALL ${i.calleeIndex} at pc ${this.pc}: only ${this.tos} value(s) on the stack, need ${stackArgs}`)
 
-                    const args: Expr[] = []
+                    const args: Expr<E>[] = []
                     if(callee.argCount > 0)
                     {
                         const prev = this.acc
@@ -465,9 +480,17 @@ class Raiser
                     const n = -effect.tosDelta
                     if(this.tos < n) throw new Error(`raise: EXT ${i.ext} at pc ${this.pc}: only ${this.tos} value(s) on the stack, need ${n}`)
                     this.tos -= n
-                    const args = Array.from({length: n}, (_, k) => slotExpr(this.tos + k))
+                    const args = Array.from({length: n}, (_, k) => slotExpr<E>(this.tos + k))
                     if(priorAcc) args.push(priorAcc.expr)
-                    this.setAcc({kind: ExprKind.Ext, ext: i.ext, operands: i.operands, args}, false)
+                    // Spread `i`'s own payload fields (everything E declares
+                    // — e.g. CodecExtInstr's `dst`/`src`/`ref` for ENTER —
+                    // minus the RTL-only `op` tag, which the raised tree has
+                    // no use for; `kind` is the tree's own discriminant) so
+                    // a concrete extension's named fields survive onto the
+                    // raised `Expr` node unchanged, alongside the popped/
+                    // acc-sourced `args`.
+                    const {op: _op, ...payload} = i
+                    this.setAcc({kind: ExprKind.Ext, ...payload, args} as Expr<E>, false)
                     this.pc++
                     continue
                 }
@@ -478,7 +501,7 @@ class Raiser
         }
     }
 
-    private binary(stmts: Stmt[], i: Extract<RtlInstr, {op: BinaryOpcode}>): void
+    private binary(stmts: Stmt<E>[], i: { op: BinaryOpcode; combo: RegCombo; target: number } | { op: BinaryOpcode; combo: "IMM_ACC"; imm: number } | { op: BinaryOpcode; combo: StackCombo }): void
     {
         const prev = this.acc
         if(!prev) throw new Error(`raise: ${i.op} with no acc value at pc ${this.pc}`)

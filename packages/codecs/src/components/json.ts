@@ -49,6 +49,7 @@ import { concreteKindOf, SemanticTypeKinds, pInteger, pUnit, pList, pUnionFields
 import { codecRules } from "../engine/codec-extension"
 import type { CodecRule } from "../engine/resolver"
 import { createCodecResolver, codecRule } from "../engine/resolver"
+import type { CodecExtInstr } from "../engine/codec-ext-instr"
 
 const indent = (depth: number): string => "  ".repeat(depth)
 
@@ -191,7 +192,7 @@ function jsonUnionBody(match: UnionFieldsMatch, depth: number, resolve: Resolve)
 
 /** Build an encode-only `RtlProgram` that pretty-prints `root` as JSON.
  *  There is no decode-direction counterpart — see the file header. */
-export function buildJsonEncoder(root: SemanticType): RtlProgram
+export function buildJsonEncoder(root: SemanticType): RtlProgram<CodecExtInstr>
 {
     // `emit_decimal` is reserved lazily, on first actual need — a fresh
     // singleton per `buildJsonEncoder` call, shared by every integer node

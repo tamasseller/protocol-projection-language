@@ -29,7 +29,7 @@
  */
 
 import assert from "assert"
-import type {RtlProgram, RtlProc, RtlInstr} from "./rtl"
+import type {RtlProgram, RtlProc, RtlInstr, ExtOpPayload} from "./rtl"
 import type {Extension} from "./extension"
 
 const MAX_STEPS = 10_000_000
@@ -103,7 +103,7 @@ export function evalUnary(V: number, op: RtlInstr["op"]): number
 // sub-blocks; "skip a block" = advance until a BLOCK_END/terminator at this
 // level, skipping any nested construct whole along the way.
 
-function skipConstruct(body: RtlInstr[], pc: number): number
+function skipConstruct<E extends { ext: string } = ExtOpPayload>(body: RtlInstr<E>[], pc: number): number
 {
     const opener = body[pc]
     if(opener.op === "BR_TABLE") return skipBlocks(body, pc + 1, opener.imm)
@@ -112,7 +112,7 @@ function skipConstruct(body: RtlInstr[], pc: number): number
 
 /** Skip over `count` sibling blocks starting at `pc`; return the pc just
  *  past the last one. `count === 0` is a no-op (already past the last). */
-function skipBlocks(body: RtlInstr[], pc: number, count: number): number
+function skipBlocks<E extends { ext: string } = ExtOpPayload>(body: RtlInstr<E>[], pc: number, count: number): number
 {
     let p = pc
     for(let k = 0; k < count; k++)
@@ -144,7 +144,7 @@ type BlockFrame =
 /** Run one procedure to completion. All VM state is local to this call —
  *  a nested CALL is just a nested call to this function, against
  *  `program`'s procedure table. */
-function runProc(program: RtlProgram, proc: RtlProc, args: readonly number[], extension?: Extension): {acc: number; steps: number}
+function runProc<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E>, proc: RtlProc<E>, args: readonly number[], extension?: Extension<E>): {acc: number; steps: number}
 {
     const body = proc.body
     const regs: number[] = [...args]
@@ -178,7 +178,7 @@ function runProc(program: RtlProgram, proc: RtlProc, args: readonly number[], ex
         },
     }
 
-    function operand(i: RtlInstr): number
+    function operand(i: RtlInstr<E>): number
     {
         if(!("combo" in i)) return 0
         switch(i.combo)
@@ -197,7 +197,7 @@ function runProc(program: RtlProgram, proc: RtlProc, args: readonly number[], ex
         }
     }
 
-    function writeResult(i: RtlInstr, value: number): void
+    function writeResult(i: RtlInstr<E>, value: number): void
     {
         const v = value >>> 0
         if(!("combo" in i)) { acc = v; return }
@@ -351,7 +351,7 @@ export interface VmResult
     steps: number
 }
 
-export function run(prog: RtlProgram, extension?: Extension): VmResult
+export function run<E extends { ext: string } = ExtOpPayload>(prog: RtlProgram<E>, extension?: Extension<E>): VmResult
 {
     if(prog.procedures.length === 0) throw new Error(`empty program`)
 

@@ -17,14 +17,19 @@
  */
 
 import type { Extension, ExecState, ExtOpEffect } from "@ppl/machine"
-import type { ExtInstr } from "@ppl/machine"
 import type { Rule } from "@ppl/machine"
-import { rule, leafNode, unaryNode, extInstr, pBuiltinCall, pConst, pIdentifier, pRtl } from "@ppl/machine"
+import { rule, leafNode, unaryNode, pBuiltinCall, pConst, pIdentifier, pRtl } from "@ppl/machine"
 import type { IntegerType, TypeNode } from "@ppl/core"
 import { kindOf, SemanticTypeKinds } from "@ppl/core"
 import type { CodecOpcode } from "./opcodes"
-import { isCodecOpcode, assertNever } from "./opcodes"
+import { assertNever } from "./opcodes"
 import { codecWireCodec } from "./wire"
+import type { CodecExtInstr } from "./codec-ext-instr"
+import {
+    enterInstr, enterNextInstr, loadValInstr, storeValInstr, countInstr, tagInstr, openListInstr,
+    readInstr, writeInstr, hasNextInstr, cloneRdInstr, cloneWrInstr, seekInstr,
+    callCodecInstr, callCodecNextInstr, writeSeqInstr, readSeqInstr,
+} from "./codec-ext-instr"
 
 export type Direction = "encode" | "decode"
 
@@ -144,7 +149,7 @@ type Frame = Handle[]
  *  CODEC_EFFECTS})` without needing a real `Handle`/buffer just to get at
  *  `exec()`'s own `Extension` object — `raiseProgram` only ever reads
  *  `.effects`, never `.exec`/`.rules`/`.codec`. */
-export const CODEC_EFFECTS: Readonly<Record<CodecOpcode, ExtOpEffect>> = {
+export const CODEC_EFFECTS: Readonly<Record<CodecOpcode, ExtOpEffect<CodecExtInstr>>> = {
     ENTER:      { tosDelta: 0, maxTransient: 0 },
     ENTER_NEXT: { tosDelta: 0, maxTransient: 0 },
     LOAD_VAL:   { tosDelta: 0, maxTransient: 0 },
@@ -170,11 +175,11 @@ export const CODEC_EFFECTS: Readonly<Record<CodecOpcode, ExtOpEffect>> = {
     SEEK:       { tosDelta: 0, maxTransient: 0 },
     // §3.3/§4: CALL_CODEC codec_idx, src, ref, [args...] — validate.ts
     // derives the actual pop count from the resolved callee's own
-    // argCount header (extension.ts's `ExtOpEffect.call` doc comment), so
-    // this declaration doesn't need to (and can't) know each call site's
-    // codec's arity itself.
-    CALL_CODEC:      { tosDelta: 0, maxTransient: 0, call: { calleeOperandIndex: 0 } },
-    CALL_CODEC_NEXT: { tosDelta: 0, maxTransient: 0, call: { calleeOperandIndex: 0 } },
+    // argCount header (extension.ts's `ExtOpEffect.calleeOf` doc comment),
+    // so this declaration doesn't need to (and can't) know each call
+    // site's codec's arity itself.
+    CALL_CODEC:      { tosDelta: 0, maxTransient: 0, calleeOf: instr => instr.ext === "CALL_CODEC" ? instr.calleeIndex : undefined },
+    CALL_CODEC_NEXT: { tosDelta: 0, maxTransient: 0, calleeOf: instr => instr.ext === "CALL_CODEC_NEXT" ? instr.calleeIndex : undefined },
     // ROADMAP.md item 11: bulk transfer of `acc` (the element count) many
     // elements between a stream iterator and a list handle's own array
     // storage — the "snatch point" a target codegen can specialize into a
@@ -228,40 +233,49 @@ export const CODEC_EFFECTS: Readonly<Record<CodecOpcode, ExtOpEffect>> = {
  *  still-unimplemented optional runtime value args (docs/codec-
  *  extension.md §3.3, §4: `codec_idx, src, ref, [args…]`) whenever that
  *  lands. */
-export function codecRules(_resolveLocal: (name: string) => number, resolveCallee: (name: string) => number | undefined): Rule[]
+export function codecRules(_resolveLocal: (name: string) => number, resolveCallee: (name: string) => number | undefined): Rule<CodecExtInstr>[]
 {
     return [
         rule("codec:enter", pBuiltinCall("enter", pConst(), pConst(), pConst()), m =>
-            leafNode(["acc"], [extInstr("ENTER", m.argumentMatches.map(a => a.value))], [], 0, 0)),
+        {
+            const [dst, src, ref] = m.argumentMatches
+            return leafNode<CodecExtInstr>(["acc"], [enterInstr(dst.value, src.value, ref.value)], [], 0, 0)
+        }),
 
         rule("codec:enter_next", pBuiltinCall("enter_next", pConst(), pConst()), m =>
-            leafNode(["acc"], [extInstr("ENTER_NEXT", m.argumentMatches.map(a => a.value))], [], 0, 0)),
+        {
+            const [dst, src] = m.argumentMatches
+            return leafNode<CodecExtInstr>(["acc"], [enterNextInstr(dst.value, src.value)], [], 0, 0)
+        }),
 
         rule("codec:load_val", pBuiltinCall("load_val", pConst()), m =>
-            leafNode(["acc"], [extInstr("LOAD_VAL", m.argumentMatches.map(a => a.value))], [], 0, 0)),
+            leafNode<CodecExtInstr>(["acc"], [loadValInstr(m.argumentMatches[0].value)], [], 0, 0)),
 
         rule("codec:count", pBuiltinCall("count", pConst()), m =>
-            leafNode(["acc"], [extInstr("COUNT", m.argumentMatches.map(a => a.value))], [], 0, 0)),
+            leafNode<CodecExtInstr>(["acc"], [countInstr(m.argumentMatches[0].value)], [], 0, 0)),
 
         rule("codec:tag", pBuiltinCall("tag", pConst()), m =>
-            leafNode(["acc"], [extInstr("TAG", m.argumentMatches.map(a => a.value))], [], 0, 0)),
+            leafNode<CodecExtInstr>(["acc"], [tagInstr(m.argumentMatches[0].value)], [], 0, 0)),
 
         rule("codec:open_list", pBuiltinCall("open_list", pConst()), m =>
-            leafNode(["acc"], [extInstr("OPEN_LIST", m.argumentMatches.map(a => a.value))], [], 0, 0)),
+            leafNode<CodecExtInstr>(["acc"], [openListInstr(m.argumentMatches[0].value)], [], 0, 0)),
 
         rule("codec:read", pBuiltinCall("read", pConst(), pConst()), m =>
-            leafNode(["acc"], [extInstr("READ", m.argumentMatches.map(a => a.value))], [], 0, 0)),
+        {
+            const [iter, width] = m.argumentMatches
+            return leafNode<CodecExtInstr>(["acc"], [readInstr(iter.value, width.value)], [], 0, 0)
+        }),
 
         rule("codec:write", pBuiltinCall("write", pConst(), pConst(), pRtl("acc")), m =>
         {
             const [iter, width, value] = m.argumentMatches
-            return unaryNode(value.node, ["acc"], [...value.node.fragment, extInstr("WRITE", [iter.value, width.value])])
+            return unaryNode<CodecExtInstr>(value.node, ["acc"], [...value.node.fragment, writeInstr(iter.value, width.value)])
         }),
 
         rule("codec:store_val", pBuiltinCall("store_val", pConst(), pRtl("acc")), m =>
         {
             const [src, value] = m.argumentMatches
-            return unaryNode(value.node, ["acc"], [...value.node.fragment, extInstr("STORE_VAL", [src.value])])
+            return unaryNode<CodecExtInstr>(value.node, ["acc"], [...value.node.fragment, storeValInstr(src.value)])
         }),
 
         // `write_seq(iter, handle, width, count)` / `read_seq(iter, handle,
@@ -273,25 +287,31 @@ export function codecRules(_resolveLocal: (name: string) => number, resolveCalle
         rule("codec:write_seq", pBuiltinCall("write_seq", pConst(), pConst(), pConst(), pRtl("acc")), m =>
         {
             const [iter, handle, width, count] = m.argumentMatches
-            return unaryNode(count.node, ["acc"],
-                [...count.node.fragment, extInstr("WRITE_SEQ", [iter.value, handle.value, width.value])])
+            return unaryNode<CodecExtInstr>(count.node, ["acc"],
+                [...count.node.fragment, writeSeqInstr(iter.value, handle.value, width.value)])
         }),
 
         rule("codec:read_seq", pBuiltinCall("read_seq", pConst(), pConst(), pConst(), pConst(), pRtl("acc")), m =>
         {
             const [iter, handle, width, signed, count] = m.argumentMatches
-            return unaryNode(count.node, ["acc"],
-                [...count.node.fragment, extInstr("READ_SEQ", [iter.value, handle.value, width.value, signed.value])])
+            return unaryNode<CodecExtInstr>(count.node, ["acc"],
+                [...count.node.fragment, readSeqInstr(iter.value, handle.value, width.value, signed.value)])
         }),
 
         rule("codec:has_next", pBuiltinCall("has_next", pConst()), m =>
-            leafNode(["acc"], [extInstr("HAS_NEXT", m.argumentMatches.map(a => a.value))], [], 0, 0)),
+            leafNode<CodecExtInstr>(["acc"], [hasNextInstr(m.argumentMatches[0].value)], [], 0, 0)),
 
         rule("codec:clone_rd", pBuiltinCall("clone_rd", pConst(), pConst()), m =>
-            leafNode(["acc"], [extInstr("CLONE_RD", m.argumentMatches.map(a => a.value))], [], 0, 0)),
+        {
+            const [src, dst] = m.argumentMatches
+            return leafNode<CodecExtInstr>(["acc"], [cloneRdInstr(src.value, dst.value)], [], 0, 0)
+        }),
 
         rule("codec:clone_wr", pBuiltinCall("clone_wr", pConst(), pConst()), m =>
-            leafNode(["acc"], [extInstr("CLONE_WR", m.argumentMatches.map(a => a.value))], [], 0, 0)),
+        {
+            const [src, dst] = m.argumentMatches
+            return leafNode<CodecExtInstr>(["acc"], [cloneWrInstr(src.value, dst.value)], [], 0, 0)
+        }),
 
         // `pConst()` alone is enough for a *negative* delta too: `-4` parses
         // as `UnaryExpression("-", Literal(4))` (matcher.ts), but
@@ -299,14 +319,17 @@ export function codecRules(_resolveLocal: (name: string) => number, resolveCalle
         // other — resolves it to a plain constant wherever a `pConst()`
         // position asks, so no second rule is needed for the negative case.
         rule("codec:seek", pBuiltinCall("seek", pConst(), pConst()), m =>
-            leafNode(["acc"], [extInstr("SEEK", m.argumentMatches.map(a => a.value))], [], 0, 0)),
+        {
+            const [iter, delta] = m.argumentMatches
+            return leafNode<CodecExtInstr>(["acc"], [seekInstr(iter.value, delta.value)], [], 0, 0)
+        }),
 
         rule("codec:call_codec", pBuiltinCall("call_codec", pIdentifier(), pConst(), pConst()), m =>
         {
             const [callee, src, ref] = m.argumentMatches
             const calleeIndex = resolveCallee(callee.name)
             if(calleeIndex === undefined) return undefined
-            return leafNode(["acc"], [extInstr("CALL_CODEC", [calleeIndex, src.value, ref.value])], [], 0, 0)
+            return leafNode<CodecExtInstr>(["acc"], [callCodecInstr(calleeIndex, src.value, ref.value)], [], 0, 0)
         }),
 
         rule("codec:call_codec_next", pBuiltinCall("call_codec_next", pIdentifier(), pConst()), m =>
@@ -314,7 +337,7 @@ export function codecRules(_resolveLocal: (name: string) => number, resolveCalle
             const [callee, src] = m.argumentMatches
             const calleeIndex = resolveCallee(callee.name)
             if(calleeIndex === undefined) return undefined
-            return leafNode(["acc"], [extInstr("CALL_CODEC_NEXT", [calleeIndex, src.value])], [], 0, 0)
+            return leafNode<CodecExtInstr>(["acc"], [callCodecNextInstr(calleeIndex, src.value)], [], 0, 0)
         }),
     ]
 }
@@ -435,7 +458,7 @@ interface StreamIter
  *                   whatever the frame does next — unlike the per-frame
  *                   handle table above.
  */
-export function createCodecExtension(direction: Direction, root: Handle, buffer: number[]): Extension
+export function createCodecExtension(direction: Direction, root: Handle, buffer: number[]): Extension<CodecExtInstr>
 {
     const frames: Frame[] = [[root]]
     const iters: StreamIter[] = [{ pos: 0, capability: direction === "encode" ? "write" : "read", overwriteOnly: false }]
@@ -448,32 +471,33 @@ export function createCodecExtension(direction: Direction, root: Handle, buffer:
         return it
     }
 
-    function exec(instr: ExtInstr, state: ExecState): void
+    function exec(instr: CodecExtInstr, state: ExecState): void
     {
         const frame = top()
 
-        if(!isCodecOpcode(instr.ext)) throw new Error(`codec extension: unhandled opcode EXT ${instr.ext}`)
-        const op: CodecOpcode = instr.ext
-
-        switch(op)
+        // Switching on `instr.ext` directly (not a separately-assigned
+        // `op` local) is what lets each case below narrow `instr` itself
+        // to its own variant and read named fields straight off it —
+        // assigning `op` first breaks that narrowing link back to `instr`.
+        switch(instr.ext)
         {
             case "ENTER":
             {
-                const [dst, src, ref] = instr.operands as readonly [number, number, number]
+                const { dst, src, ref } = instr
                 frame[dst] = computeChild(frame, src, ref, direction)
                 return
             }
 
             case "ENTER_NEXT":
             {
-                const [dst, src] = instr.operands as readonly [number, number]
+                const { dst, src } = instr
                 frame[dst] = computeNext(frame, src, direction)
                 return
             }
 
             case "LOAD_VAL":
             {
-                const [src] = instr.operands as readonly [number]
+                const { src } = instr
                 const h = frame[src]
                 if(!h) throw new Error(`codec extension: LOAD_VAL on unbound handle ${src}`)
                 state.acc = (get(h) as number) >>> 0
@@ -482,7 +506,7 @@ export function createCodecExtension(direction: Direction, root: Handle, buffer:
 
             case "STORE_VAL":
             {
-                const [src] = instr.operands as readonly [number]
+                const { src } = instr
                 const h = frame[src]
                 if(!h) throw new Error(`codec extension: STORE_VAL on unbound handle ${src}`)
                 const value = kindOf(h.type.type) === SemanticTypeKinds.Integer
@@ -494,7 +518,7 @@ export function createCodecExtension(direction: Direction, root: Handle, buffer:
 
             case "COUNT":
             {
-                const [src] = instr.operands as readonly [number]
+                const { src } = instr
                 const h = frame[src]
                 if(!h) throw new Error(`codec extension: COUNT on unbound handle ${src}`)
                 state.acc = (get(h) as unknown[]).length >>> 0
@@ -503,7 +527,7 @@ export function createCodecExtension(direction: Direction, root: Handle, buffer:
 
             case "TAG":
             {
-                const [src] = instr.operands as readonly [number]
+                const { src } = instr
                 const h = frame[src]
                 if(!h) throw new Error(`codec extension: TAG on unbound handle ${src}`)
                 const active = get(h) as UnionValue
@@ -515,7 +539,7 @@ export function createCodecExtension(direction: Direction, root: Handle, buffer:
 
             case "OPEN_LIST":
             {
-                const [src] = instr.operands as readonly [number]
+                const { src } = instr
                 const h = frame[src]
                 if(!h) throw new Error(`codec extension: OPEN_LIST on unbound handle ${src}`)
                 set(h, []) // capacity hint in acc intentionally ignored — §3.4
@@ -524,7 +548,7 @@ export function createCodecExtension(direction: Direction, root: Handle, buffer:
 
             case "READ":
             {
-                const [iterId, width] = instr.operands as readonly [number, number]
+                const { iter: iterId, width } = instr
                 const it = iterAt(iterId)
                 if(it.capability !== "read") throw new Error(`codec extension: READ on write-only iterator ${iterId}`)
                 let value = 0
@@ -536,7 +560,7 @@ export function createCodecExtension(direction: Direction, root: Handle, buffer:
 
             case "WRITE":
             {
-                const [iterId, width] = instr.operands as readonly [number, number]
+                const { iter: iterId, width } = instr
                 const it = iterAt(iterId)
                 if(it.capability !== "write") throw new Error(`codec extension: WRITE on read-only iterator ${iterId}`)
                 if(it.overwriteOnly && it.pos + width > buffer.length)
@@ -552,7 +576,7 @@ export function createCodecExtension(direction: Direction, root: Handle, buffer:
 
             case "HAS_NEXT":
             {
-                const [iterId] = instr.operands as readonly [number]
+                const { iter: iterId } = instr
                 const it = iterAt(iterId)
                 if(it.capability !== "read") throw new Error(`codec extension: HAS_NEXT on write-only iterator ${iterId}`)
                 state.acc = it.pos < buffer.length ? 1 : 0
@@ -561,21 +585,21 @@ export function createCodecExtension(direction: Direction, root: Handle, buffer:
 
             case "CLONE_RD":
             {
-                const [src, dst] = instr.operands as readonly [number, number]
+                const { src, dst } = instr
                 iters[dst] = { pos: iterAt(src).pos, capability: "read", overwriteOnly: false }
                 return
             }
 
             case "CLONE_WR":
             {
-                const [src, dst] = instr.operands as readonly [number, number]
+                const { src, dst } = instr
                 iters[dst] = { pos: iterAt(src).pos, capability: "write", overwriteOnly: true }
                 return
             }
 
             case "SEEK":
             {
-                const [iterId, delta] = instr.operands as readonly [number, number]
+                const { iter: iterId, delta } = instr
                 const it = iterAt(iterId)
                 if(it.pos + delta < 0) throw new Error(`codec extension: SEEK would move iterator ${iterId} before the stream's start`)
                 it.pos += delta
@@ -584,26 +608,26 @@ export function createCodecExtension(direction: Direction, root: Handle, buffer:
 
             case "CALL_CODEC":
             {
-                const [codecIdx, src, ref] = instr.operands as readonly [number, number, number]
+                const { calleeIndex, src, ref } = instr
                 const child = computeChild(frame, src, ref, direction)
                 frames.push([child])
-                try { state.acc = state.callProc(codecIdx, []) }
+                try { state.acc = state.callProc(calleeIndex, []) }
                 finally { frames.pop() }
                 return
             }
 
             case "CALL_CODEC_NEXT":
             {
-                const [codecIdx, src] = instr.operands as readonly [number, number]
+                const { calleeIndex, src } = instr
                 const child = computeNext(frame, src, direction)
                 frames.push([child])
-                try { state.acc = state.callProc(codecIdx, []) }
+                try { state.acc = state.callProc(calleeIndex, []) }
                 finally { frames.pop() }
                 return
             }
 
             // ROADMAP.md item 11: bulk transfer, `acc` many elements, each
-            // `width` bytes, between `iterId` and `handleId`'s own array
+            // `width` bytes, between `iter` and `handle`'s own array
             // storage. Always the dumb per-element pump loop here — the
             // "generic semantics first" half of §11's split; a target
             // codegen recognizing this op at `raise.ts` time is free to
@@ -611,7 +635,7 @@ export function createCodecExtension(direction: Direction, root: Handle, buffer:
             // about `exec`/`validateProgram`/`run` needs to know that.
             case "WRITE_SEQ":
             {
-                const [iterId, handleId, width] = instr.operands as readonly [number, number, number]
+                const { iter: iterId, handle: handleId, width } = instr
                 const it = iterAt(iterId)
                 if(it.capability !== "write") throw new Error(`codec extension: WRITE_SEQ on read-only iterator ${iterId}`)
                 const h = frame[handleId]
@@ -634,7 +658,7 @@ export function createCodecExtension(direction: Direction, root: Handle, buffer:
 
             case "READ_SEQ":
             {
-                const [iterId, handleId, width, signed] = instr.operands as readonly [number, number, number, number]
+                const { iter: iterId, handle: handleId, width, signed } = instr
                 const it = iterAt(iterId)
                 if(it.capability !== "read") throw new Error(`codec extension: READ_SEQ on write-only iterator ${iterId}`)
                 const h = frame[handleId]
@@ -653,7 +677,7 @@ export function createCodecExtension(direction: Direction, root: Handle, buffer:
             }
 
             default:
-                return assertNever(op)
+                return assertNever(instr)
         }
     }
 

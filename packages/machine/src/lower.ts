@@ -23,6 +23,7 @@ import type {
     ExpressionStatement, Expression,
 } from "./ast"
 import {RtlProc, RtlProgram, RtlInstr, bare, brTable} from "./rtl"
+import type {ExtOpPayload} from "./rtl"
 import type {Procedure} from "./ir"
 import assert from "assert"
 import {Rule, ruleset} from "./rules"
@@ -32,7 +33,7 @@ import type {Extension} from "./extension"
 // Register allocator
 // ─────────────────────────────────────────────────────────────────────────────
 
-class RegAlloc
+class RegAlloc<E extends { ext: string } = ExtOpPayload>
 {
     private map = new Map<string, number>()
     private next: number
@@ -47,15 +48,15 @@ class RegAlloc
      * argument) already put at those low indices.
      */
     constructor(
-        private _parent?: RegAlloc,
+        private _parent?: RegAlloc<E>,
         private _resolveCallee?: (name: string) => number | undefined,
-        private _extension?: Extension,
+        private _extension?: Extension<E>,
     )
     {
         this.next = _parent?.next ?? 0
     }
 
-    get parent(): RegAlloc | undefined {return this._parent}
+    get parent(): RegAlloc<E> | undefined {return this._parent}
 
     /** A nested scope (`new RegAlloc(alloc)`, no second argument) has no
      *  callee resolver of its own — it inherits the enclosing procedure's,
@@ -75,7 +76,7 @@ class RegAlloc
 
     /** A nested scope has no `Extension` of its own — it inherits the
      *  enclosing procedure's, same as `resolveCallee`. */
-    get extension(): Extension | undefined
+    get extension(): Extension<E> | undefined
     {
         return this._extension ?? this._parent?.extension
     }
@@ -100,9 +101,9 @@ class RegAlloc
         return this._parent?.resolve(name)
     }
 
-    rules(): Rule[]
+    rules(): Rule<E>[]
     {
-        return ruleset(
+        return ruleset<E>(
             name => this.resolve(name) ?? (() => {throw new Error(`Unresolved variable: ${name}`)})(),
             this.resolveCallee,
             this.extension,
@@ -115,9 +116,9 @@ class RegAlloc
  *  table here, so any non-builtin call inside `stmts` fails to lower (no
  *  rule can produce a candidate for it); use {@link lowerProgram} for a
  *  fragment that references another `Procedure`. */
-export function lowerProc(stmts: readonly Statement[], args: string[] = [], extension?: Extension): RtlProc
+export function lowerProc<E extends { ext: string } = ExtOpPayload>(stmts: readonly Statement[], args: string[] = [], extension?: Extension<E>): RtlProc<E>
 {
-    const alloc = new RegAlloc(undefined, () => undefined, extension)
+    const alloc = new RegAlloc<E>(undefined, () => undefined, extension)
 
     for(const arg of args) alloc.alloc(arg)
 
@@ -138,9 +139,9 @@ export function lowerProc(stmts: readonly Statement[], args: string[] = [], exte
  * built) whole-program validator, not this pass; this pass only needs to
  * not hang on such input.
  */
-export function lowerProgram(entry: Procedure, extension?: Extension): RtlProgram
+export function lowerProgram<E extends { ext: string } = ExtOpPayload>(entry: Procedure, extension?: Extension<E>): RtlProgram<E>
 {
-    const procedures: RtlProc[] = []
+    const procedures: RtlProc<E>[] = []
     const indexOf = new Map<symbol, number>()
 
     function resolve(target: Procedure): number
@@ -150,14 +151,14 @@ export function lowerProgram(entry: Procedure, extension?: Extension): RtlProgra
 
         const index = procedures.length
         indexOf.set(target.id, index)
-        procedures.push(undefined as unknown as RtlProc) // reserved — filled in below
+        procedures.push(undefined as unknown as RtlProc<E>) // reserved — filled in below
 
         // A name absent from this fragment's own `calls` map isn't
         // necessarily an error — it may be a builtin (`clz`/`trap`/
         // `revbits`) or an extension call, which this pass knows nothing
         // about; returning `undefined` lets that call site's own rule win
         // instead (see RegAlloc.resolveCallee's doc comment).
-        const alloc = new RegAlloc(undefined, name =>
+        const alloc = new RegAlloc<E>(undefined, name =>
         {
             const callee = target.fragment.calls.get(name)
             return callee && resolve(callee)
@@ -172,9 +173,9 @@ export function lowerProgram(entry: Procedure, extension?: Extension): RtlProgra
     return { procedures }
 }
 
-function lowerBlock(stmts: readonly Statement[], alloc: RegAlloc): RtlInstr[]
+function lowerBlock<E extends { ext: string } = ExtOpPayload>(stmts: readonly Statement[], alloc: RegAlloc<E>): RtlInstr<E>[]
 {
-    const ret: RtlInstr[] = []
+    const ret: RtlInstr<E>[] = []
 
     for(const s of stmts)
         ret.push(...lowerStmt(s, alloc))
@@ -182,7 +183,7 @@ function lowerBlock(stmts: readonly Statement[], alloc: RegAlloc): RtlInstr[]
     return ret
 }
 
-function lowerStmt(stmt: Statement, alloc: RegAlloc): RtlInstr[]
+function lowerStmt<E extends { ext: string } = ExtOpPayload>(stmt: Statement, alloc: RegAlloc<E>): RtlInstr<E>[]
 {
     switch(stmt.type)
     {
@@ -204,30 +205,30 @@ function lowerStmt(stmt: Statement, alloc: RegAlloc): RtlInstr[]
  * scope (it does not get a further nested one) because the `Block` and the
  * branch/loop it belongs to are one RTL block, not two.
  */
-function lowerControlBody(body: ControlBody, alloc: RegAlloc): RtlInstr[]
+function lowerControlBody<E extends { ext: string } = ExtOpPayload>(body: ControlBody, alloc: RegAlloc<E>): RtlInstr<E>[]
 {
     return body.type === "BlockStatement"
         ? lowerBlock(body.body, alloc)
         : lowerStmt(body, alloc)
 }
 
-function lowerExprStmt(s: ExpressionStatement, alloc: RegAlloc): RtlInstr[]
+function lowerExprStmt<E extends { ext: string } = ExtOpPayload>(s: ExpressionStatement, alloc: RegAlloc<E>): RtlInstr<E>[]
 {
     // The statement's value is discarded, so demand "acc" specifically
     // would be needlessly strict — it would exclude a cheaper tiling whose
     // result lands directly in a register write-back (e.g. `x = x op e`,
     // rules.ts). lowerStatementExpr allows any TOS-neutral output instead.
-    const e = lowerStatementExpr(s.expression as EastExpression, alloc.rules())
+    const e = lowerStatementExpr(s.expression as EastExpression<E>, alloc.rules())
     assert.ok(e, `Failed to lower expression statement`)
 
     return e.fragment
 }
 
-function lowerVarDecl(s: VariableDeclaration, alloc: RegAlloc): RtlInstr[]
+function lowerVarDecl<E extends { ext: string } = ExtOpPayload>(s: VariableDeclaration, alloc: RegAlloc<E>): RtlInstr<E>[]
 {
     return s.declarations.map(d =>
     {
-        const node = lowerExpr(d.init as EastExpression, alloc.rules(), "tos")
+        const node = lowerExpr(d.init as EastExpression<E>, alloc.rules(), "tos")
         assert.ok(node, `Failed to lower variable initializer for ${d.id.name}`)
 
         // A "tos"-demand tiling's cheapest winner always nets exactly one
@@ -248,11 +249,11 @@ function lowerVarDecl(s: VariableDeclaration, alloc: RegAlloc): RtlInstr[]
     }).flat()
 }
 
-function lowerReturn(s: ReturnStatement, alloc: RegAlloc): RtlInstr[] 
+function lowerReturn<E extends { ext: string } = ExtOpPayload>(s: ReturnStatement, alloc: RegAlloc<E>): RtlInstr<E>[]
 {
     if(s.argument)
     {
-        const node = lowerExpr(s.argument as EastExpression, alloc.rules(), "acc")
+        const node = lowerExpr(s.argument as EastExpression<E>, alloc.rules(), "acc")
         assert.ok(node, `Failed to lower return expression`)
         return [...node.fragment, bare("RETURN")]
     }
@@ -335,27 +336,27 @@ function alwaysTerminates(stmts: readonly Statement[]): boolean
  *  (§14.3/§14.4 of isa-core.md — a terminator closes its own block on its
  *  own, so a `BLOCK_END` right after would be unreachable, per
  *  `alwaysTerminates`'s doc comment above). */
-function closeBlock(stmts: readonly Statement[], fragment: RtlInstr[]): RtlInstr[]
+function closeBlock<E extends { ext: string } = ExtOpPayload>(stmts: readonly Statement[], fragment: RtlInstr<E>[]): RtlInstr<E>[]
 {
     return alwaysTerminates(stmts) ? fragment : [...fragment, bare("BLOCK_END")]
 }
 
-function closeControlBody(body: ControlBody, fragment: RtlInstr[]): RtlInstr[]
+function closeControlBody<E extends { ext: string } = ExtOpPayload>(body: ControlBody, fragment: RtlInstr<E>[]): RtlInstr<E>[]
 {
     return closeBlock(body.type === "BlockStatement" ? body.body : [body], fragment)
 }
 
-function lowerIf(s: IfStatement, alloc: RegAlloc): RtlInstr[]
+function lowerIf<E extends { ext: string } = ExtOpPayload>(s: IfStatement, alloc: RegAlloc<E>): RtlInstr<E>[]
 {
-    const thenTerm = lowerControlBody(s.consequent, new RegAlloc(alloc))
+    const thenTerm = lowerControlBody(s.consequent, new RegAlloc<E>(alloc))
     assert.ok(thenTerm, `Failed to lower then branch`)
 
     if(s.alternate)
     {
-        const test = lowerExpr(s.test as EastExpression, alloc.rules(), "acc")
+        const test = lowerExpr(s.test as EastExpression<E>, alloc.rules(), "acc")
         assert.ok(test, `Failed to lower if test expression`)
 
-        const elseTerm = lowerControlBody(s.alternate, new RegAlloc(alloc))
+        const elseTerm = lowerControlBody(s.alternate, new RegAlloc<E>(alloc))
         assert.ok(elseTerm, `Failed to lower else branch`)
 
         return [
@@ -367,7 +368,7 @@ function lowerIf(s: IfStatement, alloc: RegAlloc): RtlInstr[]
     }
     else
     {
-        const test = lowerExpr(logicInvertRoot(s.test as EastExpression), alloc.rules(), "acc")
+        const test = lowerExpr(logicInvertRoot(s.test as EastExpression) as EastExpression<E>, alloc.rules(), "acc")
         assert.ok(test, `Failed to lower if test expression`)
 
         return [
@@ -378,9 +379,9 @@ function lowerIf(s: IfStatement, alloc: RegAlloc): RtlInstr[]
     }
 }
 
-function lowerSwitch(s: SwitchStatement, alloc: RegAlloc): RtlInstr[] 
+function lowerSwitch<E extends { ext: string } = ExtOpPayload>(s: SwitchStatement, alloc: RegAlloc<E>): RtlInstr<E>[]
 {
-    const disc = lowerExpr(s.discriminant as EastExpression, alloc.rules(), "acc")
+    const disc = lowerExpr(s.discriminant as EastExpression<E>, alloc.rules(), "acc")
     assert.ok(disc, `Failed to lower switch discriminant expression`)
 
     const cases = s.cases.filter(c => c.test !== null)
@@ -392,20 +393,20 @@ function lowerSwitch(s: SwitchStatement, alloc: RegAlloc): RtlInstr[]
         brTable(N),
         ...cases.flatMap(c =>
         {
-            const blockTerm = lowerBlock(c.consequent, new RegAlloc(alloc))
+            const blockTerm = lowerBlock(c.consequent, new RegAlloc<E>(alloc))
             assert.ok(blockTerm, `Failed to lower switch case`)
             return closeBlock(c.consequent, blockTerm)
         }),
-        ...(defaultCase ? lowerBlock(defaultCase.consequent, new RegAlloc(alloc)) : []),
+        ...(defaultCase ? lowerBlock(defaultCase.consequent, new RegAlloc<E>(alloc)) : []),
     ]
 }
 
-function lowerWhile(s: WhileStatement, alloc: RegAlloc): RtlInstr[] 
+function lowerWhile<E extends { ext: string } = ExtOpPayload>(s: WhileStatement, alloc: RegAlloc<E>): RtlInstr<E>[]
 {
-    const test = lowerExpr(s.test as EastExpression, alloc.rules(), "acc")
+    const test = lowerExpr(s.test as EastExpression<E>, alloc.rules(), "acc")
     assert.ok(test, `Failed to lower while test expression`)
 
-    const bodyTerm = lowerControlBody(s.body, new RegAlloc(alloc))
+    const bodyTerm = lowerControlBody(s.body, new RegAlloc<E>(alloc))
     assert.ok(bodyTerm, `Failed to lower while body`)
 
     return [
@@ -416,10 +417,10 @@ function lowerWhile(s: WhileStatement, alloc: RegAlloc): RtlInstr[]
     ]
 }
 
-function lowerFor(s: ForStatement, alloc: RegAlloc): RtlInstr[] 
+function lowerFor<E extends { ext: string } = ExtOpPayload>(s: ForStatement, alloc: RegAlloc<E>): RtlInstr<E>[]
 {
-    const init: RtlInstr[] | undefined = (s.init) ? 
-        (s.init.type === "VariableDeclaration") 
+    const init: RtlInstr<E>[] | undefined = (s.init) ?
+        (s.init.type === "VariableDeclaration")
             ? lowerVarDecl(s.init, alloc)
             : lowerExprStmt({type: "ExpressionStatement", expression: s.init}, alloc)
         : []
@@ -430,13 +431,13 @@ function lowerFor(s: ForStatement, alloc: RegAlloc): RtlInstr[]
     // relaxed "any TOS-neutral output") is required here, not optional.
     const test = s.test ? (() =>
     {
-        const node = lowerExpr(s.test as EastExpression, alloc.rules(), "acc")
+        const node = lowerExpr(s.test as EastExpression<E>, alloc.rules(), "acc")
         assert.ok(node, `Failed to lower for-loop test expression`)
         return node.fragment
     })() : []
     const update = s.update ? lowerExprStmt({type: "ExpressionStatement", expression: s.update}, alloc) : []
 
-    const body = lowerControlBody(s.body, new RegAlloc(alloc))
+    const body = lowerControlBody(s.body, new RegAlloc<E>(alloc))
     const bodyStmts = s.body.type === "BlockStatement" ? s.body.body : [s.body]
 
     return [

@@ -9,7 +9,7 @@
  */
 
 import { COMBO } from "./rtl"
-import type { ComboName, OutputLocation, Resource } from "./rtl"
+import type { ComboName, OutputLocation, Resource, ExtOpPayload } from "./rtl"
 import type { RtlNode } from "./east"
 
 // ——————————————————————————————————————————————
@@ -29,19 +29,19 @@ const isRegLocation = (loc: OutputLocation): loc is { reg: number } =>
  * `tos` are: a later fragment that clobbers them, or that has a net-negative
  * tos delta (pops), destroys the value.
  */
-export const destroys = (later: RtlNode, loc: OutputLocation): boolean =>
+export const destroys = <E extends { ext: string } = ExtOpPayload>(later: RtlNode<E>, loc: OutputLocation): boolean =>
     !isRegLocation(loc) &&
     (later.clobbers.includes(loc) || (loc === "tos" && later.tosDelta < 0))
 
 /** Does `later` destroy any of `earlier`'s declared outputs? */
-export const destroysAny = (later: RtlNode, earlier: RtlNode): boolean =>
+export const destroysAny = <E extends { ext: string } = ExtOpPayload>(later: RtlNode<E>, earlier: RtlNode<E>): boolean =>
     earlier.output.some(loc => destroys(later, loc))
 
 /**
  * Worst-case TOS depth for a two-element ordering `[a, b]`, relative to entry.
  * SU weight of the combined fragment. Lower is better.
  */
-export const pairMaxStack = (a: RtlNode, b: RtlNode): number =>
+export const pairMaxStack = <E extends { ext: string } = ExtOpPayload>(a: RtlNode<E>, b: RtlNode<E>): number =>
     Math.max(a.maxStack, a.tosDelta + b.maxStack)
 
 /**
@@ -52,7 +52,7 @@ export const pairMaxStack = (a: RtlNode, b: RtlNode): number =>
  * This is the only ordering decision the lowerer ever makes: binary ops have
  * two children, and call args are pushed in source order (no reordering).
  */
-export function pickBinaryOrder(a: RtlNode, b: RtlNode): [RtlNode, RtlNode] | undefined
+export function pickBinaryOrder<E extends { ext: string } = ExtOpPayload>(a: RtlNode<E>, b: RtlNode<E>): [RtlNode<E>, RtlNode<E>] | undefined
 {
     if (destroysAny(b, a))
     {
@@ -77,17 +77,17 @@ export function pickBinaryOrder(a: RtlNode, b: RtlNode): [RtlNode, RtlNode] | un
  *
  * `fragment` is passed through unchanged.
  */
-export function nodeInvariants(args: {
-    children: RtlNode[]
+export function nodeInvariants<E extends { ext: string } = ExtOpPayload>(args: {
+    children: RtlNode<E>[]
     combo: ComboName
     output: OutputLocation | OutputLocation[]
-    fragment: RtlNode["fragment"]
+    fragment: RtlNode<E>["fragment"]
     /** Optional extra tos delta beyond children+combo (e.g. a trailing PUSH). */
     extraTosDelta?: number
     /** Optional extra max-stack contribution (e.g. a trailing PUSH reaching
      *  one slot above the running delta). */
     extraMaxStack?: number
-}): RtlNode
+}): RtlNode<E>
 {
     const { children, combo, output, fragment } = args
     const meta = COMBO[combo]

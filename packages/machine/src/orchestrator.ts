@@ -28,16 +28,16 @@ import { matchAllEast } from "./matcher"
 import type { EastMatch } from "./matcher"
 import type { EastExpression, RtlNode } from "./east"
 import { isRtlNode, isLiteral } from "./east"
-import type { OutputLocation } from "./rtl"
+import type { OutputLocation, ExtOpPayload } from "./rtl"
 import { outputHas } from "./rtl"
 import {instrBytes} from "./encoding"
 
-export function fragmentBytes(node: RtlNode): number
+export function fragmentBytes<E extends { ext: string } = ExtOpPayload>(node: RtlNode<E>): number
 {
     return node.fragment.reduce((s, i) => s + instrBytes(i), 0)
 }
 
-function collectRtlNodes(m: EastMatch): RtlNode[]
+function collectRtlNodes<E extends { ext: string } = ExtOpPayload>(m: EastMatch<E>): RtlNode<E>[]
 {
     switch (m.kind)
     {
@@ -63,7 +63,7 @@ function collectRtlNodes(m: EastMatch): RtlNode[]
  * `"acc"`-tagged one, since a future demand for one can never be satisfied
  * by the other.
  */
-function dominates(b: RtlNode, a: RtlNode): boolean
+function dominates<E extends { ext: string } = ExtOpPayload>(b: RtlNode<E>, a: RtlNode<E>): boolean
 {
     if (!b.clobbers.every(r => a.clobbers.includes(r))) return false
     const bBytes = fragmentBytes(b), aBytes = fragmentBytes(a)
@@ -104,12 +104,12 @@ function dominates(b: RtlNode, a: RtlNode): boolean
  * candidates are just deduped by value (at most one distinct value can ever
  * apply per node — there's no cost dimension to break a tie on).
  */
-function pruneToFrontier(candidates: EastExpression[]): EastExpression[]
+function pruneToFrontier<E extends { ext: string } = ExtOpPayload>(candidates: EastExpression<E>[]): EastExpression<E>[]
 {
     const rtlCandidates = candidates.filter(isRtlNode)
     const foldedCandidates = candidates.filter(c => !isRtlNode(c))
 
-    const groups = new Map<string, RtlNode[]>()
+    const groups = new Map<string, RtlNode<E>[]>()
     for (const c of rtlCandidates)
     {
         const key = JSON.stringify(c.output)
@@ -118,10 +118,10 @@ function pruneToFrontier(candidates: EastExpression[]): EastExpression[]
         else groups.set(key, [c])
     }
 
-    const kept: EastExpression[] = []
+    const kept: EastExpression<E>[] = []
     for (const group of groups.values())
     {
-        const byCostPoint = new Map<string, RtlNode>()
+        const byCostPoint = new Map<string, RtlNode<E>>()
         for (const c of group)
         {
             const costKey = `${fragmentBytes(c)}|${c.maxStack}|${[...c.clobbers].sort()}`
@@ -158,15 +158,15 @@ function pruneToFrontier(candidates: EastExpression[]): EastExpression[]
  * see `pruneToFrontier`. This means `tileNode`/`tileExpr` no longer return
  * *every* structurally-realizable tiling, only the cost-relevant ones.
  */
-function tileNode(node: EastExpression, rules: readonly Rule[], memo: WeakMap<EastExpression, EastExpression[]>): EastExpression[]
+function tileNode<E extends { ext: string } = ExtOpPayload>(node: EastExpression<E>, rules: readonly Rule<E>[], memo: WeakMap<EastExpression<E>, EastExpression<E>[]>): EastExpression<E>[]
 {
     if (isRtlNode(node)) return [node]
 
     const cached = memo.get(node)
     if (cached) return cached
 
-    const results: EastExpression[] = []
-    const tile = (n: EastExpression) => tileNode(n, rules, memo)
+    const results: EastExpression<E>[] = []
+    const tile = (n: EastExpression<E>) => tileNode(n, rules, memo)
 
     for (const r of rules)
     {
@@ -208,7 +208,7 @@ function tileNode(node: EastExpression, rules: readonly Rule[], memo: WeakMap<Ea
  *  nothing once a node is unreferenced, and sharing it is what lets
  *  `touchedRuleNames` below accumulate across the whole test suite rather
  *  than one call at a time. */
-const nodeRuleNames = new WeakMap<EastExpression, ReadonlySet<string>>()
+const nodeRuleNames = new WeakMap<object, ReadonlySet<string>>()
 
 /**
  * Rule names that have appeared in a node `lowerExpr` actually selected as
@@ -219,10 +219,10 @@ const nodeRuleNames = new WeakMap<EastExpression, ReadonlySet<string>>()
  * on cost). See test/rule-coverage.test.ts.
  */
 export const touchedRuleNames = new Set<string>()
- 
-export function tileExpr(expr: EastExpression, rules: readonly Rule[], demand?: OutputLocation): RtlNode[]
+
+export function tileExpr<E extends { ext: string } = ExtOpPayload>(expr: EastExpression<E>, rules: readonly Rule<E>[], demand?: OutputLocation): RtlNode<E>[]
 {
-    const memo = new WeakMap<EastExpression, EastExpression[]>()
+    const memo = new WeakMap<EastExpression<E>, EastExpression<E>[]>()
     const results = tileNode(expr, rules, memo).filter(isRtlNode)
     return demand ? results.filter(n => outputHas(n.output, demand)) : results
 }
@@ -232,7 +232,7 @@ export function tileExpr(expr: EastExpression, rules: readonly Rule[], demand?: 
  *  `lowerExpr` (demand-filtered via `tileExpr`) and `lowerStatementExpr`
  *  (custom-filtered — see there for why demand filtering alone isn't right
  *  for a discarded-value expression statement). */
-function pickCheapest(variants: readonly RtlNode[]): RtlNode | undefined
+function pickCheapest<E extends { ext: string } = ExtOpPayload>(variants: readonly RtlNode<E>[]): RtlNode<E> | undefined
 {
     if (variants.length === 0) return undefined
 
@@ -251,7 +251,7 @@ function pickCheapest(variants: readonly RtlNode[]): RtlNode | undefined
     return best
 }
 
-export function lowerExpr(expr: EastExpression, rules: readonly Rule[], demand?: OutputLocation): RtlNode | undefined
+export function lowerExpr<E extends { ext: string } = ExtOpPayload>(expr: EastExpression<E>, rules: readonly Rule<E>[], demand?: OutputLocation): RtlNode<E> | undefined
 {
     return pickCheapest(tileExpr(expr, rules, demand))
 }
@@ -267,7 +267,7 @@ export function lowerExpr(expr: EastExpression, rules: readonly Rule[], demand?:
  * statement runs. The correct filter is structural: any output location
  * other than `"tos"` is TOS-neutral and safe to discard.
  */
-export function lowerStatementExpr(expr: EastExpression, rules: readonly Rule[]): RtlNode | undefined
+export function lowerStatementExpr<E extends { ext: string } = ExtOpPayload>(expr: EastExpression<E>, rules: readonly Rule<E>[]): RtlNode<E> | undefined
 {
     const variants = tileExpr(expr, rules).filter(v => v.output.some(loc => loc !== "tos"))
     return pickCheapest(variants)

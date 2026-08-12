@@ -55,6 +55,7 @@ import { concreteKindOf, derefType, SemanticTypeKinds, pList, pInteger } from "@
 import type { Direction } from "../engine/codec-extension"
 import { buildCodec } from "../engine/resolver"
 import { codecRule } from "../engine/resolver"
+import type { CodecExtInstr } from "../engine/codec-ext-instr"
 
 // ── leb128_encode(value) — §8.3, as an ir` ` fragment ────────────────────
 
@@ -185,7 +186,7 @@ export const deltaLeb128DecodeRule = codecRule<ListPattern<IntegerPattern>, void
  *  type. A thin wrapper picking whichever of `deltaLeb128EncodeRule`/
  *  `deltaLeb128DecodeRule` matches `direction` — those rules are the
  *  reusable, composable pieces. */
-export function buildDeltaLeb128ListCodec(root: SemanticType, direction: Direction): RtlProgram
+export function buildDeltaLeb128ListCodec(root: SemanticType, direction: Direction): RtlProgram<CodecExtInstr>
 {
     if(concreteKindOf(root) !== SemanticTypeKinds.List)
         throw new Error(`buildDeltaLeb128ListCodec: expected a list type, got "${concreteKindOf(root)}"`)

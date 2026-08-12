@@ -70,8 +70,8 @@ import type {Stmt, Expr, RaisedProc} from "@ppl/machine"
 import {ExprKind, StmtKind} from "@ppl/machine"
 import type {TypeNode, TypeEdge} from "@ppl/core"
 import {kindOf, SemanticTypeKinds} from "@ppl/core"
-import type {Direction, CodecOpcode} from "@ppl/codecs"
-import {requireSlotNode, intWireSize, isCodecOpcode, assertNever} from "@ppl/codecs"
+import type {Direction, CodecExtInstr} from "@ppl/codecs"
+import {requireSlotNode, intWireSize, assertNever} from "@ppl/codecs"
 import {LineBuilder} from "./line-builder"
 import {requireEdge, isStructKind, variantNamesOf, describeType} from "./codec-type-nav"
 
@@ -96,28 +96,26 @@ interface GenCtx
  *  (never re-`let`), so a value entered inside one `dispatch` case stays
  *  a plain JS variable visible after the dispatch too, matching the
  *  interpreted runtime's own flat, function-lifetime `Frame` array. */
-function scanMaxHandleIndex(stmts: readonly Stmt[]): number
+function scanMaxHandleIndex(stmts: readonly Stmt<CodecExtInstr>[]): number
 {
     let max = 0
     const bumpAll = (indices: readonly number[]): void => {for(const i of indices) if(i > max) max = i}
 
-    function visitExpr(e: Expr): void
+    function visitExpr(e: Expr<CodecExtInstr>): void
     {
         if(e.kind === ExprKind.Ext)
         {
-            if(!isCodecOpcode(e.ext)) throw new Error(`codec-codegen: unrecognized codec opcode "${e.ext}"`)
-            const op: CodecOpcode = e.ext
-            switch(op)
+            switch(e.ext)
             {
-                case "ENTER": case "ENTER_NEXT": bumpAll(e.operands as readonly number[]); break
+                case "ENTER": bumpAll([e.dst, e.src, e.ref]); break
+                case "ENTER_NEXT": bumpAll([e.dst, e.src]); break
                 case "LOAD_VAL": case "STORE_VAL": case "COUNT": case "TAG": case "OPEN_LIST":
-                    bumpAll(e.operands as readonly number[]); break
-                case "CALL_CODEC": bumpAll([(e.operands as readonly number[])[1]!]); break
-                case "CALL_CODEC_NEXT": bumpAll([(e.operands as readonly number[])[1]!]); break
-                case "WRITE_SEQ": case "READ_SEQ": bumpAll([(e.operands as readonly number[])[1]!]); break
+                    bumpAll([e.src]); break
+                case "CALL_CODEC": case "CALL_CODEC_NEXT": bumpAll([e.src]); break
+                case "WRITE_SEQ": case "READ_SEQ": bumpAll([e.handle]); break
                 // Iterator ids, never handle-table slots — nothing to bump.
                 case "READ": case "WRITE": case "HAS_NEXT": case "CLONE_RD": case "CLONE_WR": case "SEEK": break
-                default: assertNever(op)
+                default: assertNever(e)
             }
             for(const a of e.args) visitExpr(a)
         }
@@ -126,7 +124,7 @@ function scanMaxHandleIndex(stmts: readonly Stmt[]): number
         else if(e.kind === ExprKind.Call) for(const a of e.args) visitExpr(a)
     }
 
-    function visitStmts(stmts: readonly Stmt[]): void
+    function visitStmts(stmts: readonly Stmt<CodecExtInstr>[]): void
     {
         for(const s of stmts)
         {
@@ -146,7 +144,7 @@ function scanMaxHandleIndex(stmts: readonly Stmt[]): number
     return max
 }
 
-function endsInTerminator(stmts: readonly Stmt[]): boolean
+function endsInTerminator(stmts: readonly Stmt<CodecExtInstr>[]): boolean
 {
     const last = stmts[stmts.length - 1]
     return last?.kind === StmtKind.Return || last?.kind === StmtKind.Trap
@@ -156,7 +154,7 @@ function endsInTerminator(stmts: readonly Stmt[]): boolean
 // Expression translation
 // ─────────────────────────────────────────────────────────────────────────
 
-function translateExpr(e: Expr, g: GenCtx): string
+function translateExpr(e: Expr<CodecExtInstr>, g: GenCtx): string
 {
     switch(e.kind)
     {
@@ -192,67 +190,62 @@ function buildChildHandleExpr(srcVar: string, edge: TypeEdge, g: GenCtx): string
     return expr
 }
 
-function translateExt(e: Extract<Expr, {kind: ExprKind.Ext}>, g: GenCtx): string
+function translateExt(e: Extract<Expr<CodecExtInstr>, {kind: ExprKind.Ext}>, g: GenCtx): string
 {
-    if(!isCodecOpcode(e.ext)) throw new Error(`codec-codegen: unrecognized codec opcode "${e.ext}"`)
-    const op: CodecOpcode = e.ext
-    const ops = e.operands as readonly number[]
     const arg = (i: number): string => translateExpr(e.args[i]!, g)
 
-    switch(op)
+    switch(e.ext)
     {
         case "ENTER": case "ENTER_NEXT":
-            throw new Error(`codec-codegen: ${op} should only ever appear as its own statement — never nested in an expression`)
+            throw new Error(`codec-codegen: ${e.ext} should only ever appear as its own statement — never nested in an expression`)
 
-        case "LOAD_VAL": return `loadVal(h${ops[0]})`
-        case "COUNT": return `countOf(h${ops[0]})`
+        case "LOAD_VAL": return `loadVal(h${e.src})`
+        case "COUNT": return `countOf(h${e.src})`
 
         case "TAG":
             {
-                const node = requireSlotNode(g.slotTypes, ops[0]!, "TAG")
-                return `tagOf(h${ops[0]}, ${JSON.stringify(variantNamesOf(node))})`
+                const node = requireSlotNode(g.slotTypes, e.src, "TAG")
+                return `tagOf(h${e.src}, ${JSON.stringify(variantNamesOf(node))})`
             }
 
-        case "OPEN_LIST": return `openList(h${ops[0]})`
-        case "READ": return `read(ctx, ${ops[0]}, ${ops[1]})`
-        case "HAS_NEXT": return `hasNext(ctx, ${ops[0]})`
-        case "CLONE_RD": return `cloneRd(ctx, ${ops[0]}, ${ops[1]})`
-        case "CLONE_WR": return `cloneWr(ctx, ${ops[0]}, ${ops[1]})`
-        case "SEEK": return `seek(ctx, ${ops[0]}, ${ops[1]})`
-        case "WRITE": return `write(ctx, ${ops[0]}, ${ops[1]}, ${arg(0)})`
+        case "OPEN_LIST": return `openList(h${e.src})`
+        case "READ": return `read(ctx, ${e.iter}, ${e.width})`
+        case "HAS_NEXT": return `hasNext(ctx, ${e.iter})`
+        case "CLONE_RD": return `cloneRd(ctx, ${e.src}, ${e.dst})`
+        case "CLONE_WR": return `cloneWr(ctx, ${e.src}, ${e.dst})`
+        case "SEEK": return `seek(ctx, ${e.iter}, ${e.delta})`
+        case "WRITE": return `write(ctx, ${e.iter}, ${e.width}, ${arg(0)})`
 
         case "STORE_VAL":
             {
-                const node = requireSlotNode(g.slotTypes, ops[0]!, "STORE_VAL")
-                if(kindOf(node.type) !== SemanticTypeKinds.Integer) return `setH(h${ops[0]}, ${arg(0)})`
+                const node = requireSlotNode(g.slotTypes, e.src, "STORE_VAL")
+                if(kindOf(node.type) !== SemanticTypeKinds.Integer) return `setH(h${e.src}, ${arg(0)})`
                 const width = intWireSize(node.type as {min: number, max: number})
                 const signed = (node.type as {min: number}).min < 0
-                return `storeVal(h${ops[0]}, ${arg(0)}, ${width}, ${signed})`
+                return `storeVal(h${e.src}, ${arg(0)}, ${width}, ${signed})`
             }
 
-        case "WRITE_SEQ": return `writeSeq(ctx, ${ops[0]}, h${ops[1]}, ${ops[2]}, ${arg(0)})`
-        case "READ_SEQ": return `readSeq(ctx, ${ops[0]}, h${ops[1]}, ${ops[2]}, ${!!ops[3]}, ${arg(0)})`
+        case "WRITE_SEQ": return `writeSeq(ctx, ${e.iter}, h${e.handle}, ${e.width}, ${arg(0)})`
+        case "READ_SEQ": return `readSeq(ctx, ${e.iter}, h${e.handle}, ${e.width}, ${e.signed}, ${arg(0)})`
 
         case "CALL_CODEC":
             {
-                const [calleeIndex, src, ref] = ops as readonly [number, number, number]
-                const srcNode = requireSlotNode(g.slotTypes, src, "CALL_CODEC")
-                const edge = requireEdge(srcNode, ref, "CALL_CODEC")
-                const childExpr = buildChildHandleExpr(`h${src}`, edge, g)
-                return `${g.direction}_proc${calleeIndex}(${childExpr}, ctx)`
+                const srcNode = requireSlotNode(g.slotTypes, e.src, "CALL_CODEC")
+                const edge = requireEdge(srcNode, e.ref, "CALL_CODEC")
+                const childExpr = buildChildHandleExpr(`h${e.src}`, edge, g)
+                return `${g.direction}_proc${e.calleeIndex}(${childExpr}, ctx)`
             }
 
         case "CALL_CODEC_NEXT":
             {
-                const [calleeIndex, src] = ops as readonly [number, number]
-                const srcNode = requireSlotNode(g.slotTypes, src, "CALL_CODEC_NEXT")
+                const srcNode = requireSlotNode(g.slotTypes, e.src, "CALL_CODEC_NEXT")
                 const edge = requireEdge(srcNode, 0, "CALL_CODEC_NEXT")
-                const childExpr = buildChildHandleExpr(`h${src}`, edge, g)
-                return `${g.direction}_proc${calleeIndex}(${childExpr}, ctx)`
+                const childExpr = buildChildHandleExpr(`h${e.src}`, edge, g)
+                return `${g.direction}_proc${e.calleeIndex}(${childExpr}, ctx)`
             }
 
         default:
-            return assertNever(op)
+            return assertNever(e)
     }
 }
 
@@ -265,21 +258,17 @@ function translateExt(e: Extract<Expr, {kind: ExprKind.Ext}>, g: GenCtx): string
  *  value anything reads, so they're recognized here — before generic
  *  expression translation ever sees them — and lowered to a plain
  *  variable assignment instead. */
-function translateEnterStmt(e: Extract<Expr, {kind: ExprKind.Ext}>, g: GenCtx, b: LineBuilder): void
+function translateEnterStmt(e: Extract<Expr<CodecExtInstr>, {ext: "ENTER" | "ENTER_NEXT"}>, g: GenCtx, b: LineBuilder): void
 {
-    if(!isCodecOpcode(e.ext)) throw new Error(`codec-codegen: unrecognized codec opcode "${e.ext}"`)
-    const op: CodecOpcode = e.ext
-    const [dst, src, ref] = op === "ENTER"
-        ? e.operands as readonly [number, number, number]
-        : [...(e.operands as readonly [number, number]), 0] as const
+    const [dst, src, ref] = e.ext === "ENTER" ? [e.dst, e.src, e.ref] : [e.dst, e.src, 0]
 
-    const srcNode = requireSlotNode(g.slotTypes, src, op)
-    const edge = requireEdge(srcNode, ref, op)
+    const srcNode = requireSlotNode(g.slotTypes, src, e.ext)
+    const edge = requireEdge(srcNode, ref, e.ext)
     b.line(`h${dst} = ${buildChildHandleExpr(`h${src}`, edge, g)};`)
     g.slotTypes.set(dst, edge.target)
 }
 
-function translateStmt(s: Stmt, g: GenCtx, b: LineBuilder): void
+function translateStmt(s: Stmt<CodecExtInstr>, g: GenCtx, b: LineBuilder): void
 {
     switch(s.kind)
     {
@@ -334,7 +323,7 @@ function translateStmt(s: Stmt, g: GenCtx, b: LineBuilder): void
     }
 }
 
-function translateStmts(stmts: readonly Stmt[], g: GenCtx, b: LineBuilder): void
+function translateStmts(stmts: readonly Stmt<CodecExtInstr>[], g: GenCtx, b: LineBuilder): void
 {
     for(const s of stmts) translateStmt(s, g, b)
 }
@@ -345,7 +334,7 @@ function translateStmts(stmts: readonly Stmt[], g: GenCtx, b: LineBuilder): void
 
 /** One `RaisedProc`, translated in isolation — `codec-module.ts` calls
  *  this once per procedure and stitches the results together. */
-export function generateProcedure(index: number, raised: RaisedProc, entryNode: TypeNode, direction: Direction): string
+export function generateProcedure(index: number, raised: RaisedProc<CodecExtInstr>, entryNode: TypeNode, direction: Direction): string
 {
     // Seeded with just slot 0 (the entry handle) — everything else is
     // discovered live, in translateStmts' own walk order, via the same

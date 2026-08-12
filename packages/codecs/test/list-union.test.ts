@@ -1,7 +1,7 @@
 /**
  * @ppl/codecs/test — codec extension: list + union opcodes (Phase A)
  *
- * Hand-built `RtlProgram`s, same style as struct-encoder.test.ts, isolating
+ * Hand-built `RtlProgram<CodecExtInstr>`s, same style as struct-encoder.test.ts, isolating
  * the new opcodes (`COUNT`/`OPEN_LIST`/`ENTER_NEXT`/`CALL_CODEC_NEXT` for
  * lists, `TAG`/`CALL_CODEC`'s union branch for unions) from
  * `buildCodec`'s (engine/resolver.ts) generic codec-generation logic — a
@@ -12,16 +12,18 @@ import { describe, test } from "node:test"
 import assert from "node:assert/strict"
 
 import { list, u8, union, unit, buildTypeGraph } from "@ppl/core"
-import { extInstr, bare, brTable, CONST, STORE, LOAD, opImm, validateProgram, run } from "@ppl/machine"
-import type { RtlProgram } from "@ppl/machine"
+import { bare, brTable, CONST, STORE, LOAD, opImm, validateProgram, run } from "@ppl/machine"
+import { callCodecInstr, callCodecNextInstr, countInstr, loadValInstr, openListInstr, readInstr, storeValInstr, tagInstr, writeInstr } from "../src/engine/codec-ext-instr"
+import type { CodecExtInstr } from "../src/engine/codec-ext-instr"
+import type { RtlProgram, RtlInstr } from "@ppl/machine"
 
 import { createCodecExtension } from "../src/engine/codec-extension"
 import type { Handle } from "../src/engine/codec-extension"
 
-const u8CodecBody = (direction: "encode" | "decode") =>
+const u8CodecBody = (direction: "encode" | "decode"): RtlInstr<CodecExtInstr>[] =>
     direction === "encode"
-        ? [extInstr("LOAD_VAL", [0]), extInstr("WRITE", [0, 1]), bare("RETURN")]
-        : [extInstr("READ", [0, 1]), extInstr("STORE_VAL", [0]), bare("RETURN")]
+        ? [loadValInstr(0), writeInstr(0, 1), bare("RETURN")]
+        : [readInstr(0, 1), storeValInstr(0), bare("RETURN")]
 
 describe("codec extension — list of u8 (COUNT/OPEN_LIST/ENTER_NEXT/CALL_CODEC_NEXT)", () =>
 {
@@ -31,24 +33,24 @@ describe("codec extension — list of u8 (COUNT/OPEN_LIST/ENTER_NEXT/CALL_CODEC_
     // r0 = loop counter. Plain "while (r0 != 0) { ...; r0 -= 1 }" — no
     // special-cased first element (that's delta-encoding's own concern,
     // §8.6, not a general list-walk requirement).
-    function listCodecBody(direction: "encode" | "decode")
+    function listCodecBody(direction: "encode" | "decode"): RtlInstr<CodecExtInstr>[]
     {
-        const prelude = direction === "encode"
-            ? [extInstr("COUNT", [0]), STORE(0), extInstr("WRITE", [0, 1])]
-            : [extInstr("READ", [0, 1]), STORE(0), extInstr("OPEN_LIST", [0])]
+        const prelude: RtlInstr<CodecExtInstr>[] = direction === "encode"
+            ? [countInstr(0), STORE(0), writeInstr(0, 1)]
+            : [readInstr(0, 1), STORE(0), openListInstr(0)]
 
         return [
             ...prelude,
             bare("LOOP"),
             LOAD(0), opImm("NE", 0), bare("BLOCK_END"),
-            extInstr("CALL_CODEC_NEXT", [1, 0]),
+            callCodecNextInstr(1, 0),
             LOAD(0), opImm("SUB", 1), STORE(0),
             bare("BLOCK_END"),
             bare("RETURN"),
         ]
     }
 
-    function program(direction: "encode" | "decode"): RtlProgram
+    function program(direction: "encode" | "decode"): RtlProgram<CodecExtInstr>
     {
         return { procedures: [{ argCount: 0, body: listCodecBody(direction) }, { argCount: 0, body: u8CodecBody(direction) }] }
     }
@@ -95,7 +97,7 @@ describe("codec extension — union (TAG + CALL_CODEC's fused ENTER/instantiate)
     const unionType = union({ a: unit, b: u8 })
     const graph = buildTypeGraph(unionType)
 
-    const unitCodecBody = () => [bare("RETURN")] // nothing to read or write
+    const unitCodecBody = (): RtlInstr<CodecExtInstr>[] => [bare("RETURN")] // nothing to read or write
 
     // TAG; BR_TABLE 2; case a -> CALL_CODEC unitCodec; case b -> CALL_CODEC
     // u8Codec; shared RETURN — codec-extension.md §8.2's exact shape (N=2),
@@ -104,21 +106,21 @@ describe("codec extension — union (TAG + CALL_CODEC's fused ENTER/instantiate)
     // give the decoder side's READ something to read. WRITE doesn't touch
     // acc (mirrors the ISA's own `WRITE`: "stream[i].write(acc,w)", a pure
     // write), so BR_TABLE right after still sees TAG's own result.
-    function unionCodecBody(direction: "encode" | "decode")
+    function unionCodecBody(direction: "encode" | "decode"): RtlInstr<CodecExtInstr>[]
     {
-        const tagOrRead = direction === "encode"
-            ? [extInstr("TAG", [0]), extInstr("WRITE", [0, 1])]
-            : [extInstr("READ", [0, 1])]
+        const tagOrRead: RtlInstr<CodecExtInstr>[] = direction === "encode"
+            ? [tagInstr(0), writeInstr(0, 1)]
+            : [readInstr(0, 1)]
         return [
             ...tagOrRead,
             brTable(2),
-            extInstr("CALL_CODEC", [1, 0, 0]), bare("BLOCK_END"), // case 0: "a"
-            extInstr("CALL_CODEC", [2, 0, 1]), bare("BLOCK_END"), // case 1: "b"
+            callCodecInstr(1, 0, 0), bare("BLOCK_END"), // case 0: "a"
+            callCodecInstr(2, 0, 1), bare("BLOCK_END"), // case 1: "b"
             bare("RETURN"),
         ]
     }
 
-    function program(direction: "encode" | "decode"): RtlProgram
+    function program(direction: "encode" | "decode"): RtlProgram<CodecExtInstr>
     {
         return {
             procedures: [
@@ -151,9 +153,9 @@ describe("codec extension — union (TAG + CALL_CODEC's fused ENTER/instantiate)
         // via a union codec instructed to enter variant #1 unconditionally.
         const root: Handle = { container: { root: { variant: "a", value: undefined } }, key: "root", type: graph.root }
         const buffer: number[] = []
-        const badProgram: RtlProgram = {
+        const badProgram: RtlProgram<CodecExtInstr> = {
             procedures: [
-                { argCount: 0, body: [extInstr("CALL_CODEC", [1, 0, 1]), bare("RETURN")] }, // forces variant #1 ("b")
+                { argCount: 0, body: [callCodecInstr(1, 0, 1), bare("RETURN")] }, // forces variant #1 ("b")
                 { argCount: 0, body: u8CodecBody("encode") },
             ],
         }

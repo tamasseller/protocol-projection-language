@@ -75,8 +75,9 @@ describe("extension hook — end to end via a toy `double(x)` opcode", () =>
  * `calleeIndex` via `ExecState.callProc` — the capability `vm.ts`'s `EXT`
  * case didn't expose until now. Exercises the one part `double(x)` above
  * never touches: a call-shaped extension op that both `validate.ts` (via
- * `effect.call`) and `vm.ts` (via `callProc`) treat as a real call site —
- * the mechanism `CALL_CODEC` (docs/codec-extension.md §3.3) will need.
+ * `effect.calleeOf`) and `vm.ts` (via `callProc`) treat as a real call
+ * site — the mechanism `CALL_CODEC` (docs/codec-extension.md §3.3) will
+ * need.
  *
  * No `rules()`/DSL surface here deliberately: referencing another
  * `Procedure` from inside `ir\`...\`` text only works in *callee* position
@@ -96,7 +97,7 @@ describe("extension hook — end to end via a toy `double(x)` opcode", () =>
 function callShapedExtension(): Extension
 {
     return {
-        effects: { EXT_CALL: { tosDelta: 0, maxTransient: 0, call: { calleeOperandIndex: 0 } } },
+        effects: { EXT_CALL: { tosDelta: 0, maxTransient: 0, calleeOf: instr => instr.operands[0] } },
         exec: (instr, state) => { state.acc = state.callProc(instr.operands[0]!, []) },
     }
 }

@@ -25,9 +25,11 @@ import
         RtlNode,
     } from "./east"
 import {outputHas} from "./rtl"
-import type {OutputLocation} from "./rtl"
+import type {OutputLocation, ExtOpPayload} from "./rtl"
 
-// 1. Pattern interfaces
+// 1. Pattern interfaces — never carry a concrete RtlNode instance
+// themselves (only `RtlMatch`/`CallMatch`, below, do), so none of these
+// need the `E` type parameter.
 
 export interface LiteralPattern {kind: "Literal"}
 export interface IdentifierPattern {kind: "Identifier"}
@@ -122,11 +124,12 @@ export interface BuiltinCallPattern<
     tailPattern?: T
 }
 
-// 2. Match interfaces
+// 2. Match interfaces — `RtlMatch`/`CallMatch` are the only two that embed
+// a concrete `RtlNode`, so they're the only ones parameterized by `E`.
 
 export interface LiteralMatch {kind: "Literal"; value: number}
 export interface IdentifierMatch {kind: "Identifier"; name: string}
-export interface RtlMatch {kind: "Rtl"; node: RtlNode}
+export interface RtlMatch<E extends { ext: string } = ExtOpPayload> {kind: "Rtl"; node: RtlNode<E>}
 
 export interface BinaryMatch<
     LM extends EastMatch = EastMatch,
@@ -154,11 +157,11 @@ export interface AssignMatch<V extends EastMatch = EastMatch>
     rightMatch: V
 }
 
-export interface CallMatch
+export interface CallMatch<E extends { ext: string } = ExtOpPayload>
 {
     kind: "Call"
     callee: string
-    argNodes: RtlNode[]
+    argNodes: RtlNode<E>[]
 }
 
 export interface BuiltinCallMatch<AM extends readonly EastMatch[] = readonly EastMatch[], TM extends EastMatch = EastMatch>
@@ -185,32 +188,32 @@ export type EastPattern =
     | CallPattern
     | BuiltinCallPattern
 
-export type EastMatch =
+export type EastMatch<E extends { ext: string } = ExtOpPayload> =
     | LiteralMatch
     | IdentifierMatch
-    | RtlMatch
-    | BinaryMatch
-    | UnaryMatch
-    | AssignMatch
-    | CallMatch
-    | BuiltinCallMatch
+    | RtlMatch<E>
+    | BinaryMatch<EastMatch<E>, EastMatch<E>>
+    | UnaryMatch<EastMatch<E>>
+    | AssignMatch<EastMatch<E>>
+    | CallMatch<E>
+    | BuiltinCallMatch<readonly EastMatch<E>[], EastMatch<E>>
 
-// 4. MatchOf<P> — pattern → match mapping (recursively maps child sub-patterns)
+// 4. MatchOf<P, E> — pattern → match mapping (recursively maps child sub-patterns)
 
-export type MatchOf<P extends EastPattern> =
+export type MatchOf<P extends EastPattern, E extends { ext: string } = ExtOpPayload> =
     P extends LiteralPattern ? LiteralMatch
     : P extends ConstPattern ? LiteralMatch
     : P extends IdentifierPattern ? IdentifierMatch
-    : P extends RtlPattern ? RtlMatch
+    : P extends RtlPattern ? RtlMatch<E>
     : P extends BinaryPattern<infer L, infer R>
-    ? BinaryMatch<MatchOf<L>, MatchOf<R>>
+    ? BinaryMatch<MatchOf<L, E>, MatchOf<R, E>>
     : P extends UnaryPattern<infer A>
-    ? UnaryMatch<MatchOf<A>>
+    ? UnaryMatch<MatchOf<A, E>>
     : P extends AssignPattern<infer V>
-    ? AssignMatch<MatchOf<V>>
-    : P extends CallPattern ? CallMatch
+    ? AssignMatch<MatchOf<V, E>>
+    : P extends CallPattern ? CallMatch<E>
     : P extends BuiltinCallPattern<infer A, infer T>
-    ? BuiltinCallMatch<MatchOfTuple<A>, T extends EastPattern ? MatchOf<T> : never>
+    ? BuiltinCallMatch<MatchOfTuple<A, E>, T extends EastPattern ? MatchOf<T, E> : never>
     : never
 
 /** Maps each pattern in a fixed-length tuple to its `MatchOf`, preserving
@@ -218,8 +221,8 @@ export type MatchOf<P extends EastPattern> =
  *  pConst(), pRtl("acc"))`'s match type narrow `argumentMatches` to
  *  exactly `[LiteralMatch, LiteralMatch, RtlMatch]`, each position its own
  *  real type, not a widened union array. */
-type MatchOfTuple<T extends readonly EastPattern[]> =
-    {readonly [K in keyof T]: T[K] extends EastPattern ? MatchOf<T[K]> : never}
+type MatchOfTuple<T extends readonly EastPattern[], E extends { ext: string } = ExtOpPayload> =
+    {readonly [K in keyof T]: T[K] extends EastPattern ? MatchOf<T[K], E> : never}
 
 // 5. matchAllEast — single dispatcher, inlines all per-kind matching
 //
@@ -242,17 +245,17 @@ type MatchOfTuple<T extends readonly EastPattern[]> =
 // against the finished result" scheme would have already collapsed an
 // intermediate node before the parent's pattern ever got to see its raw
 // shape — see docs/ir-engine.md for why this matters.
-export function matchAllEast<P extends EastPattern>(
-    N: EastExpression,
+export function matchAllEast<P extends EastPattern, E extends { ext: string } = ExtOpPayload>(
+    N: EastExpression<E>,
     P: P,
-    tile: (node: EastExpression) => readonly EastExpression[],
-): MatchOf<P>[]
+    tile: (node: EastExpression<E>) => readonly EastExpression<E>[],
+): MatchOf<P, E>[]
 {
     switch(P.kind)
     {
         case "Literal":
             return isLiteral(N)
-                ? [{kind: "Literal", value: N.value} as MatchOf<P>]
+                ? [{kind: "Literal", value: N.value} as MatchOf<P, E>]
                 : []
 
         case "Const":
@@ -262,14 +265,14 @@ export function matchAllEast<P extends EastPattern>(
                 // pattern is never a whole rule's own top-level pattern, so
                 // `N` here is always a genuine child of whatever node the
                 // enclosing `tileNode` call is computing, never that same node.
-                if(isLiteral(N)) return [{kind: "Literal", value: N.value} as MatchOf<P>]
+                if(isLiteral(N)) return [{kind: "Literal", value: N.value} as MatchOf<P, E>]
                 const values = new Set(tile(N).filter(isLiteral).map(c => c.value))
-                return [...values].map(value => ({kind: "Literal", value} as MatchOf<P>))
+                return [...values].map(value => ({kind: "Literal", value} as MatchOf<P, E>))
             }
 
         case "Identifier":
             return isIdentifier(N)
-                ? [{kind: "Identifier", name: N.name} as MatchOf<P>]
+                ? [{kind: "Identifier", name: N.name} as MatchOf<P, E>]
                 : []
 
         case "Rtl":
@@ -278,7 +281,7 @@ export function matchAllEast<P extends EastPattern>(
                 const filtered = P.output === undefined
                     ? candidates
                     : candidates.filter(c => outputHas(c.output, P.output!))
-                return filtered.map(node => ({kind: "Rtl", node} as MatchOf<P>))
+                return filtered.map(node => ({kind: "Rtl", node} as MatchOf<P, E>))
             }
 
         case "Binary":
@@ -289,10 +292,10 @@ export function matchAllEast<P extends EastPattern>(
                 if(leftMatches.length === 0) return []
                 const rightMatches = matchAllEast(N.right, P.right, tile)
                 if(rightMatches.length === 0) return []
-                const out: MatchOf<P>[] = []
+                const out: MatchOf<P, E>[] = []
                 for(const leftMatch of leftMatches)
                     for(const rightMatch of rightMatches)
-                        out.push({kind: "Binary", operator: N.operator, leftMatch, rightMatch} as MatchOf<P>)
+                        out.push({kind: "Binary", operator: N.operator, leftMatch, rightMatch} as MatchOf<P, E>)
                 return out
             }
 
@@ -301,7 +304,7 @@ export function matchAllEast<P extends EastPattern>(
                 if(!isEastUnary(N)) return []
                 if(N.operator !== P.operator) return []
                 return matchAllEast(N.argument, P.argument, tile)
-                    .map(argumentMatch => ({kind: "Unary", operator: N.operator, argumentMatch} as MatchOf<P>))
+                    .map(argumentMatch => ({kind: "Unary", operator: N.operator, argumentMatch} as MatchOf<P, E>))
             }
 
         case "Assign":
@@ -311,7 +314,7 @@ export function matchAllEast<P extends EastPattern>(
                 // left is always an Identifier per the EAST type
                 if(N.left.type !== "Identifier") return []
                 return matchAllEast(N.right, P.right, tile)
-                    .map(rightMatch => ({kind: "Assign", operator: N.operator, target: N.left.name, rightMatch} as MatchOf<P>))
+                    .map(rightMatch => ({kind: "Assign", operator: N.operator, target: N.left.name, rightMatch} as MatchOf<P, E>))
             }
 
         case "Call":
@@ -327,10 +330,10 @@ export function matchAllEast<P extends EastPattern>(
                 const perArg = N.arguments.map((arg, i) =>
                     tile(arg).filter(isRtlNode).filter(c => outputHas(c.output, i === last ? "acc" : "tos")))
                 if(perArg.some(cands => cands.length === 0)) return []
-                let combos: RtlNode[][] = [[]]
+                let combos: RtlNode<E>[][] = [[]]
                 for(const cands of perArg)
                     combos = combos.flatMap(prefix => cands.map(c => [...prefix, c]))
-                return combos.map(argNodes => ({kind: "Call", callee: N.callee.name, argNodes} as MatchOf<P>))
+                return combos.map(argNodes => ({kind: "Call", callee: N.callee.name, argNodes} as MatchOf<P, E>))
             }
 
         case "BuiltinCall":
@@ -345,13 +348,13 @@ export function matchAllEast<P extends EastPattern>(
                 // across positions) — mirrors "Binary"'s left/right combination.
                 const perFixed = P.arguments.map((pat, i) => matchAllEast(N.arguments[i]!, pat, tile))
                 if(perFixed.some(cands => cands.length === 0)) return []
-                let fixedCombos: EastMatch[][] = [[]]
+                let fixedCombos: EastMatch<E>[][] = [[]]
                 for(const cands of perFixed)
                     fixedCombos = fixedCombos.flatMap(prefix => cands.map(c => [...prefix, c]))
 
                 if(P.tailPattern === undefined)
                     return fixedCombos.map(argumentMatches =>
-                        ({kind: "BuiltinCall", argumentMatches} as unknown as MatchOf<P>))
+                        ({kind: "BuiltinCall", argumentMatches} as unknown as MatchOf<P, E>))
 
                 // Variadic tail: every argument past the fixed prefix is matched
                 // against the *same* `tailPattern` — the identical recursive
@@ -361,14 +364,14 @@ export function matchAllEast<P extends EastPattern>(
                 const tailArgs = N.arguments.slice(fixedCount)
                 const perTail = tailArgs.map(arg => matchAllEast(arg, P.tailPattern!, tile))
                 if(perTail.some(cands => cands.length === 0)) return []
-                let tailCombos: EastMatch[][] = [[]]
+                let tailCombos: EastMatch<E>[][] = [[]]
                 for(const cands of perTail)
                     tailCombos = tailCombos.flatMap(prefix => cands.map(c => [...prefix, c]))
 
-                const out: MatchOf<P>[] = []
+                const out: MatchOf<P, E>[] = []
                 for(const argumentMatches of fixedCombos)
                     for(const tailMatches of tailCombos)
-                        out.push({kind: "BuiltinCall", argumentMatches, tailMatches} as unknown as MatchOf<P>)
+                        out.push({kind: "BuiltinCall", argumentMatches, tailMatches} as unknown as MatchOf<P, E>)
                 return out
             }
     }

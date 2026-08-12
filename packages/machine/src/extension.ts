@@ -12,10 +12,16 @@
  *
  * Every field is optional: a header-only extension (opaque `Procedure`/
  * `RtlProc.header` data, no new opcodes) needs none of them.
+ *
+ * `E` names the concrete extension's own `EXT` instruction payload shape
+ * (rtl.ts's `RtlInstr<E>` type parameter) — defaulted to `ExtOpPayload`
+ * (today's flat `{ext, operands}` shape) so an extension with no need for
+ * named-field operands (or a caller with no extension at all) never has to
+ * think about this parameter.
  */
 
 import type { Rule } from "./rules"
-import type { ExtInstr } from "./rtl"
+import type { ExtInstrOf, ExtOpPayload } from "./rtl"
 
 /**
  * Declared stack effect of one extension opcode (the "effect declarations"
@@ -24,7 +30,7 @@ import type { ExtInstr } from "./rtl"
  * dispatch stay ignorant of what the op actually does, needing only these
  * numbers/flags to keep isa-core.md §8's guarantees.
  */
-export interface ExtOpEffect
+export interface ExtOpEffect<E extends { ext: string } = ExtOpPayload>
 {
     /** Net TOS depth change contributed by the op itself, mirroring
      *  `ComboMeta.tosDelta` for core ops. Must be `<= 0` — `raise.ts`
@@ -47,8 +53,9 @@ export interface ExtOpEffect
      *  needed by this hook itself. */
     terminates?: boolean
     /** Set when this op is call-shaped (like the codec extension's fused
-     *  `CALL_CODEC`, docs/codec-extension.md §3.3) — which `operands` index
-     *  carries the resolved callee's procedure-table index. Lets
+     *  `CALL_CODEC`, docs/codec-extension.md §3.3) — resolves *this*
+     *  instruction's own callee procedure-table index, or `undefined` if
+     *  this particular instance isn't call-shaped after all. Lets
      *  validate.ts's §8.2/§8.3 call-graph walk fold it into the same
      *  `callSites` bookkeeping as a plain `CALL`, without knowing the op's
      *  name: the callee's own `argCount` header decides how many values the
@@ -61,8 +68,14 @@ export interface ExtOpEffect
      *  `ExecState.callProc` is the matching VM-side capability — the
      *  extension's own `exec` decides *when* to call it and what to bind
      *  first (e.g. a codec's object handle), but the invocation itself runs
-     *  through the same machinery a plain `CALL` does. */
-    call?: { calleeOperandIndex: number }
+     *  through the same machinery a plain `CALL` does.
+     *
+     *  A callback rather than a positional `{calleeOperandIndex: number}`
+     *  because `E` may have named fields instead of a flat `operands`
+     *  array — a callback reads whichever field means "callee" for its own
+     *  opcode however it likes, with no positional contract to keep in
+     *  sync with a wire-order comment. */
+    calleeOf?: (instr: ExtInstrOf<E>) => number | undefined
     /** True for an op whose real input includes whatever `acc` already
      *  holds, *in addition to* whatever `-tosDelta` says it pops off the
      *  stack — the codec extension's `WRITE`/`STORE_VAL`/`WRITE_SEQ`/
@@ -89,7 +102,7 @@ export interface ExtOpEffect
  *  straight-line by construction (isa-core.md §5.1).
  *
  *  `callProc` is the one exception to "straight-line": it's what a
- *  call-shaped op (`ExtOpEffect.call`, e.g. the codec extension's
+ *  call-shaped op (`ExtOpEffect.calleeOf`, e.g. the codec extension's
  *  `CALL_CODEC`) uses to actually invoke the callee `validate.ts` already
  *  folded into its call-graph bookkeeping — mirroring `vm.ts`'s own `CALL`
  *  case exactly (resolve the callee by table index, run it to completion,
@@ -110,29 +123,29 @@ export interface ExecState
     callProc(calleeIndex: number, args: readonly number[]): number
 }
 
-export interface ExtCodec
+export interface ExtCodec<E extends { ext: string } = ExtOpPayload>
 {
     /** Encode one extension instruction to its wire bytes, including the
      *  leading opcode byte (≥128). */
-    encode(instr: ExtInstr): number[]
+    encode(instr: ExtInstrOf<E>): number[]
     /** Decode one extension instruction starting at `bytes[offset]`, where
      *  `bytes[offset]` is the leading opcode byte (≥128) — mirrors
      *  `decodeInstr`'s own `{instr, next}` contract for every core opcode. */
-    decode(bytes: Uint8Array, offset: number): { instr: ExtInstr; next: number }
+    decode(bytes: Uint8Array, offset: number): { instr: ExtInstrOf<E>; next: number }
 }
 
-export interface Extension
+export interface Extension<E extends { ext: string } = ExtOpPayload>
 {
     /** DSL-side call-like syntax with fixed lowering — the same mechanism
      *  `builtinCallRules()` (rules.ts) already uses for `clz`/`trap`/
      *  `revbits`, generalized so an extension contributes its own rules
      *  instead of them being hardcoded there. */
-    rules?: (resolveLocal: (name: string) => number, resolveCallee: (name: string) => number | undefined) => Rule[]
+    rules?: (resolveLocal: (name: string) => number, resolveCallee: (name: string) => number | undefined) => Rule<E>[]
     /** One `ExtOpEffect` per opcode this extension defines, keyed by the
      *  `ExtInstr.ext` name validate.ts will see. */
-    effects?: Readonly<Record<string, ExtOpEffect>>
+    effects?: Readonly<Record<string, ExtOpEffect<E>>>
     /** VM execution for one extension instruction. */
-    exec?: (instr: ExtInstr, state: ExecState) => void
+    exec?: (instr: ExtInstrOf<E>, state: ExecState) => void
     /** Wire encode/decode for this extension's opcode range. */
-    codec?: ExtCodec
+    codec?: ExtCodec<E>
 }

@@ -17,6 +17,7 @@ import type { RtlProgram } from "@ppl/machine"
 
 import { createCodecExtension, codecRules } from "../src/engine/codec-extension"
 import type { Handle, Direction } from "../src/engine/codec-extension"
+import type { CodecExtInstr } from "../src/engine/codec-ext-instr"
 
 function numberCodec(direction: Direction, width: number)
 {
@@ -25,7 +26,7 @@ function numberCodec(direction: Direction, width: number)
         : proc([], ir`store_val(0, read(0, ${width})); return;`)
 }
 
-function lower(entry: ReturnType<typeof proc>): RtlProgram
+function lower(entry: ReturnType<typeof proc>): RtlProgram<CodecExtInstr>
 {
     return lowerProgram(entry, { rules: codecRules })
 }

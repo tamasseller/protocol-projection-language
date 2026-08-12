@@ -12,12 +12,31 @@
  *
  * Register/literal operands use two-level patterns matching Identifier /
  * Literal as a direct child of Binary — no intermediate reg-output RtlNode.
+ *
+ * Every rule builder below (`leafRules`, `foldRules`, `unaryRules`,
+ * `builtinCallRules`, `regOperandRules`, `immOperandRules`,
+ * `stackOperandRules`, `binaryRulesForOp`, `assignmentRules`, `callRules`)
+ * is deliberately *not* parameterized by `E` — none of them ever construct
+ * or inspect an `E`-shaped instruction, only core, non-`EXT` ones
+ * (`rtl.ts`'s `BaseRtlInstr`), so each returns a plain `Rule[]` (the
+ * default `E = ExtOpPayload`). `ruleset()` splices those together with
+ * whatever `Rule<E>[]` an extension's own `rules()` contributes
+ * (`Extension.rules`, extension.ts) into one `Rule<E>[]` for its own
+ * caller-supplied `E`, and that widening is free — `Rule.build` is
+ * declared with method syntax specifically so TS checks it *bivariantly*,
+ * letting a `Rule<ExtOpPayload>` stand in for a `Rule<E>` for any `E`
+ * without a cast. (Everywhere else in this codebase, a callback-shaped
+ * field is deliberately declared as an arrow-typed property instead, for
+ * strict — sound — contravariant checking; this is the one spot that
+ * specifically wants the looser, unsound-in-general check, because every
+ * value actually flowing through it is already known safe: nothing here
+ * ever reads an `E`-shaped field.)
  */
 
 import type {BinaryOperator, Literal, UnaryOperator} from "./ast"
 import type {EastPattern, MatchOf, CallPattern} from "./matcher"
 import {pLiteral, pConst, pIdentifier, pRtl, pBinary, pUnary, pAssign, pCall, pBuiltinCall} from "./matcher"
-import type {ComboName, OutputLocation, Resource, RtlInstr, BinaryOpcode, UnaryOpcode, StackCombo} from "./rtl"
+import type {ComboName, OutputLocation, Resource, RtlInstr, BinaryOpcode, UnaryOpcode, StackCombo, ExtOpPayload} from "./rtl"
 import {CONST, PUSH, LOAD, STORE, opReg, opRegWriteback, opImm, opStack, bare, call, trap, outputHas} from "./rtl"
 import type {EastExpression, RtlNode} from "./east"
 import {nodeInvariants, pickBinaryOrder} from "./builders"
@@ -25,7 +44,7 @@ import type {Extension} from "./extension"
 
 // ── Rule type + constructor ─────────────────────────────────────────────────
 
-export interface Rule
+export interface Rule<E extends { ext: string } = ExtOpPayload>
 {
     /**
      * Stable, human-readable rule identity — e.g. `"+->ADD:REG_ACC"`. Used
@@ -42,17 +61,25 @@ export interface Rule
     /** Usually builds an `RtlNode` (real code); a `fold:*` rule (below)
      *  builds a plain `Literal` instead — both are `EastExpression`s, and
      *  the orchestrator's `tileNode` treats them uniformly as tile
-     *  candidates for the same node. */
-    build: (match: MatchOf<any>) => EastExpression | undefined
+     *  candidates for the same node. Method syntax (not an arrow-typed
+     *  property) — see this file's own header for why. */
+    build(match: MatchOf<any, E>): EastExpression<E> | undefined
 }
 
-export function rule<P extends EastPattern>(
+/** Genuinely `<E>`-generic (unlike this file's own internal builders below,
+ *  which stay at the default `E` and cast once at their own return
+ *  boundary) — an extension author calling this directly (as
+ *  `Extension.rules`, e.g. `@ppl/codecs`'s `codecRules()`) needs `E` to
+ *  actually propagate from a real `leafNode<E>`/`unaryNode<E>` call inside
+ *  `build`, not be squashed to the default by a non-generic signature
+ *  here. */
+export function rule<P extends EastPattern, E extends { ext: string } = ExtOpPayload>(
     name: string,
     pattern: P,
-    build: (match: MatchOf<P>) => EastExpression | undefined,
-): Rule
+    build: (match: MatchOf<P, E>) => EastExpression<E> | undefined,
+): Rule<E>
 {
-    return {name, pattern, build: build as Rule["build"]}
+    return {name, pattern, build: build as Rule<E>["build"]}
 }
 
 // ── Operator classification ─────────────────────────────────────────────────
@@ -94,7 +121,7 @@ const UNARY_OPS: readonly {ast: UnaryOperator; isa: UnaryOpcode}[] = [
 /** Exported for extensions (extension.ts's `Extension.rules`) — building a
  *  leaf `RtlNode` for a domain-specific opcode is exactly this same shape,
  *  not something the extension mechanism needs to reinvent. */
-export function leafNode(output: OutputLocation[], fragment: RtlInstr[], clobbers: Resource[], tosDelta: number, maxStack: number): RtlNode
+export function leafNode<E extends { ext: string } = ExtOpPayload>(output: OutputLocation[], fragment: RtlInstr<E>[], clobbers: Resource[], tosDelta: number, maxStack: number): RtlNode<E>
 {
     return {type: "RtlNode", output, fragment, clobbers, tosDelta, maxStack}
 }
@@ -104,7 +131,7 @@ export function leafNode(output: OutputLocation[], fragment: RtlInstr[], clobber
  *  tiled sub-expression's value (rather than only literal operands) needs
  *  to splice that child's own fragment in ahead of its instruction and
  *  inherit its `clobbers`/`tosDelta`/`maxStack`, exactly this shape. */
-export function unaryNode(child: RtlNode, output: OutputLocation[], fragment: RtlInstr[]): RtlNode
+export function unaryNode<E extends { ext: string } = ExtOpPayload>(child: RtlNode<E>, output: OutputLocation[], fragment: RtlInstr<E>[]): RtlNode<E>
 {
     return {type: "RtlNode", output, fragment, clobbers: [...child.clobbers], tosDelta: child.tosDelta, maxStack: child.maxStack}
 }
@@ -566,11 +593,11 @@ function callRules(resolveCallee: (name: string) => number | undefined): Rule[]
     ]
 }
 
-export const ruleset = (
+export const ruleset = <E extends { ext: string } = ExtOpPayload>(
     resolveLocal: (name: string) => number,
     resolveCallee: (name: string) => number | undefined,
-    extension?: Extension,
-) => [
+    extension?: Extension<E>,
+): Rule<E>[] => [
     ...foldRules(),
     ...leafRules(resolveLocal),
     ...unaryRules(),

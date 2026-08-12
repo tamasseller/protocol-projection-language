@@ -4,7 +4,7 @@
  * Two kinds of coverage: (1) real `buildCodec` output — including a
  * hoisted union field, so `ENTER` onto a non-`o0` handle actually appears
  * in the body — passes `validateCodecHandles` cleanly; (2) hand-built
- * `RtlProgram` fixtures for each violation §7.1 is supposed to catch.
+ * `RtlProgram<CodecExtInstr>` fixtures for each violation §7.1 is supposed to catch.
  */
 
 import { describe, test } from "node:test"
@@ -13,7 +13,9 @@ import assert from "node:assert/strict"
 import type { TypeNode } from "@ppl/core"
 import { struct, union, unit, u8, u32, list, buildTypeGraph } from "@ppl/core"
 import type { RtlProgram, RtlProc } from "@ppl/machine"
-import { extInstr, bare, validateProgram } from "@ppl/machine"
+import { bare, validateProgram } from "@ppl/machine"
+import { callCodecInstr, enterInstr, enterNextInstr, loadValInstr, tagInstr } from "../src/engine/codec-ext-instr"
+import type { CodecExtInstr } from "../src/engine/codec-ext-instr"
 
 import { validateCodecHandles } from "../src/engine/validate-handles"
 import { buildCodec } from "../src/engine/resolver"
@@ -67,7 +69,7 @@ function itemTypeNodes()
     return { item, tagUnion, variantA, payload, v }
 }
 
-function proc(argCount: number, body: RtlProc["body"], header?: TypeNode): RtlProc
+function proc(argCount: number, body: RtlProc<CodecExtInstr>["body"], header?: TypeNode): RtlProc<CodecExtInstr>
 {
     return { argCount, body, header }
 }
@@ -81,10 +83,10 @@ describe("validateCodecHandles — hand-built fixtures", () =>
         // proc 0: item's own codec — enters both its fields, delegates the
         // active union variant (proc 1) and the payload struct (proc 2).
         const itemProc = proc(0, [
-            extInstr("ENTER", [1, 0, 0]),        // handle1 = tag (union)
-            extInstr("ENTER", [2, 1, 0]),        // handle2 = tag's variant 'a' (unit)
-            extInstr("CALL_CODEC", [1, 1, 0]),   // delegate variant 'a' to proc 1
-            extInstr("CALL_CODEC", [2, 0, 1]),   // delegate 'payload' (from o0 directly) to proc 2
+            enterInstr(1, 0, 0),        // handle1 = tag (union)
+            enterInstr(2, 1, 0),        // handle2 = tag's variant 'a' (unit)
+            callCodecInstr(1, 1, 0),   // delegate variant 'a' to proc 1
+            callCodecInstr(2, 0, 1),   // delegate 'payload' (from o0 directly) to proc 2
             bare("RETURN"),
         ], item)
 
@@ -93,12 +95,12 @@ describe("validateCodecHandles — hand-built fixtures", () =>
 
         // proc 2: payload's own codec — enters its one field and reads it.
         const payloadProc = proc(0, [
-            extInstr("ENTER", [1, 0, 0]),   // handle1 = v (integer)
-            extInstr("LOAD_VAL", [1]),
+            enterInstr(1, 0, 0),   // handle1 = v (integer)
+            loadValInstr(1),
             bare("RETURN"),
         ], payload)
 
-        const program: RtlProgram = { procedures: [itemProc, variantAProc, payloadProc] }
+        const program: RtlProgram<CodecExtInstr> = { procedures: [itemProc, variantAProc, payloadProc] }
 
         assert.doesNotThrow(() => validateCodecHandles(program))
     })
@@ -106,8 +108,8 @@ describe("validateCodecHandles — hand-built fixtures", () =>
     test("rejects an out-of-range struct field ref", () =>
     {
         const { item } = itemTypeNodes()
-        const program: RtlProgram = {
-            procedures: [proc(0, [extInstr("ENTER", [1, 0, 5]), bare("RETURN")], item)],
+        const program: RtlProgram<CodecExtInstr> = {
+            procedures: [proc(0, [enterInstr(1, 0, 5), bare("RETURN")], item)],
         }
         assert.throws(() => validateCodecHandles(program), /ref 5 out of range/)
     })
@@ -116,9 +118,9 @@ describe("validateCodecHandles — hand-built fixtures", () =>
     {
         const { item, payload } = itemTypeNodes()
         void payload
-        const program: RtlProgram = {
+        const program: RtlProgram<CodecExtInstr> = {
             procedures: [
-                proc(0, [extInstr("CALL_CODEC", [1, 0, 1]), bare("RETURN")], item),
+                proc(0, [callCodecInstr(1, 0, 1), bare("RETURN")], item),
                 proc(0, [bare("RETURN")]), // no header — GENERIC
             ],
         }
@@ -128,10 +130,10 @@ describe("validateCodecHandles — hand-built fixtures", () =>
     test("rejects CALL_CODEC delegating to a codec built for the wrong type", () =>
     {
         const { item, tagUnion } = itemTypeNodes()
-        const program: RtlProgram = {
+        const program: RtlProgram<CodecExtInstr> = {
             procedures: [
                 // field 1 is 'payload', but the callee below declares 'tagUnion' as its type.
-                proc(0, [extInstr("CALL_CODEC", [1, 0, 1]), bare("RETURN")], item),
+                proc(0, [callCodecInstr(1, 0, 1), bare("RETURN")], item),
                 proc(0, [bare("RETURN")], tagUnion),
             ],
         }
@@ -141,10 +143,10 @@ describe("validateCodecHandles — hand-built fixtures", () =>
     test("rejects TAG on a non-union handle", () =>
     {
         const { item } = itemTypeNodes()
-        const program: RtlProgram = {
+        const program: RtlProgram<CodecExtInstr> = {
             procedures: [proc(0, [
-                extInstr("ENTER", [1, 0, 1]),  // handle1 = payload (a struct)
-                extInstr("TAG", [1]),
+                enterInstr(1, 0, 1),  // handle1 = payload (a struct)
+                tagInstr(1),
                 bare("RETURN"),
             ], item)],
         }
@@ -154,8 +156,8 @@ describe("validateCodecHandles — hand-built fixtures", () =>
     test("rejects ENTER_NEXT on a non-list handle", () =>
     {
         const { item } = itemTypeNodes()
-        const program: RtlProgram = {
-            procedures: [proc(0, [extInstr("ENTER_NEXT", [1, 0]), bare("RETURN")], item)],
+        const program: RtlProgram<CodecExtInstr> = {
+            procedures: [proc(0, [enterNextInstr(1, 0), bare("RETURN")], item)],
         }
         assert.throws(() => validateCodecHandles(program), /list only/)
     })
@@ -163,16 +165,16 @@ describe("validateCodecHandles — hand-built fixtures", () =>
     test("rejects a handle used before it's entered", () =>
     {
         const { item } = itemTypeNodes()
-        const program: RtlProgram = {
-            procedures: [proc(0, [extInstr("LOAD_VAL", [1]), bare("RETURN")], item)],
+        const program: RtlProgram<CodecExtInstr> = {
+            procedures: [proc(0, [loadValInstr(1), bare("RETURN")], item)],
         }
         assert.throws(() => validateCodecHandles(program), /never entered/)
     })
 
     test("a GENERIC procedure (no header) touching any handle at all is rejected — o0 doesn't exist for it", () =>
     {
-        const program: RtlProgram = {
-            procedures: [proc(0, [extInstr("LOAD_VAL", [0]), bare("RETURN")])], // no header
+        const program: RtlProgram<CodecExtInstr> = {
+            procedures: [proc(0, [loadValInstr(0), bare("RETURN")])], // no header
         }
         assert.throws(() => validateCodecHandles(program), /never entered/)
     })

@@ -111,6 +111,18 @@ export type MoveRegOpcode = "LOAD" | "STORE"
 // RtlInstr — discriminated union
 // ─────────────────────────────────────────────────────────────────────────────
 
+/** The default `EXT` payload shape — a bare opcode name plus an untyped,
+ *  positional operand array. This is what every non-parameterized use of
+ *  `RtlInstr`/`RtlProc`/`RtlProgram`/`Extension` means, unchanged from
+ *  before `RtlInstr` grew a type parameter. A concrete extension that wants
+ *  named-field operands (e.g. `@ppl/codecs`'s `CodecExtInstr`) supplies its
+ *  own shape as `E` instead. */
+export interface ExtOpPayload
+{
+    ext: string
+    operands: readonly number[]
+}
+
 /**
  * Six instruction shapes, distinguished by `op` range and field presence.
  * The combo split makes `target`/`imm` *required when applicable* rather than
@@ -125,8 +137,22 @@ export type MoveRegOpcode = "LOAD" | "STORE"
  *   4. `instr.op === "LOAD"/"STORE"`    → move-register (`target`)
  *   5. `instr.op === "CONST"`           → move-immediate (`imm`)
  *   6. else                              → bare (unary / PUSH / POP / control)
+ *
+ * `E` parameterizes only the `EXT` arm's payload — every other arm is
+ * fixed, core ISA shape, entirely independent of which extension (if any)
+ * is active, and split out as `BaseRtlInstr` on that basis: a rule builder
+ * that only ever constructs core instructions (every one of `rules.ts`'s
+ * own, e.g.) can target `BaseRtlInstr` directly and never think about `E`
+ * at all, rather than being parameterized over a type it never touches.
+ * Defaulted to `ExtOpPayload` so every existing non-parameterized
+ * `RtlInstr` means exactly what it always meant. The core
+ * (`lower.ts`/`validate.ts`/`vm.ts`/`bytecode.ts`/`raise.ts`) never
+ * interprets `E`'s contents itself — it only ever reads `.ext` (for
+ * effect-table lookups) and passes the whole instruction through to
+ * extension-supplied callbacks (`exec`, `codec`), so genericizing this one
+ * arm costs the core nothing semantically, only type-parameter plumbing.
  */
-export type RtlInstr =
+export type BaseRtlInstr =
     // 1a. Register-combo binary: arithmetic/comparison reading a register
     //     operand. target is REQUIRED (it names the operand register).
     | { op: BinaryOpcode; combo: RegCombo; target: number }
@@ -153,94 +179,104 @@ export type RtlInstr =
     //    name to its table index is `lower.ts`'s job, on the fly, as it
     //    discovers each procedure (ROADMAP.md item 2).
     | { op: "CALL"; calleeIndex: number }
-    // 7. Extension: one domain-specific opcode (isa-core.md §5.1, byte
-    //    ≥128 — "owned by the active extension"). `ext` is opaque to the
-    //    generic core; `operands` are literal constants only, by design
-    //    (ROADMAP.md item 6) — never a register/stack reference resolved
-    //    at runtime, so an AOT translator can implement whatever an
-    //    extension op abstracts away (a struct field access, a `*ptr++`
-    //    read, ...) with ordinary target-native code, not an interpreter
-    //    loop. What an `ext` name means — its stack effect, VM execution,
-    //    and wire encoding — comes from an `Extension` object threaded
-    //    through `ruleset`/`lowerProgram`/`validateProgram`/`run`/
-    //    `encodeInstr`/`decodeInstr` as an optional parameter (see
-    //    extension.ts); with none registered, an `EXT` instruction is
-    //    simply data no stage knows how to interpret.
-    | { op: "EXT"; ext: string; operands: readonly number[] }
+
+/**
+ * `BaseRtlInstr` plus one more arm — extension: one domain-specific opcode
+ * (isa-core.md §5.1, byte ≥128 — "owned by the active extension"). `ext`
+ * is opaque to the generic core; `operands` (the default payload's shape)
+ * are literal constants only, by design (ROADMAP.md item 6) — never a
+ * register/stack reference resolved at runtime, so an AOT translator can
+ * implement whatever an extension op abstracts away (a struct field
+ * access, a `*ptr++` read, ...) with ordinary target-native code, not an
+ * interpreter loop. What an `ext` name means — its stack effect, VM
+ * execution, and wire encoding — comes from an `Extension<E>` object
+ * threaded through `ruleset`/`lowerProgram`/`validateProgram`/`run`/
+ * `encodeInstr`/`decodeInstr` as an optional parameter (see extension.ts);
+ * with none registered, an `EXT` instruction is simply data no stage knows
+ * how to interpret.
+ */
+export type RtlInstr<E extends { ext: string } = ExtOpPayload> =
+    | BaseRtlInstr
+    | ({ op: "EXT" } & E)
 
 
-export const isCallInstr = (i: RtlInstr): i is Extract<RtlInstr, { op: "CALL" }> =>
+export const isCallInstr = <E extends { ext: string } = ExtOpPayload>(i: RtlInstr<E>): i is Extract<RtlInstr<E>, { op: "CALL" }> =>
     i.op === "CALL"
 
-/** The `EXT` variant on its own — the shape `Extension.exec`/`ExtCodec`
- *  (extension.ts) operate on. */
-export type ExtInstr = Extract<RtlInstr, { op: "EXT" }>
+/** The `EXT` variant on its own, for a given `E` — the shape
+ *  `Extension.exec`/`ExtCodec` (extension.ts) operate on. */
+export type ExtInstrOf<E extends { ext: string } = ExtOpPayload> = Extract<RtlInstr<E>, { op: "EXT" }>
 
-export const isExtInstr = (i: RtlInstr): i is ExtInstr =>
+/** The default-payload `EXT` variant — unchanged meaning from before
+ *  `RtlInstr` grew a type parameter (every existing import of this name
+ *  keeps meaning exactly what it always meant). */
+export type ExtInstr = ExtInstrOf
+
+export const isExtInstr = <E extends { ext: string } = ExtOpPayload>(i: RtlInstr<E>): i is ExtInstrOf<E> =>
     i.op === "EXT"
 
-export const isParametricInstr = (i: RtlInstr): i is Extract<RtlInstr, { op: "BR_TABLE" | "TRAP" }> =>
+export const isParametricInstr = <E extends { ext: string } = ExtOpPayload>(i: RtlInstr<E>): i is Extract<RtlInstr<E>, { op: "BR_TABLE" | "TRAP" }> =>
     i.op === "BR_TABLE" || i.op === "TRAP"
 
-export const isRegComboInstr = (i: RtlInstr): i is Extract<RtlInstr, { combo: RegCombo }> =>
+export const isRegComboInstr = <E extends { ext: string } = ExtOpPayload>(i: RtlInstr<E>): i is Extract<RtlInstr<E>, { combo: RegCombo }> =>
     "combo" in i && (i.combo === "REG_ACC" || i.combo === "REG_REG")
 
-export const isImmComboInstr = (i: RtlInstr): i is Extract<RtlInstr, { combo: "IMM_ACC" }> =>
+export const isImmComboInstr = <E extends { ext: string } = ExtOpPayload>(i: RtlInstr<E>): i is Extract<RtlInstr<E>, { combo: "IMM_ACC" }> =>
     "combo" in i && i.combo === "IMM_ACC"
 
-export const isStackComboInstr = (i: RtlInstr): i is Extract<RtlInstr, { combo: StackCombo }> =>
+export const isStackComboInstr = <E extends { ext: string } = ExtOpPayload>(i: RtlInstr<E>): i is Extract<RtlInstr<E>, { combo: StackCombo }> =>
     "combo" in i && (i.combo === "PEEK_PEEK" || i.combo === "POP_ACC")
 
 /** `acc ← rN` — load register into accumulator (unfused; §4.4). */
-export const LOAD = (target: number): RtlInstr =>
+export const LOAD = <E extends { ext: string } = ExtOpPayload>(target: number): RtlInstr<E> =>
     ({ op: "LOAD", target })
 
 /** `rN ← acc` — store accumulator to register (unfused; §4.4). */
-export const STORE = (target: number): RtlInstr =>
+export const STORE = <E extends { ext: string } = ExtOpPayload>(target: number): RtlInstr<E> =>
     ({ op: "STORE", target })
 
 /** `[tos++] ← acc` — push accumulator onto stack. */
-export const PUSH = (): RtlInstr =>
+export const PUSH = <E extends { ext: string } = ExtOpPayload>(): RtlInstr<E> =>
     ({ op: "PUSH" })
 
 /** `acc ← [--tos]` — pop stack into accumulator. */
-export const POP = (): RtlInstr =>
+export const POP = <E extends { ext: string } = ExtOpPayload>(): RtlInstr<E> =>
     ({ op: "POP" })
 
 /** `acc ← #imm` — load constant into accumulator. */
-export const CONST = (imm: number): RtlInstr =>
+export const CONST = <E extends { ext: string } = ExtOpPayload>(imm: number): RtlInstr<E> =>
     ({ op: "CONST", imm })
 
 /** `acc = acc ⟨op⟩ rN` — binary op with register operand, result → acc. */
-export const opReg = (op: BinaryOpcode, target: number): RtlInstr =>
+export const opReg = <E extends { ext: string } = ExtOpPayload>(op: BinaryOpcode, target: number): RtlInstr<E> =>
     ({ op, combo: "REG_ACC", target })
 
 /** `rN = acc ⟨op⟩ rN` — binary op with register operand, write-back to that
  *  same register (combo 2, §3). The single-instruction form of "compute
  *  into a register and store back into it" — e.g. `x += 1` reformulated as
  *  `1 + x` (commutative) folds to `CONST #1; ADD x → x`, no separate STORE. */
-export const opRegWriteback = (op: BinaryOpcode, target: number): RtlInstr =>
+export const opRegWriteback = <E extends { ext: string } = ExtOpPayload>(op: BinaryOpcode, target: number): RtlInstr<E> =>
     ({ op, combo: "REG_REG", target })
 
 /** `acc = acc ⟨op⟩ #imm` — binary op with immediate operand, result → acc. */
-export const opImm = (op: BinaryOpcode, imm: number): RtlInstr =>
+export const opImm = <E extends { ext: string } = ExtOpPayload>(op: BinaryOpcode, imm: number): RtlInstr<E> =>
     ({ op, combo: "IMM_ACC", imm })
 
 /** Stack-combo binary op (peek-writeback or pop). */
-export const opStack = (op: BinaryOpcode, combo: StackCombo): RtlInstr =>
+export const opStack = <E extends { ext: string } = ExtOpPayload>(op: BinaryOpcode, combo: StackCombo): RtlInstr<E> =>
     ({ op, combo })
 
 /** Bare unary ALU (`NEG`, `NOT`, `CLZ`, `REVBITS`) or no-operand control flow
  *  (`RETURN`, `BLOCK_END`, `LOOP`). */
-export const bare = (op: UnaryOpcode | ControlOpcode): RtlInstr =>
+export const bare = <E extends { ext: string } = ExtOpPayload>(op: UnaryOpcode | ControlOpcode): RtlInstr<E> =>
     ({ op })
 
 /** `BR_TABLE #n` — open dispatch block with n cases. */
-export const brTable = (n: number): RtlInstr =>
+export const brTable = <E extends { ext: string } = ExtOpPayload>(n: number): RtlInstr<E> =>
     ({ op: "BR_TABLE", imm: n })
 
 /** `TRAP #code` — abnormal exit with error code. */
-export const trap = (code: number): RtlInstr =>
+export const trap = <E extends { ext: string } = ExtOpPayload>(code: number): RtlInstr<E> =>
     ({ op: "TRAP", imm: code })
 
 /** `CALL proc_idx` — invoke `procedure[calleeIndex]` (isa-core.md §4.6).
@@ -250,21 +286,23 @@ export const trap = (code: number): RtlInstr =>
  *  through it costs nothing and saves a `PUSH` for the extremely common
  *  single-argument call. Only the callee's other `argCount - 1` arguments
  *  (0 for a 0- or 1-argument callee) are actually popped off the stack. */
-export const call = (calleeIndex: number): RtlInstr =>
+export const call = <E extends { ext: string } = ExtOpPayload>(calleeIndex: number): RtlInstr<E> =>
     ({ op: "CALL", calleeIndex })
 
-/** `EXT ext operands...` — one extension-defined opcode (isa-core.md §5.1).
- *  `operands` are literal constants, resolved at lowering time (register
- *  indices, procedure-table indices, small handle literals, ...) — never
- *  computed at runtime. */
+/** `EXT ext operands...` — one extension-defined opcode (isa-core.md §5.1),
+ *  in the default flat-payload shape. `operands` are literal constants,
+ *  resolved at lowering time (register indices, procedure-table indices,
+ *  small handle literals, ...) — never computed at runtime. A concrete
+ *  extension with its own named-field `E` defines its own per-opcode
+ *  constructors instead (e.g. `@ppl/codecs`'s `codec-ext-instr.ts`). */
 export const extInstr = (ext: string, operands: readonly number[]): ExtInstr =>
     ({ op: "EXT", ext, operands })
 
 
-export interface RtlProc
+export interface RtlProc<E extends { ext: string } = ExtOpPayload>
 {
     argCount: number
-    body: RtlInstr[]
+    body: RtlInstr<E>[]
     /** Extension-owned header data (isa-core.md §2.3's extension fields —
      *  e.g. the codec extension's ABI-kind selector). Opaque to the
      *  generic core: never read or interpreted by `lower.ts`/`validate.ts`/
@@ -274,9 +312,9 @@ export interface RtlProc
     header?: unknown
 }
 
-export interface RtlProgram
+export interface RtlProgram<E extends { ext: string } = ExtOpPayload>
 {
-    procedures: RtlProc[]
+    procedures: RtlProc<E>[]
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -313,6 +351,11 @@ const STACK_RESULT: Partial<Record<StackCombo, string>> = {
  * Render one instruction as a human-readable string. The output is stable
  * and round-trips through visual inspection — intended for debug dumps,
  * test snapshots, and error messages. Not a serialization format.
+ *
+ * Only ever called with the default `ExtOpPayload` shape — a concrete
+ * extension with named-field operands owns its own debug rendering (e.g.
+ * a `describe(instr: CodecExtInstr)`), not worth solving generically for
+ * one consumer when `EXT`'s own arm is the only one that varies by `E`.
  */
 export function format(instr: RtlInstr): string
 {

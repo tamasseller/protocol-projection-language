@@ -55,10 +55,16 @@
  * (codec-extension.ts), read from `acc` at runtime, not wire-encoded.
  */
 
-import type { ExtCodec, ExtInstr } from "@ppl/machine"
+import type { ExtCodec, ExtInstrOf } from "@ppl/machine"
 import { encodeLeb128, decodeLeb128 } from "@ppl/machine"
-import { CODEC_OPCODES } from "./opcodes"
+import { CODEC_OPCODES, assertNever } from "./opcodes"
 import type { CodecOpcode } from "./opcodes"
+import type { CodecExtInstr } from "./codec-ext-instr"
+import {
+    enterInstr, enterNextInstr, loadValInstr, storeValInstr, countInstr, tagInstr, openListInstr,
+    readInstr, writeInstr, hasNextInstr, cloneRdInstr, cloneWrInstr, seekInstr,
+    callCodecInstr, callCodecNextInstr, writeSeqInstr, readSeqInstr,
+} from "./codec-ext-instr"
 
 /** Handle IDs, iterator IDs, and (per this file's header) `ENTER`'s `ref`
  *  all share this one "small" threshold. */
@@ -386,23 +392,81 @@ function opAndLocalCodeOf(byte: number): { op: CodecOpcode; local: number }
     throw new Error(`wire: byte ${byte} (local code ${code}) is reserved and unassigned`)
 }
 
-function encode(instr: ExtInstr): number[]
+/** Flatten a structured `CodecExtInstr` back to the positional array each
+ *  `Band` above already expects, in the exact order its own doc comment
+ *  documents — the one place the named/positional seam lives, so every
+ *  `Band` factory above stays untouched, pure bit-packing over
+ *  `readonly number[]`. */
+function operandsOf(instr: CodecExtInstr): readonly number[]
 {
-    const op = instr.ext as CodecOpcode
+    switch(instr.ext)
+    {
+        case "ENTER": return [instr.dst, instr.src, instr.ref]
+        case "ENTER_NEXT": return [instr.dst, instr.src]
+        case "LOAD_VAL": return [instr.src]
+        case "STORE_VAL": return [instr.src]
+        case "COUNT": return [instr.src]
+        case "TAG": return [instr.src]
+        case "OPEN_LIST": return [instr.src]
+        case "READ": return [instr.iter, instr.width]
+        case "WRITE": return [instr.iter, instr.width]
+        case "HAS_NEXT": return [instr.iter]
+        case "CLONE_RD": return [instr.src, instr.dst]
+        case "CLONE_WR": return [instr.src, instr.dst]
+        case "SEEK": return [instr.iter, instr.delta]
+        case "CALL_CODEC": return [instr.calleeIndex, instr.src, instr.ref]
+        case "CALL_CODEC_NEXT": return [instr.calleeIndex, instr.src]
+        case "WRITE_SEQ": return [instr.iter, instr.handle, instr.width]
+        case "READ_SEQ": return [instr.iter, instr.handle, instr.width, instr.signed ? 1 : 0]
+        default: return assertNever(instr)
+    }
+}
+
+/** The mirror of `operandsOf` — rebuild a structured `CodecExtInstr` from
+ *  the flat array a `Band.decode` just reconstructed, via the same 17
+ *  named constructors `codecRules()` uses (codec-ext-instr.ts), so there's
+ *  exactly one place per opcode that knows its own operand order. */
+function fromOperands(op: CodecOpcode, operands: readonly number[]): ExtInstrOf<CodecExtInstr>
+{
+    switch(op)
+    {
+        case "ENTER": return enterInstr(operands[0]!, operands[1]!, operands[2]!)
+        case "ENTER_NEXT": return enterNextInstr(operands[0]!, operands[1]!)
+        case "LOAD_VAL": return loadValInstr(operands[0]!)
+        case "STORE_VAL": return storeValInstr(operands[0]!)
+        case "COUNT": return countInstr(operands[0]!)
+        case "TAG": return tagInstr(operands[0]!)
+        case "OPEN_LIST": return openListInstr(operands[0]!)
+        case "READ": return readInstr(operands[0]!, operands[1]!)
+        case "WRITE": return writeInstr(operands[0]!, operands[1]!)
+        case "HAS_NEXT": return hasNextInstr(operands[0]!)
+        case "CLONE_RD": return cloneRdInstr(operands[0]!, operands[1]!)
+        case "CLONE_WR": return cloneWrInstr(operands[0]!, operands[1]!)
+        case "SEEK": return seekInstr(operands[0]!, operands[1]!)
+        case "CALL_CODEC": return callCodecInstr(operands[0]!, operands[1]!, operands[2]!)
+        case "CALL_CODEC_NEXT": return callCodecNextInstr(operands[0]!, operands[1]!)
+        case "WRITE_SEQ": return writeSeqInstr(operands[0]!, operands[1]!, operands[2]!)
+        case "READ_SEQ": return readSeqInstr(operands[0]!, operands[1]!, operands[2]!, operands[3]!)
+        default: return assertNever(op)
+    }
+}
+
+function encode(instr: CodecExtInstr): number[]
+{
+    const op = instr.ext
     const band = BAND_BY_OP[op]
-    if (!band) throw new Error(`wire: unknown codec opcode "${instr.ext}"`)
     const base = BASE_BY_OP.get(op)!
-    const { code, rest } = band.encode(instr.operands)
+    const { code, rest } = band.encode(operandsOf(instr))
     return [128 + base + code, ...rest]
 }
 
-function decode(bytes: Uint8Array, offset: number): { instr: ExtInstr; next: number }
+function decode(bytes: Uint8Array, offset: number): { instr: ExtInstrOf<CodecExtInstr>; next: number }
 {
     const { op, local } = opAndLocalCodeOf(bytes[offset]!)
     const { operands, next } = BAND_BY_OP[op].decode(local, bytes, offset + 1)
-    return { instr: { op: "EXT", ext: op, operands }, next }
+    return { instr: fromOperands(op, operands), next }
 }
 
 /** The codec extension's `Extension.codec` — wired into
  *  `createCodecExtension`'s returned `Extension` (codec-extension.ts). */
-export const codecWireCodec: ExtCodec = { encode, decode }
+export const codecWireCodec: ExtCodec<CodecExtInstr> = { encode, decode }

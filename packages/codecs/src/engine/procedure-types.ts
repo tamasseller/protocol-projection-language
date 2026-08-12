@@ -51,7 +51,7 @@ import type { RtlProgram, RtlInstr } from "@ppl/machine"
 import { isExtInstr } from "@ppl/machine"
 import type { SemanticType, TypeNode } from "@ppl/core"
 import { buildTypeGraph, SemanticTypeKinds } from "@ppl/core"
-import { isCodecOpcode } from "./opcodes"
+import type { CodecExtInstr } from "./codec-ext-instr"
 
 /** A struct field's/union variant's child edge, navigated the same way
  *  `computeChild` does at runtime: by declaration-order `ref` index —
@@ -121,7 +121,7 @@ export function requireSlotNode(slotNodes: ReadonlyMap<number, TypeNode>, slot: 
  * rather than being this function's own private helpers.
  */
 export function resolveHandleTypes(
-    body: readonly RtlInstr[],
+    body: readonly RtlInstr<CodecExtInstr>[],
     entryNode: TypeNode,
     onCall?: (calleeIndex: number, childNode: TypeNode) => void,
 ): Map<number, TypeNode>
@@ -130,34 +130,34 @@ export function resolveHandleTypes(
 
     for(const instr of body)
     {
-        if(!isExtInstr(instr) || !isCodecOpcode(instr.ext)) continue
+        if(!isExtInstr(instr)) continue
 
         switch(instr.ext)
         {
             case "ENTER":
             {
-                const [dst, src, ref] = instr.operands as readonly [number, number, number]
+                const {dst, src, ref} = instr
                 const srcNode = requireSlotNode(slotNodes, src, "ENTER")
                 slotNodes.set(dst, childNode(srcNode, ref))
                 break
             }
             case "ENTER_NEXT":
             {
-                const [dst, src] = instr.operands as readonly [number, number]
+                const {dst, src} = instr
                 const srcNode = requireSlotNode(slotNodes, src, "ENTER_NEXT")
                 slotNodes.set(dst, nextNode(srcNode))
                 break
             }
             case "CALL_CODEC":
             {
-                const [calleeIndex, src, ref] = instr.operands as readonly [number, number, number]
+                const {calleeIndex, src, ref} = instr
                 const srcNode = requireSlotNode(slotNodes, src, "CALL_CODEC")
                 onCall?.(calleeIndex, childNode(srcNode, ref))
                 break
             }
             case "CALL_CODEC_NEXT":
             {
-                const [calleeIndex, src] = instr.operands as readonly [number, number]
+                const {calleeIndex, src} = instr
                 const srcNode = requireSlotNode(slotNodes, src, "CALL_CODEC_NEXT")
                 onCall?.(calleeIndex, nextNode(srcNode))
                 break
@@ -177,7 +177,7 @@ export function resolveHandleTypes(
  * reaches the same procedure more than once — same reason
  * `reconcile.ts`/`resolver.ts` both memoize their own recursive walks).
  */
-export function resolveProcedureTypes(program: RtlProgram, rootType: SemanticType): Map<number, TypeNode>
+export function resolveProcedureTypes(program: RtlProgram<CodecExtInstr>, rootType: SemanticType): Map<number, TypeNode>
 {
     const graph = buildTypeGraph(rootType)
     const types = new Map<number, TypeNode>()

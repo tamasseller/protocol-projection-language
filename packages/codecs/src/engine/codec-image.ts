@@ -19,12 +19,13 @@ import type { RtlProgram } from "@ppl/machine"
 import { decodeProgram, encodeProgram } from "@ppl/machine"
 import { codecWireCodec } from "./wire"
 import { decodeTypeTree, encodeTypeTree } from "./type-tree-wire"
+import type { CodecExtInstr } from "./codec-ext-instr"
 
 export interface CodecImage
 {
     readonly typeTree: SemanticType
-    readonly encoderProgram: RtlProgram
-    readonly decoderProgram: RtlProgram
+    readonly encoderProgram: RtlProgram<CodecExtInstr>
+    readonly decoderProgram: RtlProgram<CodecExtInstr>
 }
 
 const EXTENSION = { codec: codecWireCodec }

@@ -12,7 +12,7 @@ import type {RtlProgram, RaisedProc} from "@ppl/machine"
 import {raiseProgram} from "@ppl/machine"
 import type {SemanticType} from "@ppl/core"
 import {buildTypeGraph} from "@ppl/core"
-import type {Direction} from "@ppl/codecs"
+import type {Direction, CodecExtInstr} from "@ppl/codecs"
 import {resolveProcedureTypes, CODEC_EFFECTS} from "@ppl/codecs"
 import {projectTSTypes, emitTSDeclarations} from "./resolver"
 import {tsTypeRules} from "../components/ts-emitter"
@@ -25,10 +25,10 @@ import {generateProcedure} from "./codec-codegen"
  *  unrelated procedure indices; nothing here assumes otherwise, but a
  *  mismatched pair would generate nonsense silently, so get this from the
  *  same `buildCodec(root, {encode,decode}Rules, ...)` call it names). */
-function generateProcedures(program: RtlProgram, rootType: SemanticType, direction: Direction): string
+function generateProcedures(program: RtlProgram<CodecExtInstr>, rootType: SemanticType, direction: Direction): string
 {
     const entryTypes = resolveProcedureTypes(program, rootType)
-    const raisedProcs: readonly RaisedProc[] = raiseProgram(program, {effects: CODEC_EFFECTS})
+    const raisedProcs: readonly RaisedProc<CodecExtInstr>[] = raiseProgram(program, {effects: CODEC_EFFECTS})
     return raisedProcs
         .map((raised, i) => generateProcedure(i, raised, entryTypes.get(i)!, direction))
         .join("\n\n")
@@ -39,8 +39,8 @@ export interface CodecModuleOptions
     /** Used to name the exported pair: `encode${name}`/`decode${name}`. */
     readonly name: string
     readonly rootType: SemanticType
-    readonly encodeProgram: RtlProgram
-    readonly decodeProgram: RtlProgram
+    readonly encodeProgram: RtlProgram<CodecExtInstr>
+    readonly decodeProgram: RtlProgram<CodecExtInstr>
 }
 
 const RUNTIME_IMPORTS = [

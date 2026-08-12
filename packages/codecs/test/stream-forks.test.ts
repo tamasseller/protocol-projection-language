@@ -16,6 +16,7 @@ import type { RtlProgram } from "@ppl/machine"
 import { createCodecExtension, codecRules } from "../src/engine/codec-extension"
 import type { Handle } from "../src/engine/codec-extension"
 import { validateCodecHandles } from "../src/engine/validate-handles"
+import type { CodecExtInstr } from "../src/engine/codec-ext-instr"
 
 const unitGraph = buildTypeGraph(unit)
 
@@ -27,7 +28,7 @@ function encodeExt(buffer: number[])
     return createCodecExtension("encode", root, buffer)
 }
 
-function lower(entry: ReturnType<typeof proc>): RtlProgram
+function lower(entry: ReturnType<typeof proc>): RtlProgram<CodecExtInstr>
 {
     return lowerProgram(entry, { rules: codecRules })
 }
