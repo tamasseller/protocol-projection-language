@@ -276,8 +276,22 @@ function translateExt(e: Extract<Expr<CodecExtInstr>, {kind: ExprKind.Ext}>, g: 
         case "CLONE_WR": return `cloneWr(ctx, ${e.src}, ${e.dst})`
         case "SEEK": return `seek(ctx, ${e.iter}, ${e.delta})`
         case "WRITE": return `write(ctx, ${e.iter}, ${e.width}, ${arg(0)})`
-        case "WRITE_SEQ": return `writeSeq(ctx, ${e.iter}, v${e.handle}, ${e.width}, ${arg(0)})`
-        case "READ_SEQ": return `readSeq(ctx, ${e.iter}, v${e.handle}, ${e.width}, ${e.signed}, ${arg(0)})`
+
+        case "WRITE_SEQ":
+            {
+                const node = requireSlotNode(g.slotTypes, e.handle, "WRITE_SEQ")
+                const bulk = expectAccessor(accessorFor(node, g), "list", node).bulk
+                if(!bulk) throw new Error(`codec-codegen: no bulk sequential-transfer support for ${describeType(node)} (node #${node.id}) — the rule that claimed this type's Accessor doesn't provide "bulk"`)
+                return bulk.writeSeq(`v${e.handle}`, `${e.iter}`, `${e.width}`, arg(0))
+            }
+
+        case "READ_SEQ":
+            {
+                const node = requireSlotNode(g.slotTypes, e.handle, "READ_SEQ")
+                const bulk = expectAccessor(accessorFor(node, g), "list", node).bulk
+                if(!bulk) throw new Error(`codec-codegen: no bulk sequential-transfer support for ${describeType(node)} (node #${node.id}) — the rule that claimed this type's Accessor doesn't provide "bulk"`)
+                return bulk.readSeq(`v${e.handle}`, `${e.iter}`, `${e.width}`, `${e.signed}`, arg(0))
+            }
 
         default:
             return assertNever(e)

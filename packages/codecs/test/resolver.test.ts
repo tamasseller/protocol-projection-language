@@ -70,7 +70,7 @@ describe("createCodecResolver", () =>
     test("no matching rule throws a clear error instead of silently doing nothing", () =>
     {
         const resolve = createCodecResolver([integerRule])
-        assert.throws(() => resolve(struct({ a: u8 }), undefined), /no codec rule matches/)
+        assert.throws(() => resolve(struct({ a: u8 }), undefined), /no rule matches/)
     })
 
     test("a self-referential recursive type resolves without looping forever", () =>

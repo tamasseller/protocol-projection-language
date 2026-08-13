@@ -25,7 +25,7 @@ import type { TypeNode } from "@ppl/core"
 import { child, nameOf as declaredNameOf } from "@ppl/core"
 import { pInteger, pUnit, pStar, pList, pUnion, pStructFields, pUnionFields } from "@ppl/core"
 
-import type { TsRule } from "../engine/resolver"
+import type { TsRule, TSTypeDecl } from "../engine/resolver"
 import { tsRule } from "../engine/resolver"
 
 /** Same name-resolution fallback `ts-emitter.ts`'s rules use — repeated
@@ -102,7 +102,35 @@ export const byteListAsUint8ArrayRule: TsRule = tsRule(pList(pInteger(0, 255)),
         finishList: x => `Uint8Array.from(${x})`,
         count: v => `${v}.length`,
         elementAt: (v, i) => `${v}[${i}]`,
-    }))
+        // The trivial forwarding implementation — a `Uint8Array` already
+        // satisfies `writeSeq`'s indexed-read contract just like a plain
+        // `number[]` does, so no representation-specific work is needed
+        // here (a `subarray`-based fast path is a natural, easy, but not
+        // required follow-up once this mechanism exists).
+        bulk: {
+            writeSeq: (v, iter, width, count) => `writeSeq(ctx, ${iter}, ${v}, ${width}, ${count})`,
+            readSeq: (v, iter, width, signed, count) => `readSeq(ctx, ${iter}, ${v}, ${width}, ${signed}, ${count})`,
+        },
+    }),
+    // `pList(pInteger(0, 255))` witnesses both the list and its byte
+    // element in one `matchType` call (a concrete sub-pattern, not a
+    // `pStar()` hole) — this rule's own match structurally absorbs the
+    // element node, so it must supply that node's own Accessor too (see
+    // `TsRule.claims`'s own doc comment): nothing in *this* rule/codec
+    // pairing ever independently resolves it (bulk transfer never goes
+    // through the element's own accessor), but a different pairing of
+    // codec rules could make the element its own procedure boundary —
+    // without this, that would silently re-match against the full rule
+    // list from scratch instead of getting this exact byte semantics.
+    (match) => new Map([[match.elementType, {
+        ref: "number",
+        deps: [],
+        access: {
+            kind: "integer",
+            fromWire: (raw, width, signed) => signed ? `signExtend(${width * 8}, ${raw})` : raw,
+            toWire: x => `(${x}) >>> 0`,
+        },
+    } as TSTypeDecl]]))
 
 // ── List<T> capacity ≤1 → optional field ─────────────────────────────────
 
@@ -126,6 +154,20 @@ export const capacityOneListAsOptionalRule: TsRule = tsRule(pList(pStar(), 1),
         // null`; `!` narrows it to `T` (this is only ever reached when
         // count() reported 1, i.e. v is genuinely non-null).
         elementAt: v => `${v}!`,
+        bulk: {
+            // Only `writeSeq` needs to special-case this rule's own
+            // `T | null` finished shape — encode is the one direction
+            // that ever reads an already-`finishList`-ed value. `count`
+            // (via the `TAG`/`COUNT`-equivalent op the RTL already
+            // issued before this) is what actually decided 0 vs. 1;
+            // this only has to build an array of matching length.
+            writeSeq: (v, iter, width, count) => `writeSeq(ctx, ${iter}, ${v} === null ? [] : [${v}], ${width}, ${count})`,
+            // `readSeq`'s own accumulator is always the plain, pre-
+            // `finishList` growable array — identical regardless of
+            // this rule's own chosen finished shape, so no special
+            // casing at all.
+            readSeq: (v, iter, width, signed, count) => `readSeq(ctx, ${iter}, ${v}, ${width}, ${signed}, ${count})`,
+        },
     }))
 
 // ── optional(T) → T | null ───────────────────────────────────────────────

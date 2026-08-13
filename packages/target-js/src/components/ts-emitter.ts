@@ -73,6 +73,17 @@ const listRule: TsRule = tsRule(pList(pStar()),
         finishList: x => x,
         count: v => `${v}.length`,
         elementAt: (v, i) => `${v}[${i}]`,
+        // The trivial, always-correct implementation: forward straight
+        // to the runtime's own generic per-element helpers — this rule
+        // has no representation-specific reason to do anything else (a
+        // plain `number[]` already satisfies both helpers' own indexed-
+        // read/write contract). codec-codegen.ts never calls this unless
+        // the RTL itself emitted WRITE_SEQ/READ_SEQ, which only ever
+        // happens for a numeric-element list in the first place.
+        bulk: {
+            writeSeq: (v, iter, width, count) => `writeSeq(ctx, ${iter}, ${v}, ${width}, ${count})`,
+            readSeq: (v, iter, width, signed, count) => `readSeq(ctx, ${iter}, ${v}, ${width}, ${signed}, ${count})`,
+        },
     }))
 
 // 4. Struct → interface

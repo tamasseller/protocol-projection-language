@@ -1,35 +1,14 @@
 /**
  * @ppl/target-js — The one generic TS-decl resolver
  *
- * Mirrors `@ppl/codecs/src/engine/resolver.ts` exactly, for the same
- * reason: "walk a `SemanticType`, dispatch by pattern, resolve children
- * on demand, memoize, survive cycles" is one primitive, not something
- * each consumer re-derives. This isn't merged with `@ppl/codecs`'s copy —
- * that one produces a `Procedure` (a `@ppl/machine` concept, minted via
- * `declareProc`/`defineProc`); this one produces a `TSTypeDecl` (a plain
- * `{ref, decl?, deps}` record) — different enough artifacts, and
- * `@ppl/target-js` has no reason to depend on `@ppl/codecs`, that
- * duplicating the *shape* here (not the code) is the right call, exactly
- * as `resolver.ts`'s own header reasons about when to actually merge two
- * copies of a Layer-1 primitive ("if a second consumer shows up... that's
- * the point to merge, not before" — a second consumer *has* shown up,
- * this file, but merging still isn't free: it would mean inventing a
- * shared artifact abstraction neither `Procedure` nor `TSTypeDecl`
- * naturally is, for two current call sites. Revisit if a third shows up).
- *
- * Why not `@ppl/core`'s `runRuleset` (projection.ts) directly, then — same
- * question already answered for codecs' own copy, and the answer is the
- * same here: `runRuleset` fills its output `Map` in ONE eager top-down
- * pass, `produce(match, nodeId, graph)` with no callback to recurse into a
- * child and get *its* result — and pre-order visitation means a child's
- * entry doesn't exist yet even if `produce` tried to look it up by hand.
- * A struct's `interface` text needs a field's `ref` inlined *while being
- * built*, on demand, not read out of an already-filled table; a
- * self-referential type additionally needs reserve-before-recurse cycle
- * safety `runRuleset` has no mechanism for, since nothing in it ever
- * recurses. `TypePattern`/`matchType` (the structural matching
- * vocabulary) are reused as-is; only `Rule<C>`/`runRuleset` (the execution
- * model) are skipped in favor of the on-demand driver below.
+ * A thin adapter over `@ppl/core/projection.ts`'s shared `createResolver`
+ * primitive — the same one `@ppl/codecs/src/engine/resolver.ts`
+ * (`createCodecResolver`) adapts. Different artifact (`TSTypeDecl`, a
+ * plain `{ref, decl?, deps, access}` record, vs. codecs' `Procedure`), so
+ * this file still owns its own `TsRule`/`tsRule()`/`Accessor` surface —
+ * but the on-demand/memoized/cycle-safe *execution*, and the
+ * `claims`-based multi-node absorption guarantee (see `TsRule.claims`
+ * below), are `createResolver`'s, not re-derived here.
  *
  * The one real difference from `Procedure`'s own cycle-safety: a
  * `Procedure`'s identity (its `.name`, usable in `${proc}` interpolation)
@@ -52,11 +31,14 @@
  * named thunk reference (`const T = (): any => ...`), and nobody
  * meaningfully thunks a bare list/optional back onto itself (that type
  * would have no inhabitants at all). Not specifically defended against,
- * same bar the pre-existing code already held itself to.
+ * same bar the pre-existing code already held itself to. `access` is
+ * computed eagerly too (`createResolver`'s own `fill` contract: populate
+ * cycle-sensitive fields before recursing) — it never itself recurses
+ * (see `Accessor`'s own doc comment below), so this is free.
  */
 
-import type { SemanticType, TypeGraph, TypeNode, TypePattern, MatchOf } from "@ppl/core"
-import { matchType, buildTypeGraph, kindOf } from "@ppl/core"
+import type { SemanticType, TypeGraph, TypeNode, TypePattern, MatchOf, ResolverRule } from "@ppl/core"
+import { createResolver } from "@ppl/core"
 
 /**
  * How to construct/read a value of this `TypeNode`'s own locally-projected
@@ -111,7 +93,29 @@ export type Accessor =
     | { readonly kind: "list"
         readonly finishList: (plainArrayExpr: string) => string
         readonly count: (finishedValueExpr: string) => string
-        readonly elementAt: (finishedValueExpr: string, indexExpr: string) => string }
+        readonly elementAt: (finishedValueExpr: string, indexExpr: string) => string
+        /** Bulk sequential transfer (`WRITE_SEQ`/`READ_SEQ`,
+         *  ROADMAP.md item 11) — optional: only a list rule whose element
+         *  is itself numeric ever receives one (the RTL only emits these
+         *  ops for a `List<Integer>`-shaped node, `binary-rules.ts`'s
+         *  `listOfIntegerEncodeRule`/`DecodeRule`), so a rule for any
+         *  other element kind simply never needs to implement this.
+         *  `codec-codegen.ts` delegates to it rather than hardcoding a
+         *  runtime call — the trivial rule (`ts-emitter.ts`'s `listRule`)
+         *  implements it the obvious way (forward to `writeSeq`/
+         *  `readSeq`); a future direct-access mapping rule is free to
+         *  implement it via a raw `subarray`/DMA-style copy instead,
+         *  with no special-cased knowledge on codec-codegen's side either
+         *  way. `writeSeq` reads the already-`finishList`-ed incoming
+         *  value (encode only ever reads a finished value); `readSeq`
+         *  fills the plain, pre-`finishList` growable accumulator
+         *  (decode's own accumulator shape, uniform regardless of rule —
+         *  see this type's own header comment) — so only `writeSeq` ever
+         *  needs to account for a rule's own chosen finished shape. */
+        readonly bulk?: {
+            readonly writeSeq: (finishedValueExpr: string, iterExpr: string, widthExpr: string, countExpr: string) => string
+            readonly readSeq: (accumulatorExpr: string, iterExpr: string, widthExpr: string, signedExpr: string, countExpr: string) => string
+        } }
 
 /** The capability every TS rule produces — parallels `codecRule`'s own
  *  `Procedure`, but a plain data record instead of a machine artifact. */
@@ -161,100 +165,118 @@ export interface TsRule
      *  unlike `refOf`/`produce` — an accessor never needs a child's own
      *  accessor, only how *this* node's own value exposes its parts. */
     readonly access: (match: MatchOf<TypePattern>, node: TypeNode) => Accessor
+    /** Optional: capabilities for other nodes this rule's own `pattern`
+     *  structurally absorbed in the same match — a concrete sub-pattern
+     *  deeper than a bare `pStar()` hole (e.g. `ts-alternative-rules.ts`'s
+     *  `byteListAsUint8ArrayRule`, `pList(pInteger(0,255))`, witnesses
+     *  both the list and its byte element in one `matchType` call).
+     *  Keyed by that child's raw (possibly-thunk) `SemanticType` — the
+     *  same identity `ResolveFn` uses. Only needed if something might
+     *  ever independently `resolve()` the absorbed position (a different
+     *  pairing of codec rules that makes it its own procedure boundary);
+     *  leaving it unset when nothing does is fine — `createResolver`
+     *  (`@ppl/core`) only complains if something actually tries. See
+     *  `createTsResolver`'s own header for the guarantee this provides:
+     *  an absorbed node is never independently re-matched against the
+     *  full rule list from scratch. A full `TSTypeDecl`, not a bare
+     *  `Accessor` — the absorbed node's own `ref`/`deps` matter too, if
+     *  it's ever independently addressed (e.g. as a leaf `LOAD_VAL`/
+     *  `STORE_VAL` target rather than a `finishList` return, its `ref` is
+     *  what a caller declaring a variable of its type would need). */
+    readonly claims?: (match: MatchOf<TypePattern>, node: TypeNode) => ReadonlyMap<SemanticType, TSTypeDecl>
 }
 
 /**
- * Build a `TsRule` with `refOf`/`produce`/`access`'s `match` narrowed to
- * `MatchOf<P>` — exactly `codecRule`'s own factory, for exactly the same
- * reason (a rule list needs `pattern`/callbacks erased back to the union
- * at the point of storage; this is the one place that erasure happens).
+ * Build a `TsRule` with `refOf`/`produce`/`access`/`claims`'s `match`
+ * narrowed to `MatchOf<P>` — exactly `codecRule`'s own factory, for
+ * exactly the same reason (a rule list needs `pattern`/callbacks erased
+ * back to the union at the point of storage; this is the one place that
+ * erasure happens).
  */
 export function tsRule<P extends TypePattern>(
     pattern: P,
     refOf: (match: MatchOf<P>, node: TypeNode, resolve: ResolveFn) => string,
     produce: (match: MatchOf<P>, node: TypeNode, resolve: ResolveFn) => { decl?: string; deps: readonly number[] },
     access: (match: MatchOf<P>, node: TypeNode) => Accessor,
+    claims?: (match: MatchOf<P>, node: TypeNode) => ReadonlyMap<SemanticType, TSTypeDecl>,
 ): TsRule
 {
-    return { pattern, refOf, produce, access } as TsRule
+    return { pattern, refOf, produce, access, claims } as TsRule
 }
 
 /**
  * Build an on-demand, memoized, cycle-safe `SemanticType -> TSTypeDecl`
  * resolver from an ordered rule list (first match wins — a caller's own
  * rules go first so they can preempt a default, exactly like
- * `createCodecResolver`). Returns a function that, given a root type,
- * resolves it (and every type transitively reachable from it) and
+ * `createCodecResolver`). Returns a function that, given a root type (and
+ * optionally further roots — see `projectTSTypes`), resolves it and
  * returns the *whole* accumulated `Map<TypeNode.id, TSTypeDecl>` — unlike
  * `createCodecResolver` (whose caller only ever wants the *root's* own
  * `Procedure`, since `lowerProgram` separately walks the call graph),
  * every reachable struct/union here needs its own top-level declaration
- * emitted, so the full map is the actual deliverable.
+ * emitted, so the full map is the actual deliverable — `@ppl/core`'s
+ * `createResolver` exposes exactly this via its own `cache`.
  *
- * Cycle safety: mint `{ref: "", deps: []}`, cache it, call `refOf`
- * (mutating `.ref` in place), *then* call `produce` (mutating `.decl`/
- * `.deps` in place) — mirrors `createCodecResolver`'s own
- * `declareProc`-before-recursing discipline, adapted to a plain mutable
- * record instead of a `Procedure` handle.
+ * `mintPlaceholder`/`fill` lift each `TsRule`'s own three-producer shape
+ * (`refOf`/`produce`/`access`, plus optional `claims`) onto
+ * `createResolver`'s reserve-then-fill contract: `access` is computed
+ * first (never itself recursive — safe before anything might recurse
+ * back to this same node), then `refOf` (may recurse, cached for anyone
+ * that needs it before `produce` runs), then `produce`.
+ *
+ * `graph`, if given, is used instead of building a fresh one — required
+ * whenever a caller (`codec-module.ts`) also needs to cross-reference
+ * `TypeNode`s from some *other* already-built graph over the same root
+ * (its own `resolveHandleTypes`-based procedure-boundary walk): for a
+ * thunked/self-referential schema, two independently-built graphs over
+ * the same root type are *not* interchangeable (`createResolver`'s own
+ * doc comment) — sharing one is the only sound way to cross-reference.
  */
-export function createTsResolver(rules: readonly TsRule[]): (root: SemanticType) => Map<number, TSTypeDecl>
+/** `TSTypeDecl`'s public fields are `readonly` for every consumer past
+ *  construction — `codec-codegen.ts`/`emitTSDeclarations` should never
+ *  mutate one. `fill` is the one place that's wrong for: it's building
+ *  the record in place, exactly as the old hand-rolled resolver's own
+ *  `decl: {ref: string; ...}` local did before being handed back as a
+ *  `TSTypeDecl`. Same trick here — mutate through this local, mutable
+ *  view of the very same object `mintPlaceholder` handed back as `C`. */
+type MutableTSTypeDecl = { ref: string; decl?: string; deps: readonly number[]; access: Accessor }
+
+export function createTsResolver(rules: readonly TsRule[], graph?: TypeGraph): (root: SemanticType, extraRoots?: readonly SemanticType[]) => Map<number, TSTypeDecl>
 {
-    return (root: SemanticType) =>
-    {
-        const graph: TypeGraph = buildTypeGraph(root)
-        const cache = new Map<number, TSTypeDecl>()
-
-        function resolve(type: SemanticType): TSTypeDecl
+    const adapted: readonly ResolverRule<TSTypeDecl, void>[] = rules.map(rule => ({
+        pattern: rule.pattern,
+        fill: (placeholder, match, node, _ctx, resolveWithCtx) =>
         {
-            const node = graph.nodeOf(type)
-            if(!node)
-                throw new Error("ts resolver: resolve() called with a type not reachable from the root it was first called with")
+            const resolve: ResolveFn = childType => resolveWithCtx(childType, undefined)
+            const mutable = placeholder as MutableTSTypeDecl
+            mutable.access = rule.access(match, node)
+            mutable.ref = rule.refOf(match, node, resolve)
+            const { decl, deps } = rule.produce(match, node, resolve)
+            mutable.decl = decl
+            mutable.deps = deps
+            return rule.claims ? { claims: rule.claims(match, node) } : undefined
+        },
+    }))
 
-            const cached = cache.get(node.id)
-            if(cached) return cached
+    const { resolve, cache } = createResolver<TSTypeDecl, void>(
+        adapted,
+        (): TSTypeDecl => ({ ref: "", deps: [], access: undefined as unknown as Accessor }),
+        undefined,
+        graph,
+    )
 
-            const rule = rules.find(r => matchType(node.type, r.pattern) !== undefined)
-            if(!rule) throw new Error(`no ts rule matches type kind "${kindOf(node.type)}"`)
-            const match = matchType(node.type, rule.pattern)!
+    return (root: SemanticType, extraRoots: readonly SemanticType[] = []) =>
+    {
+        resolve(root, undefined)
+        for(const extra of extraRoots) resolve(extra, undefined)
 
-            const decl: { ref: string; decl?: string; deps: readonly number[]; access: Accessor } =
-                { ref: "", deps: [], access: rule.access(match, node) }
-            cache.set(node.id, decl) // reserved — before refOf/produce recurse
-
-            decl.ref = rule.refOf(match, node, resolve)
-            const { decl: text, deps } = rule.produce(match, node, resolve)
-            decl.decl = text
-            decl.deps = deps
-
-            return decl
-        }
-
-        resolve(root)
-
-        // A rule's own produce()/refOf() only calls resolve() on a child
-        // whose *declaration text* it actually needs — the all-unit
-        // union collapse (ts-emitter.ts's unionFieldsRule) is the sharpest
-        // example: it never resolves its own unit-kind variants at all,
-        // since a bare string-literal union needs no per-variant ref.
-        // That's the right call for *declarations* — codec-codegen.ts
-        // needs an Accessor for every TypeNode the bytecode's own call
-        // graph reaches, which is a strictly wider set (every reachable
-        // node, full stop, regardless of whether any rule's own decl text
-        // needed it). Walking `graph.nodes` here, unconditionally, is
-        // this function's own return value going from "what a caller
-        // needs for declarations" to "what a caller needs for
-        // declarations, plus every reachable node's own Accessor" — a
-        // pure superset, since a leaf/no-decl node adds nothing to
-        // emitTSDeclarations's own output either way.
-        // `node.source`, not `node.type` — `graph.nodeOf` (which `resolve`
-        // uses) is keyed by the original, possibly-thunk object a field's
-        // type came in as (`byObject`, type-graph.ts), while `node.type`
-        // is already the dereferenced, concrete result of calling that
-        // thunk — a different object for any thunked (e.g. recursive)
-        // type, which `graph.nodeOf` would fail to find at all.
-        for(const node of graph.nodes.values()) resolve(node.source as SemanticType)
-
-        return cache
+        // `cache` is keyed by `createResolver`'s default `keyOf`
+        // (`String(node.id)`, never overridden here — target-js has no
+        // per-call `Ctx`) — parsing back to a number is exact, an integer
+        // id round-trips through `String`/`Number` losslessly.
+        const result = new Map<number, TSTypeDecl>()
+        for(const [key, decl] of cache) result.set(Number(key), decl)
+        return result
     }
 }
 
@@ -265,10 +287,25 @@ export function createTsResolver(rules: readonly TsRule[]): (root: SemanticType)
  * relative to `createCodecResolver` in `@ppl/codecs/src/engine/resolver.ts`:
  * generic over *any* `TsRule[]`, so it belongs next to the primitive it
  * drives, not inside a specific rule library like `../components/ts-emitter.ts`.
+ *
+ * `extraRoots`, if given, are also resolved (in addition to `root`) —
+ * `codec-module.ts` uses this to guarantee every genuine CALL_CODEC/
+ * procedure-boundary `TypeNode` (its own `resolveHandleTypes`-based walk,
+ * across both directions) has its own `Accessor`, precisely, without a
+ * blind "resolve literally everything reachable" sweep: a `TsRule`'s own
+ * `produce`/`refOf` only calls `resolve()` on a child whose *declaration
+ * text* it actually needs (the all-unit union collapse never resolves
+ * its own unit-kind variants, since a bare string-literal union needs no
+ * per-variant ref) — a strictly narrower set than every procedure
+ * boundary codec-codegen.ts's own `accessorFor` might reach. `graph`, if
+ * given, is passed straight through to `createTsResolver` — see its own
+ * doc comment for why a caller cross-referencing another already-built
+ * graph over the same root (exactly what `extraRoots` needs) must share
+ * it rather than let this function build its own.
  */
-export function projectTSTypes(root: SemanticType, rules: readonly TsRule[]): Map<number, TSTypeDecl>
+export function projectTSTypes(root: SemanticType, rules: readonly TsRule[], extraRoots: readonly SemanticType[] = [], graph?: TypeGraph): Map<number, TSTypeDecl>
 {
-    return createTsResolver(rules)(root)
+    return createTsResolver(rules, graph)(root, extraRoots)
 }
 
 /**

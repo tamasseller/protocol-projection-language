@@ -31,7 +31,11 @@
 export function tagOf(variantName: string, variantNames: readonly string[]): number
 {
     const idx = variantNames.indexOf(variantName)
-    if(idx < 0) throw new Error(`codec: active variant "${variantName}" isn't one of ${JSON.stringify(variantNames)}`)
+    if(idx < 0)
+    {
+        throw new Error(`codec: active variant "${variantName}" isn't one of ${JSON.stringify(variantNames)}`)
+    }
+
     return idx
 }
 
@@ -47,47 +51,162 @@ export interface Iter { pos: number; capability: "read" | "write"; overwriteOnly
  *  local variables in generated code — genuinely local to one procedure
  *  call, never threaded through `Ctx`.
  *
- *  `buffer` is `number[]`, not `Uint8Array`, purely so encoding has a sink
- *  it can *grow* (`write`'s own `buffer[it.pos++] = ...` past the current
- *  length) — a fixed-size Uint8Array can't do that. This is an internal
- *  contract only: `generateCodecModule`'s generated `encode`/`decode`
- *  entry points convert at the boundary (`new Uint8Array(buffer)` /
- *  `Array.from(bytes)`), so the *public* API a caller actually sees is
- *  `Uint8Array` in, `Uint8Array` out — the standard cross-runtime binary
- *  type, not this module's own internal growable-array detail leaking
- *  out. */
-export interface Ctx { buffer: number[]; iters: Iter[] }
+ *  `buffer` is a real `Uint8Array` throughout, on both the decode side
+ *  (where it's the caller's own input, used directly — no copy) and the
+ *  encode side (grown on demand, doubling, by `ensureCapacity` — the one
+ *  place `buffer.length` is a *capacity*, not the actually-valid extent).
+ *  `length` is that actually-valid extent: identical to `buffer.length`
+ *  for decode (fixed, never grows), but tracked separately for encode
+ *  since `ensureCapacity` may over-allocate ahead of what's actually
+ *  been written so far. `generateCodecModule`'s own `encode${name}`
+ *  returns `ctx.buffer.subarray(0, ctx.length)` — a *view*, not a copy,
+ *  trimmed to exactly what was written; `decode${name}` passes its own
+ *  `bytes` parameter straight through as `buffer`, no copy either. */
+export interface Ctx { buffer: Uint8Array; length: number; iters: Iter[] }
 
 function iterAt(ctx: Ctx, id: number): Iter
 {
     const it = ctx.iters[id]
-    if(!it) throw new Error(`codec: no stream iterator ${id}`)
+    if(!it)
+    {
+        throw new Error(`codec: no stream iterator ${id}`)
+    }
+
     return it
+}
+
+/** Grow `ctx.buffer`'s own capacity, doubling (never shrinking, never
+ *  called at all on the decode side, whose buffer is fixed-size by
+ *  construction) — the one place a fixed-size `Uint8Array` would
+ *  otherwise be a real constraint compiled `write`/`writeSeq` don't have
+ *  to live with. */
+function ensureCapacity(ctx: Ctx, upTo: number): void
+{
+    if(upTo <= ctx.buffer.length)
+    {
+        return
+    }
+
+    const grown = new Uint8Array(Math.max(upTo, ctx.buffer.length * 2, 64))
+    grown.set(ctx.buffer.subarray(0, ctx.length))
+    ctx.buffer = grown
+}
+
+/** Every wire width `intWireSize` (`@ppl/codecs`) ever produces is 1, 2,
+ *  4, or 8 — the three common cases go straight through `DataView`
+ *  (little-endian, matching this module's own byte order throughout);
+ *  8 (and, defensively, anything else) falls back to the same manual
+ *  per-byte loop this module always used — `DataView.getBigUint64`
+ *  would be the genuinely correct 8-byte read, but the value crossing
+ *  this boundary is a plain `number` throughout the rest of this module
+ *  (an `Accessor.fromWire`/`toWire` already narrowed it, e.g.
+ *  `wideIntegerRule`'s own `Number(x) >>> 0` on the way in), so nothing
+ *  downstream could use the extra precision anyway; unchanged from this
+ *  module's own pre-existing behavior, not a new gap this rework opens. */
+function readBytes(dv: DataView, buffer: Uint8Array, pos: number, width: number): number
+{
+    if(width === 1)
+    {
+        return dv.getUint8(pos)
+    }
+
+    if(width === 2)
+    {
+        return dv.getUint16(pos, true)
+    }
+
+    if(width === 4)
+    {
+        return dv.getUint32(pos, true)
+    }
+
+    let value = 0
+    for(let byte = 0; byte < width; byte++)
+    {
+        value |= (buffer[pos + byte] ?? 0) << (8 * byte)
+    }
+
+    return value >>> 0
+}
+
+function writeBytes(dv: DataView, buffer: Uint8Array, pos: number, width: number, value: number): void
+{
+    if(width === 1)
+    {
+        dv.setUint8(pos, value)
+        return
+    }
+
+    if(width === 2)
+    {
+        dv.setUint16(pos, value, true)
+        return
+    }
+
+    if(width === 4)
+    {
+        dv.setUint32(pos, value >>> 0, true)
+        return
+    }
+
+    for(let byte = 0; byte < width; byte++)
+    {
+        buffer[pos + byte] = value & 0xFF
+        value >>>= 8
+    }
+}
+
+/** A fresh `DataView` over `ctx.buffer`'s own current backing — cheap (no
+ *  data copy, just a small wrapper), but still built once per call rather
+ *  than once per byte, and — critically — always *after* any growth
+ *  (`ensureCapacity`) a caller already performed, since growing replaces
+ *  `ctx.buffer` with a new `Uint8Array` entirely. */
+function view(ctx: Ctx): DataView
+{
+    return new DataView(ctx.buffer.buffer, ctx.buffer.byteOffset, ctx.buffer.byteLength)
 }
 
 export function read(ctx: Ctx, iterIdx: number, width: number): number
 {
     const it = iterAt(ctx, iterIdx)
-    if(it.capability !== "read") throw new Error(`codec: READ on write-only iterator ${iterIdx}`)
-    let value = 0
-    for(let byte = 0; byte < width; byte++) value |= (ctx.buffer[it.pos++] ?? 0) << (8 * byte)
-    return value >>> 0
+    if(it.capability !== "read")
+    {
+        throw new Error(`codec: READ on write-only iterator ${iterIdx}`)
+    }
+
+    const value = readBytes(view(ctx), ctx.buffer, it.pos, width)
+    it.pos += width
+    return value
 }
 
 export function write(ctx: Ctx, iterIdx: number, width: number, value: number): void
 {
     const it = iterAt(ctx, iterIdx)
-    if(it.capability !== "write") throw new Error(`codec: WRITE on read-only iterator ${iterIdx}`)
-    if(it.overwriteOnly && it.pos + width > ctx.buffer.length)
+    if(it.capability !== "write")
+    {
+        throw new Error(`codec: WRITE on read-only iterator ${iterIdx}`)
+    }
+
+    if(it.overwriteOnly && it.pos + width > ctx.length)
+    {
         throw new Error(`codec: iterator ${iterIdx} (a CLONE_WR fork) can't append — only the root iterator appends`)
-    for(let byte = 0; byte < width; byte++) { ctx.buffer[it.pos++] = value & 0xFF; value >>>= 8 }
+    }
+
+    ensureCapacity(ctx, it.pos + width)
+    writeBytes(view(ctx), ctx.buffer, it.pos, width, value)
+    it.pos += width
+    ctx.length = Math.max(ctx.length, it.pos)
 }
 
 export function hasNext(ctx: Ctx, iterIdx: number): number
 {
     const it = iterAt(ctx, iterIdx)
-    if(it.capability !== "read") throw new Error(`codec: HAS_NEXT on write-only iterator ${iterIdx}`)
-    return it.pos < ctx.buffer.length ? 1 : 0
+    if(it.capability !== "read")
+    {
+        throw new Error(`codec: HAS_NEXT on write-only iterator ${iterIdx}`)
+    }
+
+    return it.pos < ctx.length ? 1 : 0
 }
 
 export function cloneRd(ctx: Ctx, srcIdx: number, dstIdx: number): void
@@ -103,7 +222,11 @@ export function cloneWr(ctx: Ctx, srcIdx: number, dstIdx: number): void
 export function seek(ctx: Ctx, iterIdx: number, delta: number): void
 {
     const it = iterAt(ctx, iterIdx)
-    if(it.pos + delta < 0) throw new Error(`codec: SEEK would move iterator ${iterIdx} before the stream's start`)
+    if(it.pos + delta < 0)
+    {
+        throw new Error(`codec: SEEK would move iterator ${iterIdx} before the stream's start`)
+    }
+
     it.pos += delta
 }
 
@@ -120,12 +243,15 @@ export function signExtend(bits: number, raw: number): number
     return raw >= signBit ? raw - 2 ** bits : raw
 }
 
-/** ROADMAP.md item 11's "snatch point": the dumb per-element pump loop
- *  here matches codec-extension.ts's own WRITE_SEQ exec() case exactly —
- *  a target codegen recognizing this op is free to specialize it into a
+/** ROADMAP.md item 11's "snatch point": the per-element pump loop here
+ *  matches codec-extension.ts's own WRITE_SEQ exec() case in spirit — a
+ *  target codegen recognizing this op is free to specialize it into a
  *  raw-buffer/DMA copy, but this module doesn't (a straightforward,
  *  obviously-correct baseline is more valuable here than a premature
- *  optimization only exercised by the tests written against it).
+ *  optimization only exercised by the tests written against it). It does
+ *  still grow the buffer *once*, for the whole transfer, rather than once
+ *  per element (`ensureCapacity` before the loop, not inside it) and
+ *  reuses one `DataView` across every element for the same reason.
  *
  *  `arr` is the *finished* list value directly, never a `Handle` — an
  *  encode-side caller passes it as such (already representation-
@@ -137,34 +263,49 @@ export function signExtend(bits: number, raw: number): number
 export function writeSeq(ctx: Ctx, iterIdx: number, arr: { readonly [i: number]: number }, width: number, count: number): void
 {
     const it = iterAt(ctx, iterIdx)
-    if(it.capability !== "write") throw new Error(`codec: WRITE_SEQ on read-only iterator ${iterIdx}`)
-    if(it.overwriteOnly && it.pos + width * count > ctx.buffer.length)
+    if(it.capability !== "write")
+    {
+        throw new Error(`codec: WRITE_SEQ on read-only iterator ${iterIdx}`)
+    }
+
+    if(it.overwriteOnly && it.pos + width * count > ctx.length)
+    {
         throw new Error(`codec: iterator ${iterIdx} (a CLONE_WR fork) can't append — only the root iterator appends`)
+    }
+
+    ensureCapacity(ctx, it.pos + width * count)
+    const dv = view(ctx)
     for(let i = 0; i < count; i++)
     {
-        let value = arr[i]!
-        for(let byte = 0; byte < width; byte++) { ctx.buffer[it.pos++] = value & 0xFF; value >>>= 8 }
+        writeBytes(dv, ctx.buffer, it.pos, width, arr[i]!)
+        it.pos += width
     }
+
+    ctx.length = Math.max(ctx.length, it.pos)
 }
 
-/** `arr` is decode's own plain, growable accumulator — filled in directly,
- *  the same "no `Accessor` per element" reasoning as `writeSeq` above;
- *  whatever `finishList` eventually converts it to happens once, later,
- *  at the owning procedure's own `return`. */
 export function readSeq(ctx: Ctx, iterIdx: number, arr: number[], width: number, signed: boolean, count: number): void
 {
     const it = iterAt(ctx, iterIdx)
-    if(it.capability !== "read") throw new Error(`codec: READ_SEQ on write-only iterator ${iterIdx}`)
+    if(it.capability !== "read")
+    {
+        throw new Error(`codec: READ_SEQ on write-only iterator ${iterIdx}`)
+    }
+
+    const dv = view(ctx)
     for(let i = 0; i < count; i++)
     {
-        let value = 0
-        for(let byte = 0; byte < width; byte++) value |= (ctx.buffer[it.pos++] ?? 0) << (8 * byte)
-        value = value >>> 0
+        const value = readBytes(dv, ctx.buffer, it.pos, width)
+        it.pos += width
         arr[i] = signed ? signExtend(width * 8, value) : value
     }
 }
 
 export class CodecTrap extends Error
 {
-    constructor(readonly code: number) { super(`codec trap ${code}`); this.name = "CodecTrap" }
+    constructor(readonly code: number)
+    {
+        super(`codec trap ${code}`)
+        this.name = "CodecTrap"
+    }
 }

@@ -17,13 +17,15 @@ import { describe, test } from "node:test"
 import * as assert from "node:assert/strict"
 
 import type { SemanticType } from "@ppl/core"
-import { struct, union, list, u8, integer, named } from "@ppl/core"
+import { struct, union, list, u8, integer, named, pList, pStar } from "@ppl/core"
 import { buildCodec, binaryEncodeRules, binaryDecodeRules } from "@ppl/codecs"
 
 import type { TsRule } from "../src/engine/resolver"
+import { tsRule } from "../src/engine/resolver"
 import { tsTypeRules } from "../src/components/ts-emitter"
 import {
     structAsClassRule, unionAsClassHierarchyRule, byteListAsUint8ArrayRule, bigIntEscalationRules,
+    capacityOneListAsOptionalRule,
 } from "../src/components/ts-alternative-rules"
 import { generateCodecModule } from "../src/engine/codec-module"
 import { loadGenerated } from "./load-generated"
@@ -111,5 +113,40 @@ describe("codec-codegen — alternative representations actually round-trip thro
         const decoded = decode(encode({ n: 123456789n }))
         assert.equal(typeof decoded.n, "bigint", "decoded value isn't a real bigint")
         assert.equal(decoded.n, 123456789n)
+    })
+
+    test("capacityOneListAsOptionalRule: WRITE_SEQ/READ_SEQ bulk transfer through the T|null special case", () =>
+    {
+        // binaryEncodeRules/DecodeRules list listOfIntegerEncodeRule/
+        // DecodeRule (pList(pInteger(...)), no capacity constraint) ahead
+        // of the generic per-element list rule, so this capacity-1
+        // integer list still gets WRITE_SEQ/READ_SEQ, not call_codec_next
+        // — exactly the pairing that needs `bulk.writeSeq`'s own T|null
+        // special-casing (see ts-alternative-rules.ts's own comment on it).
+        const T = named("MaybeByte", list(integer(0, 255), 1))
+        const { encode, decode } = loadCompiled(T, "MaybeByte", [capacityOneListAsOptionalRule, ...tsTypeRules])
+
+        assert.equal(decode(encode(42)), 42)
+        assert.equal(decode(encode(null)), null)
+    })
+
+    test("a list-kind rule with no bulk() throws a clear error when WRITE_SEQ/READ_SEQ is actually needed", () =>
+    {
+        const noBulkListRule: TsRule = tsRule(pList(pStar()),
+            (match, _node, resolve) => `${resolve(match.elementType).ref}[]`,
+            () => ({ deps: [] }),
+            () => ({
+                kind: "list",
+                finishList: x => x,
+                count: v => `${v}.length`,
+                elementAt: (v, i) => `${v}[${i}]`,
+                // no bulk — the point of this test.
+            }))
+
+        const T = named("Samples", list(integer(0, 255), 4))
+        assert.throws(
+            () => loadCompiled(T, "Samples", [noBulkListRule, ...tsTypeRules]),
+            /no bulk sequential-transfer support/,
+        )
     })
 })

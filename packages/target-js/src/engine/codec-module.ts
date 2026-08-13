@@ -4,37 +4,79 @@
  * `codec-codegen.ts` translates one `RaisedProc` into one JS `function`;
  * this module is the whole-program layer around it — raising both
  * directions' `RtlProgram`s, resolving each procedure's entry `TypeNode`
- * (`@ppl/codecs`'s `resolveProcedureTypes`) and its own local-
- * representation `Accessor` (this module's own `projectTSTypes` call,
- * `./resolver.ts`), and assembling the result into one self-contained
- * TypeScript module with a real, typed `encode${name}`/`decode${name}`
- * pair at the bottom.
+ * and its own local-representation `Accessor` (this module's own
+ * `projectTSTypes` call, `./resolver.ts`), and assembling the result into
+ * one self-contained TypeScript module with a real, typed
+ * `encode${name}`/`decode${name}` pair at the bottom.
+ *
+ * Exactly one `TypeGraph` gets built for the whole call (`graph`, below)
+ * — deliberately, not one per direction plus one inside `projectTSTypes`.
+ * `@ppl/codecs`'s own `resolveProcedureTypes` builds its own graph
+ * internally, which would make this module's own procedure-boundary
+ * `TypeNode`s (fed into `projectTSTypes` as `extraRoots`, so
+ * codec-codegen.ts's `accessorFor` never misses one) *not* the same
+ * objects `projectTSTypes`'s own resolution produces for a thunked/self-
+ * referential schema (`@ppl/core/type-graph.ts`'s own header comment:
+ * dereferencing a thunk twice, independently, produces two structurally-
+ * equivalent but non-identical nested objects) — exactly the bug
+ * `@ppl/codecs/engine/procedure-types.ts`'s own header describes fixing
+ * once already, elsewhere (`classifyHoistableFields`). So this module
+ * builds `graph` itself and drives the same procedure-boundary walk
+ * locally via the lower-level `resolveHandleTypes` (which takes an
+ * already-resolved entry `TypeNode`, no graph of its own) instead of
+ * calling `resolveProcedureTypes`, and passes `graph` straight through to
+ * `projectTSTypes` too — one graph, shared everywhere in this call.
  */
 import type {RtlProgram, RaisedProc} from "@ppl/machine"
 import {raiseProgram} from "@ppl/machine"
-import type {SemanticType} from "@ppl/core"
+import type {SemanticType, TypeGraph, TypeNode} from "@ppl/core"
 import {buildTypeGraph} from "@ppl/core"
 import type {Direction, CodecExtInstr} from "@ppl/codecs"
-import {resolveProcedureTypes, CODEC_EFFECTS} from "@ppl/codecs"
+import {resolveHandleTypes, CODEC_EFFECTS} from "@ppl/codecs"
 import type {TsRule, TSTypeDecl} from "./resolver"
 import {projectTSTypes, emitTSDeclarations} from "./resolver"
 import {tsTypeRules} from "../components/ts-emitter"
 import {generateProcedure} from "./codec-codegen"
 
-/** All procedures for one direction, as one source block — `program` and
- *  `rootType` must be the ones actually passed to the matching
- *  `buildCodec` call (encode/decode programs from the same schema have
- *  unrelated procedure indices; nothing here assumes otherwise, but a
- *  mismatched pair would generate nonsense silently, so get this from the
- *  same `buildCodec(root, {encode,decode}Rules, ...)` call it names).
+/** Recover each reachable procedure's own `TypeNode`, by index, from
+ *  `graph.root` — the same recursive descent `@ppl/codecs`'s own
+ *  `resolveProcedureTypes` does, reusing its exported building block
+ *  (`resolveHandleTypes`, written for exactly this kind of external
+ *  reuse — see its own doc comment), but seeded from a graph *this*
+ *  module already built rather than a second, independently-built one.
+ *  Memoized by procedure index for cycle safety, same reason. */
+function procedureBoundaryTypes(program: RtlProgram<CodecExtInstr>, graph: TypeGraph): Map<number, TypeNode>
+{
+    const types = new Map<number, TypeNode>()
+
+    function visit(procIndex: number, node: TypeNode): void
+    {
+        if(types.has(procIndex)) return
+        types.set(procIndex, node)
+
+        const proc = program.procedures[procIndex]
+        if(!proc) throw new Error(`generateCodecModule: no procedure ${procIndex}`)
+
+        resolveHandleTypes(proc.body, node, visit)
+    }
+
+    visit(0, graph.root)
+    return types
+}
+
+/** All procedures for one direction, as one source block. `entryTypes`
+ *  must be the ones actually resolved against `program` (encode/decode
+ *  programs from the same schema have unrelated procedure indices; a
+ *  mismatched pair would generate nonsense silently) — `generateCodecModule`
+ *  passes in what it already computed via `procedureBoundaryTypes`,
+ *  rather than this function recomputing its own.
  *  `projection` is shared across both directions — it's purely about the
  *  local representation, direction-independent. */
 function generateProcedures(
-    program: RtlProgram<CodecExtInstr>, rootType: SemanticType, direction: Direction,
+    program: RtlProgram<CodecExtInstr>, entryTypes: ReadonlyMap<number, TypeNode>, direction: Direction,
     projection: ReadonlyMap<number, TSTypeDecl>,
 ): string
 {
-    const entryTypes = resolveProcedureTypes(program, rootType)
     const raisedProcs: readonly RaisedProc<CodecExtInstr>[] = raiseProgram(program, {effects: CODEC_EFFECTS})
     return raisedProcs
         .map((raised, i) => generateProcedure(i, raised, entryTypes.get(i)!, direction, projection))
@@ -75,28 +117,45 @@ export function generateCodecModule(opts: CodecModuleOptions): string
 {
     const {name, rootType, encodeProgram, decodeProgram, rules = tsTypeRules} = opts
 
-    const typeResult = projectTSTypes(rootType, rules)
-    const rootNode = buildTypeGraph(rootType).root
-    const valueType = typeResult.get(rootNode.id)?.ref ?? "unknown"
+    // One graph, shared by everything below — see this module's own
+    // header comment for why a second, independently-built one (e.g.
+    // `@ppl/codecs`'s own `resolveProcedureTypes`) isn't interchangeable.
+    const graph = buildTypeGraph(rootType)
+
+    // Every genuine CALL_CODEC/procedure-boundary TypeNode, across both
+    // directions — resolved as explicit `extraRoots` below so
+    // codec-codegen.ts's own `accessorFor` never misses one, without a
+    // blind "resolve literally everything reachable" sweep (a TsRule's
+    // own produce()/refOf() only calls resolve() on a child whose
+    // *declaration text* it actually needs, a strictly narrower set —
+    // see resolver.ts's own `projectTSTypes` doc comment). `node.source`,
+    // not `node.type`: `TypeGraph.nodeOf` (which `projectTSTypes`'s own
+    // resolve() uses internally) is keyed by the original, possibly-thunk
+    // object, not the already-dereferenced concrete type.
+    const encodeEntryTypes = procedureBoundaryTypes(encodeProgram, graph)
+    const decodeEntryTypes = procedureBoundaryTypes(decodeProgram, graph)
+    const extraRoots = [...encodeEntryTypes.values(), ...decodeEntryTypes.values()].map(node => node.source as SemanticType)
+
+    const typeResult = projectTSTypes(rootType, rules, extraRoots, graph)
+    const valueType = typeResult.get(graph.root.id)?.ref ?? "unknown"
 
     return `import { ${RUNTIME_IMPORTS.join(", ")} } from "@ppl/target-js/src/runtime/codec-runtime"
 import type { Ctx } from "@ppl/target-js/src/runtime/codec-runtime"
 import { evalBinary, evalUnary } from "@ppl/machine"
 
 ${emitTSDeclarations(typeResult)}
-${generateProcedures(encodeProgram, rootType, "encode", typeResult)}
+${generateProcedures(encodeProgram, encodeEntryTypes, "encode", typeResult)}
 
-${generateProcedures(decodeProgram, rootType, "decode", typeResult)}
+${generateProcedures(decodeProgram, decodeEntryTypes, "decode", typeResult)}
 
 export function encode${name}(value: ${valueType}): Uint8Array {
-    const buffer: number[] = []
-    const ctx: Ctx = { buffer, iters: [{ pos: 0, capability: "write", overwriteOnly: false }] }
+    const ctx: Ctx = { buffer: new Uint8Array(64), length: 0, iters: [{ pos: 0, capability: "write", overwriteOnly: false }] }
     encode_proc0(value, ctx)
-    return new Uint8Array(buffer)
+    return ctx.buffer.subarray(0, ctx.length)
 }
 
 export function decode${name}(bytes: Uint8Array): ${valueType} {
-    const ctx: Ctx = { buffer: Array.from(bytes), iters: [{ pos: 0, capability: "read", overwriteOnly: false }] }
+    const ctx: Ctx = { buffer: bytes, length: bytes.length, iters: [{ pos: 0, capability: "read", overwriteOnly: false }] }
     return decode_proc0(ctx)
 }`
 }

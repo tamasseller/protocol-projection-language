@@ -18,34 +18,27 @@
  * primitive it's a driver over.
  *
  * `TypePattern`/`matchType` (`@ppl/core/matcher.ts`) — the pure structural
- * matching vocabulary already used by `target-cpp`/`target-js`'s own
- * `Rule<C>`/`runRuleset` (`@ppl/core/projection.ts`, itself labeled "Layer
- * 1: Ruleset runner") — is reused as-is here. `runRuleset` itself is not:
- * it fills `Map<nodeId, C>` in one eager top-down pass via
- * absorption/coverage, with no way to hand a not-yet-finished child a
- * reserved slot number before a sibling embeds it into its own instruction
- * stream. Codec generation needs on-demand, indexed, self-reference-safe
- * resolution instead — a different execution model, not a superset
- * `runRuleset` can be stretched to cover — so this file provides its own
- * small driver rather than routing through `runRuleset`. It lives here,
- * next to its only current consumer, rather than promoted into
- * `@ppl/core` alongside `runRuleset`, because there's exactly one consumer
- * to generalize for so far; if a second one shows up (e.g. a target
- * needing the same on-demand/cycle-safe resolution for a recursive type),
- * that's the point to actually merge the two into one shared Layer-1
- * primitive, not before.
+ * matching vocabulary — is reused as-is here. The on-demand, indexed,
+ * self-reference-safe *execution* underneath (mint-then-recurse, memoize,
+ * survive cycles) is `@ppl/core/projection.ts`'s `createResolver` — this
+ * file is now a thin adapter over that shared Layer-1 primitive, not its
+ * own driver: `createCodecResolver` just lifts `CodecRule`'s
+ * author-facing shape (`produce(match, ctx, resolve) => IrFragment`, no
+ * `node`/`placeholder` of its own) onto `createResolver`'s
+ * reserve-then-fill contract, and `mintPlaceholder` is `declareProc([],
+ * node)`. `@ppl/core/projection.ts`'s *other* primitive, `runRuleset`, is
+ * a genuinely different execution model (one eager top-down pass, no
+ * child-resolve callback) that stays a poor fit for the same reason it
+ * always was: no way to hand a not-yet-finished child a reserved identity
+ * before a sibling embeds it into its own instruction stream.
  *
  * A rule's `produce` sees only its own match witness and a `resolve`
  * callback — no `TypeNode`, no graph. `resolve` takes a raw `SemanticType`
  * (a struct/union/list field's `.type`, straight off the match witness —
  * see matcher.ts's `FieldWitness`/`StructFieldsMatch`/etc.) and returns its
- * `Procedure`, keyed on that type's own object identity. Internally this
- * still rides on `@ppl/core`'s `TypeGraph` (built once, from whichever
- * type `resolve` is first called with — the root) so cycle-breaking and
- * thunk-unwrapping are exactly `buildTypeGraph`'s already-proven behavior,
- * not a second, independently-written copy of that logic; `TypeGraph.nodeOf`
- * is the bridge from "resolve was handed a SemanticType" back to "the
- * TypeNode identity Procedures are actually cached against."
+ * `Procedure`, keyed on that type's own object identity — `createResolver`'s
+ * own `@ppl/core`'s `TypeGraph` machinery (cycle-breaking, thunk-unwrapping)
+ * underneath, not a second, independently-written copy of that logic.
  *
  * A rule set that mixes conventions (e.g. an ASCII-text override sitting
  * inside an otherwise-binary rule list) is not a special case this driver
@@ -53,9 +46,10 @@
  * emitting, so nothing here enforces — or even notices — that distinction.
  */
 
-import type { TypePattern, TypeMatch, TypeGraph, TypeNode, MatchOf } from "@ppl/core"
+import type { TypePattern, TypeMatch, TypeNode, MatchOf } from "@ppl/core"
 import type { SemanticType } from "@ppl/core"
-import { matchType, kindOf, buildTypeGraph } from "@ppl/core"
+import { createResolver } from "@ppl/core"
+import type { ResolverRule } from "@ppl/core"
 import type { IrFragment, Procedure, RtlProgram } from "@ppl/machine"
 import { declareProc, defineProc, ir, lowerProgram } from "@ppl/machine"
 import { codecRules } from "./codec-extension"
@@ -146,56 +140,39 @@ function ensureTerminated(fragment: IrFragment): IrFragment
  * varies per call (json.ts's nesting depth) supplies its own, keying on
  * `(node, ctx)` together.
  *
- * The `TypeGraph` backing this is built once, lazily, from whichever type
- * `resolve` is first called with — that call is always the root in
- * practice (every subsequent call is for a child reached from an
- * already-resolved node's own match witness, hence already part of the
- * same graph). Cycle safety mirrors `lowerProgram`'s own
+ * Cycle safety mirrors `lowerProgram`'s own
  * (`@ppl/machine/lower.ts:141-173`): mint the `Procedure`'s identity via
  * `declareProc` and cache it *before* recursing into `produce`, so a self-
  * or mutually-recursive type resolves to the reserved identity instead of
- * looping forever.
+ * looping forever — now `createResolver`'s own concern, via
+ * `mintPlaceholder`/reserve-then-fill, not re-derived here.
  */
 export function createCodecResolver<Ctx>(
     rules: readonly CodecRule<Ctx>[],
     keyOf: (node: TypeNode, ctx: Ctx) => string = node => String(node.id),
 ): (root: SemanticType, ctx: Ctx) => Procedure
 {
-    let graph: TypeGraph | undefined
-    const cache = new Map<string, Procedure>()
+    // Thin adapter over `@ppl/core`'s shared on-demand resolver — every
+    // `CodecRule` body stays exactly as authored (`produce(match, ctx,
+    // resolve)`, no `node`/`placeholder`/`claims` of its own); this is the
+    // one place that shape gets lifted onto `ResolverRule`'s
+    // reserve-then-fill contract. `node` (a TypeNode, @ppl/core/type-
+    // graph.ts) becomes each procedure's opaque header — its declared
+    // `o0` type, per codec-extension.md §2.4/§4.1's `{GENERIC, CODEC}` ABI
+    // selector; `validate-handles.ts`'s §7.1/§7.2 checks are why this
+    // exists at all. No `claims` — no `CodecRule` in this codebase needs
+    // a `Procedure` for a node its own multi-node match already absorbed
+    // (see `binary-rules.ts`'s `listOfIntegerEncodeRule`/`delta-leb128.ts`:
+    // nothing ever independently `resolve()`s their absorbed element).
+    const adapted: readonly ResolverRule<Procedure, Ctx>[] = rules.map(rule => ({
+        pattern: rule.pattern,
+        fill: (placeholder, match, _node, ctx, resolve) =>
+        {
+            defineProc(placeholder, ensureTerminated(rule.produce(match, ctx, resolve)))
+        },
+    }))
 
-    function resolve(type: SemanticType, ctx: Ctx): Procedure
-    {
-        graph ??= buildTypeGraph(type)
-        const node = graph.nodeOf(type)
-        if(!node)
-            throw new Error("codec resolver: resolve() called with a type not reachable from the root it was first called with")
-
-        const key = keyOf(node, ctx)
-        const cached = cache.get(key)
-        if(cached) return cached
-
-        // `node` (a TypeNode, @ppl/core/type-graph.ts) becomes this
-        // procedure's opaque header — its declared `o0` type, per
-        // codec-extension.md §2.4/§4.1's `{GENERIC, CODEC}` ABI selector. A
-        // GENERIC helper declared directly (bypassing this resolver — e.g.
-        // delta-leb128.ts's leb128_encode) gets no header, meaning no o0 at
-        // all, exactly per §4.1. `validate-handles.ts`'s §7.1/§7.2 checks
-        // are the reason this exists: neither needs new validator
-        // machinery, just this one piece of type metadata carried through
-        // untouched by lower.ts (rtl.ts's `RtlProc.header` doc comment).
-        const handle = declareProc([], node) // mint identity now — reserved, before recursing
-        cache.set(key, handle)
-
-        const rule = rules.find(r => matchType(node.type, r.pattern) !== undefined)
-        if(!rule) throw new Error(`no codec rule matches type kind "${kindOf(node.type)}"`)
-
-        const match = matchType(node.type, rule.pattern)!
-        defineProc(handle, ensureTerminated(rule.produce(match, ctx, resolve)))
-        return handle
-    }
-
-    return resolve
+    return createResolver(adapted, (node) => declareProc([], node), keyOf).resolve
 }
 
 /**
