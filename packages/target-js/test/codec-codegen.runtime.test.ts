@@ -58,22 +58,43 @@ function loadCompiled(rootType: SemanticType, name: string): { encode: (v: unkno
     return { encode: mod[`encode${name}`], decode: mod[`decode${name}`] }
 }
 
-function assertMatchesInterpreted(rootType: SemanticType, name: string, value: unknown): void
+/**
+ * `compiledValue` defaults to `value` — every fixture but one shares the
+ * exact same shape across both paths, since `tsTypeRules`'s own default
+ * union representation (`{variant, value}`) now matches
+ * `codec-extension.ts`'s own internal `UnionValue` convention exactly
+ * (the tag-vs-variant mismatch this rework fixed). The one exception is
+ * an *all-unit* union: `tsTypeRules` collapses it to a bare string-literal
+ * type (a deliberate, pre-existing ergonomic choice, `ts-emitter.ts`'s own
+ * doc comment) — a real, public shape difference from the interpreter's
+ * own `{variant, value: undefined}`, not a bug, so that one fixture below
+ * passes both shapes explicitly instead.
+ */
+function assertMatchesInterpreted(rootType: SemanticType, name: string, value: unknown, compiledValue: unknown = value): void
 {
     const { encode, decode } = loadCompiled(rootType, name)
 
     const expectedBytes = interpretedEncode(rootType, value)
-    const actualBytes = encode(value)
+    const actualBytes = encode(compiledValue)
     // The public boundary is Uint8Array (codec-runtime.ts's own doc
     // comment on Ctx.buffer explains why) — compare contents, not
     // TypedArray-vs-plain-Array identity.
     assert.deepEqual(Array.from(actualBytes), expectedBytes, "compiled encode disagrees with the interpreted path")
 
-    const expectedDecoded = interpretedDecode(rootType, expectedBytes)
+    // Compared against `compiledValue`, not the interpreted path's own
+    // `expectedDecoded` — the two paths' decoded *shapes* can genuinely
+    // differ (this function's own doc comment), so the right ground truth
+    // for "did the compiled path decode these bytes correctly" is "does
+    // it recover the same, compiled-shaped value encoding started from,"
+    // exactly what the trailing round-trip assertion below already
+    // checks — this assertion is that same fact, checked one call sooner
+    // (straight off the interpreter's own bytes, not the compiled path's
+    // own encode output) so an encode-side bug can't mask a decode-side
+    // one by producing self-consistently-wrong bytes.
     const actualDecoded = decode(new Uint8Array(expectedBytes))
-    assert.deepEqual(actualDecoded, expectedDecoded, "compiled decode disagrees with the interpreted path")
+    assert.deepEqual(actualDecoded, compiledValue, "compiled decode disagrees with the interpreted path")
 
-    assert.deepEqual(decode(encode(value)), value, "compiled round trip (encode then decode) doesn't recover the original value")
+    assert.deepEqual(decode(encode(compiledValue)), compiledValue, "compiled round trip (encode then decode) doesn't recover the original value")
 }
 
 describe("codec-codegen — compiled encode/decode agree with the interpreted path", () =>
@@ -108,13 +129,28 @@ describe("codec-codegen — compiled encode/decode agree with the interpreted pa
     {
         const T = named("Sample", struct({ maybe: optional(integer(-10, 10)) }))
         assertMatchesInterpreted(T, "Sample", { maybe: { variant: "value", value: -3 } })
-        assertMatchesInterpreted(T, "Sample", { maybe: { variant: "empty", value: undefined } })
+        // A unit-kind payload's own value is `null` under tsTypeRules's
+        // own declared convention ("null for unit types") — a real,
+        // public shape difference from the interpreter's own internal
+        // `undefined` (codec-extension.ts's UnionValue never writes a
+        // unit variant's `.value` at all, so it just stays whatever it
+        // was initialized to).
+        assertMatchesInterpreted(
+            T, "Sample",
+            { maybe: { variant: "empty", value: undefined } },
+            { maybe: { variant: "empty", value: null } },
+        )
     })
 
     test("unit — a truly empty procedure body (raise.ts's own acc-seed fix)", () =>
     {
         const T = named("Flag", union({ on: unit, off: unit }))
-        assertMatchesInterpreted(T, "Flag", { variant: "on", value: undefined })
+        // All-unit union: tsTypeRules collapses the declared type to a
+        // bare string-literal union (ts-emitter.ts's own doc comment) —
+        // a real, public shape difference from the interpreter's own
+        // `{variant, value}`, so the compiled path's own input/output is
+        // just the variant name directly.
+        assertMatchesInterpreted(T, "Flag", { variant: "on", value: undefined }, "on")
     })
 
     test("list of structs — ENTER_NEXT/CALL_CODEC_NEXT", () =>

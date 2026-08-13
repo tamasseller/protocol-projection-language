@@ -46,7 +46,8 @@ function nameOf(node: TypeNode): string
  *  is dropped, not serialized), unlike `null`. */
 export const unitAsUndefinedRule: TsRule = tsRule(pUnit(),
     () => "undefined",
-    () => ({ deps: [] }))
+    () => ({ deps: [] }),
+    () => ({ kind: "unit", unitValue: () => "undefined" }))
 
 // ── Integer → bigint past Number's safe range ───────────────────────────
 
@@ -59,11 +60,25 @@ export const unitAsUndefinedRule: TsRule = tsRule(pUnit(),
  *  `wideIntegerRule`. */
 const safeIntegerRule: TsRule = tsRule(pInteger(Number.MIN_SAFE_INTEGER, Number.MAX_SAFE_INTEGER),
     () => "number",
-    () => ({ deps: [] }))
+    () => ({ deps: [] }),
+    () => ({ kind: "integer", fromWire: x => x, toWire: x => x }))
 
+// `BigInt(x)`/`Number(x)` — the wire-level bit width/sign-extension a
+// caller's `fromWire`/`toWire` receives is always already correct (image-
+// tree-driven, computed by codec-codegen before calling in), so this rule
+// only ever needs the last-mile host-representation conversion, never any
+// wire mechanics of its own.
 const wideIntegerRule: TsRule = tsRule(pInteger(-Infinity, Infinity),
     () => "bigint",
-    () => ({ deps: [] }))
+    () => ({ deps: [] }),
+    () => ({
+        kind: "integer",
+        // Sign-extension (mandatory wire correctness, same reasoning as
+        // the default integerRule) happens first, on the plain-number
+        // raw read, then the last-mile bigint conversion.
+        fromWire: (raw, width, signed) => `BigInt(${signed ? `signExtend(${width * 8}, ${raw})` : raw})`,
+        toWire: x => `Number(${x}) >>> 0`,
+    }))
 
 export const bigIntEscalationRules: readonly TsRule[] = [safeIntegerRule, wideIntegerRule]
 
@@ -76,7 +91,18 @@ export const bigIntEscalationRules: readonly TsRule[] = [safeIntegerRule, wideIn
  *  `JSON.stringify` on its own, unlike `number[]`. */
 export const byteListAsUint8ArrayRule: TsRule = tsRule(pList(pInteger(0, 255)),
     () => "Uint8Array",
-    () => ({ deps: [] }))
+    () => ({ deps: [] }),
+    () => ({
+        kind: "list",
+        // codec-codegen's own decode accumulator is always a plain,
+        // growable `number[]` regardless of the rule in play (see
+        // resolver.ts's own `Accessor` doc comment) — `finishList` is the
+        // one, one-time conversion point to this rule's chosen final
+        // representation.
+        finishList: x => `Uint8Array.from(${x})`,
+        count: v => `${v}.length`,
+        elementAt: (v, i) => `${v}[${i}]`,
+    }))
 
 // ── List<T> capacity ≤1 → optional field ─────────────────────────────────
 
@@ -87,7 +113,20 @@ export const byteListAsUint8ArrayRule: TsRule = tsRule(pList(pInteger(0, 255)),
  *  every `List<T>` regardless of capacity. */
 export const capacityOneListAsOptionalRule: TsRule = tsRule(pList(pStar(), 1),
     (match, _node, resolve) => `${resolve(match.elementType).ref} | null`,
-    (_match, node) => ({ deps: [child(node, { element: true })!.id] }))
+    (_match, node) => ({ deps: [child(node, { element: true })!.id] }),
+    () => ({
+        kind: "list",
+        // The decode accumulator is still a plain 0-or-1-element array
+        // (capacity 1 is enforced by the schema, not by this rule) —
+        // `finishList` collapses it to this rule's own `T | null`.
+        finishList: x => `${x}.length > 0 ? ${x}[0] : null`,
+        count: v => `(${v} === null ? 0 : 1)`,
+        // Never called with an index other than 0 — a capacity-1 list has
+        // no other element to ask for. `v`'s own static type is `T |
+        // null`; `!` narrows it to `T` (this is only ever reached when
+        // count() reported 1, i.e. v is genuinely non-null).
+        elementAt: v => `${v}!`,
+    }))
 
 // ── optional(T) → T | null ───────────────────────────────────────────────
 
@@ -103,7 +142,17 @@ export const capacityOneListAsOptionalRule: TsRule = tsRule(pList(pStar(), 1),
  *  structural (name-agnostic) pattern. */
 export const optionalUnionRule: TsRule = tsRule(pUnion({ value: pStar(), empty: pUnit() }),
     (match, _node, resolve) => `${resolve(match.variantMatches.value.type).ref} | null`,
-    (_match, node) => ({ deps: [child(node, { variant: "value" })!.id] }))
+    (_match, node) => ({ deps: [child(node, { variant: "value" })!.id] }),
+    () => ({
+        kind: "union",
+        finishUnion: (variant, payloadExpr) => variant === "value" ? payloadExpr! : "null",
+        activeVariantName: v => `(${v} === null ? "empty" : "value")`,
+        // `v`'s own static type is `T | null` — codegen-time knowledge of
+        // which branch this is (from the compile-time `variant` string,
+        // never a runtime check TS could narrow through) doesn't narrow
+        // `v` itself, so a plain `!` is needed to read it as `T`.
+        activeVariantPayload: (v, variant) => variant === "value" ? `${v}!` : "undefined as any",
+    }))
 
 // ── General union → class hierarchy, instead of a discriminated union ───
 
@@ -122,11 +171,44 @@ export const unionAsClassHierarchyRule: TsRule = tsRule(pUnionFields(pStar()),
         const variants = match.variantMatches.map(v => ({ name: v.name, ref: resolve(v.type).ref }))
         const deps = match.variantMatches.map(v => child(node, { variant: v.name })!.id)
 
-        const className = (variantName: string) => `${name}_${variantName[0].toUpperCase()}${variantName.slice(1)}`
+        const className = classNameOf(name)
         const subclasses = variants.map(v => `class ${className(v.name)} extends ${name} {\n  constructor(readonly value: ${v.ref}) { super(); }\n}`)
 
         return { decl: `abstract class ${name} {}\n${subclasses.join("\n")}`, deps }
+    },
+    (match, node) =>
+    {
+        const name = nameOf(node)
+        const className = classNameOf(name)
+        const variantNames = match.variantMatches.map(v => v.name)
+        return {
+            kind: "union",
+            finishUnion: (variant, payloadExpr) => `new ${className(variant)}(${payloadExpr ?? "undefined"})`,
+            // `instanceof`, checked variant-by-variant — the accessor's
+            // own real "tag": unlike the default discriminated-union
+            // rule, there's no separate `.tag` field to read at all. The
+            // chain's own fallback is the *last* variant's name, literal
+            // — every real instance matches exactly one `instanceof`
+            // check, so "none of the others" already means "the last
+            // one," not a genuine unmatched case to guard against.
+            activeVariantName: v =>
+            {
+                const lastName = variantNames[variantNames.length - 1]!
+                return variantNames.slice(0, -1).reduceRight(
+                    (fallback, n) => `${v} instanceof ${className(n)} ? ${JSON.stringify(n)} : (${fallback})`,
+                    JSON.stringify(lastName),
+                )
+            },
+            activeVariantPayload: (v, variant) => `(${v} as ${className(variant)}).value`,
+        }
     })
+
+/** Shared between `unionAsClassHierarchyRule`'s `produce`/`access` — one
+ *  subclass name per variant, derived from the union's own declared name. */
+function classNameOf(unionName: string): (variantName: string) => string
+{
+    return variantName => `${unionName}_${variantName[0]!.toUpperCase()}${variantName.slice(1)}`
+}
 
 // ── Struct → class, instead of an interface ──────────────────────────────
 
@@ -143,4 +225,21 @@ export const structAsClassRule: TsRule = tsRule(pStructFields(pStar()),
         const params = match.fieldMatches.map(f => `readonly ${f.name}: ${resolve(f.type).ref}`)
         const deps = match.fieldMatches.map(f => child(node, { field: f.name })!.id)
         return { decl: `class ${name} {\n  constructor(${params.join(", ")}) {}\n}`, deps }
+    },
+    (match, node) =>
+    {
+        const name = nameOf(node)
+        const fieldNames = match.fieldMatches.map(f => f.name)
+        return {
+            kind: "struct",
+            // `plainObjExpr` is codec-codegen's own plain accumulator
+            // (`{field: v, ...}`) — this rule's own constructor takes
+            // fields positionally, in declaration order, so pull them
+            // off it by name rather than needing codec-codegen to know
+            // this rule's own parameter order.
+            finishStruct: obj => `new ${name}(${fieldNames.map(f => `${obj}.${f}`).join(", ")})`,
+            // A class's own fields are still plain `readonly` properties
+            // — reading one is identical to the default interface rule.
+            readField: (v, f) => `${v}.${f}`,
+        }
     })

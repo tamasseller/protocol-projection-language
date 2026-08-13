@@ -78,9 +78,9 @@ test("ts-emitter: mixed-payload union projects to a tagged discriminated union",
 
     const decl = r.get(0)!.decl!
     assert.ok(decl.includes("type Result ="))
-    assert.ok(decl.includes('tag: "ok"'))
+    assert.ok(decl.includes('variant: "ok"'))
     assert.ok(decl.includes("value: number"))
-    assert.ok(decl.includes('tag: "err"'))
+    assert.ok(decl.includes('variant: "err"'))
     assert.ok(decl.includes("value: null"))
     assertCompiles(emitTSDeclarations(r))
 })
@@ -115,7 +115,8 @@ test("ts-emitter: a self-referential type projects without looping, referencing 
 test("ts-emitter: a caller's own rule ahead of tsTypeRules preempts the default for a specific shape", () => {
     const bigIntRule = tsRule(pInteger(0, Number.MAX_SAFE_INTEGER),
         () => "bigint",
-        () => ({deps: []}))
+        () => ({deps: []}),
+        () => ({kind: "integer", fromWire: x => `BigInt(${x})`, toWire: x => `Number(${x})`}))
 
     const T = struct({count: integer(0, Number.MAX_SAFE_INTEGER)})
     const withOverride = projectTSTypes(T, [bigIntRule, ...tsTypeRules])

@@ -43,17 +43,37 @@ function nameOf(node: TypeNode): string
 // 1. Integer → number (leaf, no decl)
 const integerRule: TsRule = tsRule(pInteger(-Infinity, Infinity),
     () => "number",
-    () => ({ deps: [] }))
+    () => ({ deps: [] }),
+    () => ({
+        kind: "integer",
+        // A raw wire read is always unsigned bits (codec-runtime.ts's own
+        // `read`) — sign-extension back to the real host value is
+        // mandatory wire correctness, not a representation choice, so it
+        // happens here unconditionally rather than being left for
+        // codec-codegen.ts to assume.
+        fromWire: (raw, width, signed) => signed ? `signExtend(${width * 8}, ${raw})` : raw,
+        // The mirror on the way out — `>>> 0` reinterprets a (possibly
+        // negative) host number as the unsigned bit pattern `write`
+        // expects, exactly like the old loadVal helper did.
+        toWire: x => `(${x}) >>> 0`,
+    }))
 
 // 2. Unit → null (leaf, no decl)
 const unitRule: TsRule = tsRule(pUnit(),
     () => "null",
-    () => ({ deps: [] }))
+    () => ({ deps: [] }),
+    () => ({ kind: "unit", unitValue: () => "null" }))
 
 // 3. List → T[] (inline, no decl of its own)
 const listRule: TsRule = tsRule(pList(pStar()),
     (match, _node, resolve) => `${resolve(match.elementType).ref}[]`,
-    (_match, node) => ({ deps: [child(node, { element: true })!.id] }))
+    (_match, node) => ({ deps: [child(node, { element: true })!.id] }),
+    () => ({
+        kind: "list",
+        finishList: x => x,
+        count: v => `${v}.length`,
+        elementAt: (v, i) => `${v}[${i}]`,
+    }))
 
 // 4. Struct → interface
 const structFieldsRule: TsRule = tsRule(pStructFields(pStar()),
@@ -64,7 +84,12 @@ const structFieldsRule: TsRule = tsRule(pStructFields(pStar()),
         const fieldLines = match.fieldMatches.map(f => `  readonly ${f.name}: ${resolve(f.type).ref};`)
         const deps = match.fieldMatches.map(f => child(node, { field: f.name })!.id)
         return { decl: `interface ${name} {\n${fieldLines.join("\n")}\n}`, deps }
-    })
+    },
+    () => ({
+        kind: "struct",
+        finishStruct: x => x,
+        readField: (v, f) => `${v}.${f}`,
+    }))
 
 // 5. Union → discriminated union (all-unit variants collapse to a plain
 //    string-literal union — no tag field needed when there's no payload).
@@ -81,9 +106,45 @@ const unionFieldsRule: TsRule = tsRule(pUnionFields(pStar()),
             return { decl: `type ${name} = ${literals};`, deps: [] }
         }
 
-        const members = match.variantMatches.map(v => `  | { tag: "${v.name}"; value: ${resolve(v.type).ref} }`)
+        // `variant`, not `tag` — matches the one field name this shape
+        // has always had *everywhere else* in this codebase
+        // (`codec-extension.ts`'s own `UnionValue`, every hand-authored
+        // test/example fixture) — this rule's own `produce` used to say
+        // `tag` here, disagreeing with all of that, which is exactly the
+        // tag-vs-variant mismatch found reviewing the compiled codegen.
+        // Now that codec-codegen only ever goes through this rule's own
+        // `access` below (never a hard-coded assumption of its own), the
+        // declared type and the runtime shape can't disagree — but only
+        // once this rule's own declared type agrees with the convention
+        // every *other* consumer already committed to.
+        const members = match.variantMatches.map(v => `  | { variant: "${v.name}"; value: ${resolve(v.type).ref} }`)
         const deps = match.variantMatches.map(v => child(node, { variant: v.name })!.id)
         return { decl: `type ${name} =\n${members.join("\n")};`, deps }
+    },
+    (_match, node) =>
+    {
+        // `allUnit` mirrors `produce`'s own check exactly — the accessor
+        // has to agree with whichever shape `produce` actually declared.
+        const allUnit = node.edges.every(e => isUnit(e.target.type))
+        const name = nameOf(node)
+        return {
+            kind: "union",
+            finishUnion: allUnit
+                ? (variant) => JSON.stringify(variant)
+                : (variant, payloadExpr) => `{ variant: ${JSON.stringify(variant)}, value: ${payloadExpr ?? "undefined"} }`,
+            activeVariantName: allUnit ? v => v : v => `${v}.variant`,
+            // A runtime `tagOf(...)`-driven `switch` (codec-codegen.ts's
+            // own encode-side dispatch) gives TS no way to narrow `v`'s
+            // own type the way an `if (v.variant === "x")` check would —
+            // an explicit `Extract<>` on the union's own declared name
+            // (available without `resolve`, unlike the payload's own
+            // ref) recovers exactly the one variant's own shape, so
+            // `.value` reads at its real, specific type rather than the
+            // union of every variant's own payload type.
+            activeVariantPayload: allUnit
+                ? () => "undefined as any" // a unit payload carries no real value regardless of which unit rule is active (null vs undefined) — the callee's own body never reads its parameter at all
+                : (v, variant) => `(${v} as Extract<${name}, { variant: ${JSON.stringify(variant)} }>).value`,
+        }
     })
 
 /** The default TS projection — one array among possibly several, not

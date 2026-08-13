@@ -4,133 +4,35 @@
  * `engine/codec-codegen.ts` turns a raised (`@ppl/machine`'s raise.ts)
  * codec program into real control flow — real `function`s, real `if`/
  * `while`, direct calls between the generated functions instead of an
- * index into a procedure table — with every `ENTER`'s `ref` resolved to a
- * real field/variant *name* at generation time (`@ppl/codecs`'s
- * `resolveHandleTypes`). What's left, genuinely irreducible at generation
- * time, is this module: buffer position, byte read/write, and the
- * (container, key) indirection a decoder needs to write a freshly-decoded
- * value back into its parent — the same handful of primitives
- * `@ppl/codecs`'s own `codec-extension.ts` interprets at runtime, minus
- * the parts codegen now does statically (no `TypeNode` carried at
- * runtime, no per-call schema-edge lookup, no dynamic opcode dispatch).
- *
- * `Handle`/`Iter` deliberately mirror `codec-extension.ts`'s own
- * `Handle`/`StreamIter` shapes closely — not by necessity (compiled code
- * has no obligation to look like the interpreter it replaces) but because
- * it makes every runtime helper here directly comparable, line for line,
- * against the exec() case it stands in for, which is exactly what made
- * this module easy to get right the first time and will make it easy to
- * keep right.
+ * index into a procedure table, every `ENTER`'s `ref` resolved to a real
+ * field/variant *name* at generation time (`@ppl/codecs`'s
+ * `resolveHandleTypes`) — and, unlike `@ppl/codecs`'s own interpreter
+ * (`codec-extension.ts`), every generated procedure *returns* the value
+ * it decoded or *takes* the value it's encoding as a real parameter,
+ * rather than writing through a `(container, key)` pointer pair threaded
+ * across procedure boundaries. How a value of a given `TypeNode`'s own
+ * type is actually constructed/read is never this module's concern — see
+ * `engine/resolver.ts`'s `Accessor` — so what's left here is only what's
+ * genuinely irreducible at generation time: buffer position and byte
+ * read/write, identical in spirit to `codec-extension.ts`'s own stream-
+ * iterator primitives, minus everything codegen now resolves statically
+ * (no `TypeNode` carried at runtime, no schema-edge lookup, no dynamic
+ * opcode dispatch, and — since this rework — no pointer-pair indirection
+ * either).
  */
-
-export interface Handle
-{
-    c: any
-    k: string | number
-    /** List-iteration position — lazily created by `nextChild`, shared
-     *  across every `nextChild` call against the same `Handle` object
-     *  (mirrors codec-extension.ts's own per-Handle `cursor`). Sequential
-     *  access only, matching codec-extension.md §3.4. */
-    cursor?: number
-}
-
-export const getH = (h: Handle): any => h.c[h.k]
-export const setH = (h: Handle, v: unknown): void => { h.c[h.k] = v }
-
-/** A freshly-navigated handle whose own type is a struct needs a real
- *  backing object before anything writes a field into it — codegen only
- *  ever calls this where the target's type is statically known to be a
- *  struct and only while decoding (both baked in at generation time; see
- *  `ensureDecodedStructExists`, codec-extension.ts). Also what a compiled
- *  `decode()` entry point uses to seed a struct-typed root, replacing the
- *  manual `{ root: {} }` callers of the interpreted path have to set up
- *  themselves (codec-extension.ts's own root handle is never passed
- *  through `computeChild`, so nothing instantiates it automatically). */
-export function ensureStruct(h: Handle): void
-{
-    if(getH(h) === undefined) setH(h, {})
-}
-
-/** Wraps a freshly-built child `Handle` with `ensureStruct` only where
- *  codegen has determined it's needed — kept as a one-line passthrough so
- *  every `ENTER`/`CALL_CODEC(_NEXT)` call site can stay a single
- *  expression regardless of whether the wrap applies (`ensured(x)` vs.
- *  just `x`), rather than needing a separate statement. */
-export function ensured(h: Handle): Handle
-{
-    ensureStruct(h)
-    return h
-}
-
-/** ENTER/CALL_CODEC into a union payload, decode direction: instantiate
- *  the active variant — codegen already knows the variant name statically
- *  (codec-extension.ts's computeChild union/decode branch), so this never
- *  needs a schema lookup to pick it. */
-export function enterVariant(h: Handle, variant: string): Handle
-{
-    setH(h, { variant, value: undefined })
-    return { c: getH(h), k: "value" }
-}
-
-/** ENTER/CALL_CODEC into a union payload, encode direction: navigate
- *  only — codegen has already picked `expectedVariant` to match a
- *  TAG-driven dispatch, so this never re-derives it; the active-variant
- *  check is a runtime sanity check carried over from codec-extension.ts's
- *  own encode branch (catches a caller handing in a value whose active
- *  variant disagrees with the schema, not a codegen bug). */
-export function activeVariantPayload(h: Handle, expectedVariant: string): Handle
-{
-    const active = getH(h) as { variant: string; value: unknown } | undefined
-    if(!active || active.variant !== expectedVariant)
-        throw new Error(`codec: active variant "${active?.variant ?? "none"}" doesn't match the expected variant "${expectedVariant}"`)
-    return { c: active, k: "value" }
-}
 
 /** TAG: which variant is currently active, as its declaration-order
  *  index — codegen bakes in the variant name list itself (from the
- *  union's own `TypeNode.edges`, in order), so this is a plain array
- *  lookup, never a schema-edge search the way codec-extension.ts's own
- *  TAG case does it. */
-export function tagOf(h: Handle, variantNames: readonly string[]): number
+ *  union's own `TypeNode.edges`, in order) and resolves the active
+ *  variant's own *name* via `Accessor.activeVariantName` before calling
+ *  in here, so this is a plain array lookup, never a schema-edge search
+ *  the way `codec-extension.ts`'s own TAG case does it, and never a
+ *  `Handle`-carrying one either. */
+export function tagOf(variantName: string, variantNames: readonly string[]): number
 {
-    const active = getH(h) as { variant: string }
-    const idx = variantNames.indexOf(active.variant)
-    if(idx < 0) throw new Error(`codec: active variant "${active.variant}" isn't one of ${JSON.stringify(variantNames)}`)
+    const idx = variantNames.indexOf(variantName)
+    if(idx < 0) throw new Error(`codec: active variant "${variantName}" isn't one of ${JSON.stringify(variantNames)}`)
     return idx
-}
-
-/** ENTER_NEXT/CALL_CODEC_NEXT: advance to the list's next element. */
-export function nextChild(h: Handle): Handle
-{
-    const i = (h.cursor ??= 0)
-    h.cursor = i + 1
-    return { c: getH(h), k: i }
-}
-
-export function openList(h: Handle): void { setH(h, []) }
-export function countOf(h: Handle): number { return (getH(h) as unknown[]).length }
-
-/** LOAD_VAL: read a leaf value as raw wire bits — `>>> 0` matches
- *  codec-extension.ts's own LOAD_VAL exactly (a negative signed host value
- *  gets reinterpreted as an unsigned 32-bit pattern here, the same
- *  reinterpretation the interpreted runtime performs). */
-export function loadVal(h: Handle): number { return (getH(h) as number) >>> 0 }
-
-function signExtend(bits: number, raw: number): number
-{
-    const signBit = 2 ** (bits - 1)
-    return raw >= signBit ? raw - 2 ** bits : raw
-}
-
-/** STORE_VAL: write a decoded wire value back as a real (possibly signed)
- *  host number. `width`/`signed` are baked in at generation time from the
- *  field's own static integer type (`intWireSize`, @ppl/codecs) — the
- *  interpreted runtime derives the same two facts from a `Handle.type` it
- *  carries at runtime; compiled code has no need to carry that, since
- *  every STORE_VAL call site already knows its own field. */
-export function storeVal(h: Handle, raw: number, width: number, signed: boolean): void
-{
-    setH(h, signed ? signExtend(width * 8, raw) : raw)
 }
 
 // ── The byte stream ─────────────────────────────────────────────────────
@@ -205,19 +107,39 @@ export function seek(ctx: Ctx, iterIdx: number, delta: number): void
     it.pos += delta
 }
 
+/** Reinterpret an unsigned `bits`-wide bit pattern as a signed host
+ *  number — two's-complement, mandatory wire-correctness (not a
+ *  representation choice an `Accessor` gets to opt out of): a raw wire
+ *  read is always unsigned bits; a signed integer type's own `fromWire`
+ *  (`ts-emitter.ts`'s `integerRule`, and any alternative like
+ *  `bigIntEscalationRules`) calls this to recover the real host value
+ *  before doing anything representation-specific of its own. */
+export function signExtend(bits: number, raw: number): number
+{
+    const signBit = 2 ** (bits - 1)
+    return raw >= signBit ? raw - 2 ** bits : raw
+}
+
 /** ROADMAP.md item 11's "snatch point": the dumb per-element pump loop
  *  here matches codec-extension.ts's own WRITE_SEQ exec() case exactly —
  *  a target codegen recognizing this op is free to specialize it into a
  *  raw-buffer/DMA copy, but this module doesn't (a straightforward,
  *  obviously-correct baseline is more valuable here than a premature
- *  optimization only exercised by the tests written against it). */
-export function writeSeq(ctx: Ctx, iterIdx: number, h: Handle, width: number, count: number): void
+ *  optimization only exercised by the tests written against it).
+ *
+ *  `arr` is the *finished* list value directly, never a `Handle` — an
+ *  encode-side caller passes it as such (already representation-
+ *  converted by whichever `Accessor.finishList` produced it), and both a
+ *  plain `number[]` and a `Uint8Array` support the same `[i]` indexing
+ *  this loop needs, so no `Accessor` involvement belongs here at all: the
+ *  whole point of a bulk transfer is that it never touches representation
+ *  per element, only once, at the value's own boundary. */
+export function writeSeq(ctx: Ctx, iterIdx: number, arr: { readonly [i: number]: number }, width: number, count: number): void
 {
     const it = iterAt(ctx, iterIdx)
     if(it.capability !== "write") throw new Error(`codec: WRITE_SEQ on read-only iterator ${iterIdx}`)
     if(it.overwriteOnly && it.pos + width * count > ctx.buffer.length)
         throw new Error(`codec: iterator ${iterIdx} (a CLONE_WR fork) can't append — only the root iterator appends`)
-    const arr = getH(h) as number[]
     for(let i = 0; i < count; i++)
     {
         let value = arr[i]!
@@ -225,11 +147,14 @@ export function writeSeq(ctx: Ctx, iterIdx: number, h: Handle, width: number, co
     }
 }
 
-export function readSeq(ctx: Ctx, iterIdx: number, h: Handle, width: number, signed: boolean, count: number): void
+/** `arr` is decode's own plain, growable accumulator — filled in directly,
+ *  the same "no `Accessor` per element" reasoning as `writeSeq` above;
+ *  whatever `finishList` eventually converts it to happens once, later,
+ *  at the owning procedure's own `return`. */
+export function readSeq(ctx: Ctx, iterIdx: number, arr: number[], width: number, signed: boolean, count: number): void
 {
     const it = iterAt(ctx, iterIdx)
     if(it.capability !== "read") throw new Error(`codec: READ_SEQ on write-only iterator ${iterIdx}`)
-    const arr = getH(h) as number[]
     for(let i = 0; i < count; i++)
     {
         let value = 0
