@@ -55,6 +55,28 @@ constant, needs that field added first.
 The arena is a pure bump allocator (single high-water pointer) between two
 phases: alloc-only until exhausted, then evict-LRU-and-compact (§9).
 
+**The block-nesting stack — one record per currently-open `BR_TABLE`/`LOOP`
+in whichever procedure is presently being translated (§10, §16 item 7) — is
+not one of the fixed regions above; it shares the arena itself, growing
+from the opposite end.** Compiled code bump-allocates upward from the
+arena's low address (as above); block-nesting records bump-allocate
+downward from its high address. Neither gets an independent worst-case
+reservation — the two meet wherever they meet, bounded only by how much of
+each the procedure actually being translated needs, strictly tighter than
+sizing either side from a fixed constant. When they meet, that's the same
+trigger §9's evict-LRU-and-compact phase already exists for, just measuring
+a different sum (code so far + open block records, not code alone) — see
+§11 for what compaction additionally has to cover here, and §12 for the
+failure path once nothing more is evictable.
+
+Only sound because nothing a block record holds can be an absolute arena
+address — every offset inside one (a jump-table base, a pending branch
+fixup) has to be relative to the current procedure's own start, the same
+position-independence §11 already requires of every emitted instruction.
+Given that, compaction sliding the code region never invalidates anything a
+still-open block record points at; the records themselves never move and
+never need to.
+
 ---
 
 ## 3. Register assignment
@@ -750,6 +772,18 @@ pool word (option 1) may still be cheaper in aggregate, precisely because
 they're rare. Worth deciding with real call-site counts from a
 representative program, not in the abstract.
 
+**A second, unrelated compaction extension, needed once the block-nesting
+stack shares the arena with code (§2, §16 item 7):** the procedure whose
+code is growing up against that stack is, by definition, not yet complete
+— it has no dispatch-table entry yet, so it's invisible to compaction as
+described above ("moves surviving procedures... updates the dispatch
+table's `code_ptr` entries" only covers procedures already registered
+there). Triggering compaction from that collision needs to relocate the
+in-progress code too, and update the translator's own base-pointer/cursor
+for it — mechanically identical to updating one more `code_ptr`, just one
+that isn't in the table yet. The block-nesting records themselves need no
+equivalent update (§2's own note on why).
+
 ---
 
 ## 12. Report / error model
@@ -758,10 +792,11 @@ representative program, not in the abstract.
 distinct from anything isa-core.md's own static guarantees (§9) cover.
 Stack overflow shouldn't happen (§2's static regions are sized from
 `validateProgram`'s own figures); the real runtime failure here is
-specifically **arena exhaustion where a single procedure doesn't fit even
-after evicting everything evictable** (§8) — e.g. one procedure larger than
-the whole arena, or every evictable slot still too fragmented pre-
-compaction. `TRAPPED` carries the ISA's own `TRAP #code` value unchanged.
+specifically **arena exhaustion where a single procedure's code and its own
+in-progress block-nesting stack (§2) don't together fit** even after
+evicting everything evictable (§8) — e.g. one procedure larger than the
+whole arena, or every evictable slot still too fragmented pre-compaction.
+`TRAPPED` carries the ISA's own `TRAP #code` value unchanged.
 
 ---
 
@@ -1179,3 +1214,44 @@ than by hand-translation — see §16 items 5/6.
    cross-checking the two now that a translator exists, since a
    transcription error there would silently misclassify one op's
    foldability rather than fail loudly.
+7. **Block-nesting stack — resolved, no new mechanism needed.** Auditing
+   every piece of translator-owned state that survives across the single
+   forward pass (window.ts's `tos`, accstate.ts's `AccState`, blocks.ts's
+   `BlockStack`) against §2's no-heap, fixed-region model found exactly one
+   structure whose size isn't already a compile-time constant or a value
+   computed once from `validateProgram`: `BlockStack.frames`, sized by
+   however deeply `BR_TABLE`/`LOOP` happen to nest in a given procedure — a
+   figure nothing in `@ppl/machine` computes today (checked directly:
+   neither `validate.ts` nor `vm.ts` tracks block-nesting depth anywhere;
+   `vm.ts`'s own `ctrl: BlockFrame[]` is itself an unbounded array,
+   harmless only because it's host-side JS).
+
+   Closing it needed two independent pieces. First, every `Frame` variant
+   has to actually be fixed-size — not true as prototyped today:
+   `openBrTableJump`'s `case` frame holds a `table.fixups: number[]` and an
+   `endFixups: number[]`, both sized by the switch's own arity `N`. The
+   first is redundant outright (slot `i`'s offset is `base + i*2`,
+   arithmetically derivable, no array needed); the second genuinely can't
+   be computed, since each case body is a different length, but doesn't
+   need an array either — the standard backpatch-chain technique (thread
+   pending sites through their own placeholder branches' displacement
+   fields, one `number | null` "last pending site" instead of a list) turns
+   it into the same O(1) shape as everything else. Same fix applies to
+   `BlockStack.brTableHelperSites`, since every site it holds resolves to
+   the identical single target. None of this is implemented in
+   `jit-armv6m/prototype` yet — found by design review, not yet built or
+   tested.
+
+   Second, and this is the part that avoids needing any new
+   `validateProgram` figure at all: rather than sizing `BlockStack.frames`
+   from a hard-coded compile-time constant (workable, but wastes space or
+   rejects otherwise-valid programs depending which way the constant is
+   picked, unlike the tight, program-derived bounds the other two static
+   regions in §2 get), it shares the arena itself with compiled code,
+   growing from the opposite end — see §2's own account, and §11's note on
+   the one compaction extension it needs. Meeting in the middle is the
+   exact same trigger, and the exact same `RESOURCE_ERROR` failure path
+   (§12), that arena exhaustion already needed; §8's pinning still applies
+   unchanged (exactly one procedure — the current call chain's top — is
+   ever unevictable, so the true floor is that pinned caller's code plus
+   whatever the one in-progress callee needs, not literally nothing else).
