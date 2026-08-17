@@ -14,9 +14,10 @@ import * as assert from "node:assert/strict"
 import { buildCodec } from "../src/engine/resolver"
 import { binaryEncodeRules } from "../src/components/binary-rules"
 import { createCodecExtension } from "../src/engine/codec-extension"
-import { resolveProcedureTypes } from "../src/engine/procedure-types"
-import { struct, union, list, integer, u8, named, optional, buildTypeGraph } from "@ppl/core"
-import type { SemanticType, ConcreteSemanticType, TypeNode } from "@ppl/core"
+import { resolveProcedureTypes, correspondenceChild, correspondenceElement, resolveHandleCorrespondences } from "../src/engine/procedure-types"
+import type { CodecExtInstr } from "../src/engine/codec-ext-instr"
+import { struct, union, list, integer, u8, named, optional, buildTypeGraph, reconcile } from "@ppl/core"
+import type { SemanticType, ConcreteSemanticType, TypeNode, Correspondence } from "@ppl/core"
 import { encodeProgram, decodeProgram } from "@ppl/machine"
 import type { RtlProgram } from "@ppl/machine"
 
@@ -132,5 +133,99 @@ describe("resolveProcedureTypes — robust to a program with no header at all", 
         assert.equal(after.size, before.size)
         for(const [i, node] of before)
             assert.equal(after.get(i)!.type.kind, node.type.kind, `procedure ${i}: kind mismatch after header-less resolution`)
+    })
+})
+
+/** Walks every procedure boundary reachable from `root`, memoized by
+ *  procedure index — the same shape a real target codegen (e.g.
+ *  `codec-module.ts`'s own `procedureBoundaryTypes`) drives over
+ *  `resolveHandleTypes`, here over `resolveHandleCorrespondences` instead. */
+function allBoundaryCorrespondences(program: RtlProgram<CodecExtInstr>, root: Correspondence): Map<number, Correspondence>
+{
+    const byIndex = new Map<number, Correspondence>()
+    function visit(procIndex: number, c: Correspondence): void
+    {
+        if(byIndex.has(procIndex)) return
+        byIndex.set(procIndex, c)
+        resolveHandleCorrespondences(program.procedures[procIndex]!.body, c, visit)
+    }
+    visit(0, root)
+    return byIndex
+}
+
+describe("resolveHandleCorrespondences / correspondenceChild / correspondenceElement — bridging navigation", () =>
+{
+    test("matched struct: every field's own CALL_CODEC threads a fully-matched child correspondence", () =>
+    {
+        const Image = named("Point", struct({ x: u8, y: u8 }))
+        const Local = named("Point", struct({ x: u8, y: u8 }))
+        const program = buildCodec(Image, binaryEncodeRules, undefined)
+        const root = reconcile(buildTypeGraph(Image).root, buildTypeGraph(Local).root)
+
+        const calls: Correspondence[] = []
+        const slots = resolveHandleCorrespondences(program.procedures[0]!.body, root, (_i, c) => calls.push(c))
+
+        assert.equal(slots.get(0), root)
+        assert.ok(calls.length >= 2, "expects one CALL_CODEC per shared-integer field")
+        for(const c of calls)
+        {
+            assert.equal(c.outcome, "matched")
+            assert.ok(c.imageNode && c.localNode)
+        }
+    })
+
+    test("image-only field: still reached (the bytecode still reads it), correspondence says image-only", () =>
+    {
+        const Image = named("Widget", struct({ a: u8, extra: u8 }))
+        const Local = named("Widget", struct({ a: u8 }))
+        const program = buildCodec(Image, binaryEncodeRules, undefined)
+        const root = reconcile(buildTypeGraph(Image).root, buildTypeGraph(Local).root)
+
+        const outcomes: string[] = []
+        resolveHandleCorrespondences(program.procedures[0]!.body, root, (_i, c) => outcomes.push(c.outcome))
+
+        assert.deepEqual(outcomes.sort(), ["image-only", "matched"])
+    })
+
+    test("nested struct: multi-hop CALL_CODEC carries correspondence across the procedure boundary", () =>
+    {
+        const InnerImage = named("Inner", struct({ a: u8, extra: u8 }))
+        const InnerLocal = named("Inner", struct({ a: u8 }))
+        const OuterImage = named("Outer", struct({ inner: InnerImage, b: u8 }))
+        const OuterLocal = named("Outer", struct({ inner: InnerLocal, b: u8 }))
+
+        const program = buildCodec(OuterImage, binaryEncodeRules, undefined)
+        const root = reconcile(buildTypeGraph(OuterImage).root, buildTypeGraph(OuterLocal).root)
+        const byIndex = allBoundaryCorrespondences(program, root)
+
+        assert.equal(byIndex.get(0), root)
+        const inner = [...byIndex.values()].find(c => c !== root && c.imageNode?.type.kind === "struct")
+        assert.ok(inner, "expected Inner's own procedure boundary to be reached")
+        assert.equal(inner!.outcome, "matched")
+        assert.equal(correspondenceChild(inner!, "extra").correspondence.outcome, "image-only")
+    })
+
+    test("list of structs: ENTER_NEXT/CALL_CODEC_NEXT navigate the element correspondence", () =>
+    {
+        const ItemImage = named("Item", struct({ v: u8, extra: u8 }))
+        const ItemLocal = named("Item", struct({ v: u8 }))
+        const TImage = named("Batch", struct({ items: list(ItemImage, 4) }))
+        const TLocal = named("Batch", struct({ items: list(ItemLocal, 4) }))
+
+        const program = buildCodec(TImage, binaryEncodeRules, undefined)
+        const root = reconcile(buildTypeGraph(TImage).root, buildTypeGraph(TLocal).root)
+        const byIndex = allBoundaryCorrespondences(program, root)
+
+        const item = [...byIndex.values()].find(c => c !== root && c.imageNode?.type.kind === "struct")
+        assert.ok(item, "expected Item's own procedure boundary to be reached")
+        assert.equal(correspondenceChild(item!, "extra").correspondence.outcome, "image-only")
+    })
+
+    test("correspondenceChild/correspondenceElement throw clearly when there's nothing to navigate to", () =>
+    {
+        const T = named("Point", struct({ x: u8 }))
+        const c = reconcile(buildTypeGraph(T).root, buildTypeGraph(T).root)
+        assert.throws(() => correspondenceChild(c, "nope"), /no edge named/)
+        assert.throws(() => correspondenceElement(c), /no element Correspondence/)
     })
 })

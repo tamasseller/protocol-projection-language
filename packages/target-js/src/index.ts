@@ -37,6 +37,7 @@
  */
 export * from "./engine/resolver"
 export * from "./engine/codec-module"
+export * from "./engine/bridging-codec-module"
 export * from "./components/ts-emitter"
 export * from "./components/ts-alternative-rules"
 export * from "./runtime/codec-runtime"

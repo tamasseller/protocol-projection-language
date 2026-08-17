@@ -1,5 +1,5 @@
 /**
- * @ppl/codecs/test — Reconciliation (engine/reconcile.ts, docs/codec-
+ * @ppl/core/test — Reconciliation (../src/reconcile.ts, docs/codec-
  * image.md §2/§3/§2.4, ROADMAP.md item 11)
  *
  * Covers `reconcile()`'s structural walk (matched/image-only/local-only,
@@ -13,11 +13,12 @@
 import { describe, test } from "node:test"
 import assert from "node:assert/strict"
 
-import type { TypeNode } from "@ppl/core"
-import { struct, union, unit, u8, u16, integer, list, named, defaultValueOf, buildTypeGraph } from "@ppl/core"
+import type { TypeNode } from "../src/type-graph"
+import { buildTypeGraph } from "../src/type-graph"
+import { struct, union, unit, u8, u16, integer, list, named, defaultValueOf } from "../src/metamodel"
 
-import { reconcile, resolve } from "../src/engine/reconcile"
-import type { Correspondence, CorrespondenceEdge } from "../src/engine/reconcile"
+import { reconcile, resolve } from "../src/reconcile"
+import type { Correspondence, CorrespondenceEdge } from "../src/reconcile"
 
 const root = (t: Parameters<typeof buildTypeGraph>[0]): TypeNode => buildTypeGraph(t).root
 

@@ -27,13 +27,22 @@
  *  variant's own *name* via `Accessor.activeVariantName` before calling
  *  in here, so this is a plain array lookup, never a schema-edge search
  *  the way `codec-extension.ts`'s own TAG case does it, and never a
- *  `Handle`-carrying one either. */
+ *  `Handle`-carrying one either.
+ *
+ *  `variantNames` stays image-side unconditionally (docs/codec-image.md
+ *  §2.2), so a not-found name is exactly the union/local-only/encode trap
+ *  (§3.4) once bridging is active — `CodecTrap`, not a plain `Error`,
+ *  for the same reason every other bridging trap join point uses one
+ *  (`codec-codegen-ext.ts`'s `emitCallCodec`). In a non-reconciled
+ *  program the two lists are always the same node's own, so this stays
+ *  defensive/unreachable there — a real hit means the local value's own
+ *  active-variant bookkeeping is corrupted, not a bridging outcome. */
 export function tagOf(variantName: string, variantNames: readonly string[]): number
 {
     const idx = variantNames.indexOf(variantName)
     if(idx < 0)
     {
-        throw new Error(`codec: active variant "${variantName}" isn't one of ${JSON.stringify(variantNames)}`)
+        throw new CodecTrap(-1, `active variant "${variantName}" isn't one of ${JSON.stringify(variantNames)}`)
     }
 
     return idx
@@ -384,9 +393,18 @@ export function revBits(x: number): number
 
 export class CodecTrap extends Error
 {
-    constructor(readonly code: number)
+    /** `reason`, when given, is a bridging-specific trap (docs/codec-
+     *  image.md §3) — reconciliation's own `resolve()` (`@ppl/codecs`)
+     *  already produces a human-readable reason string, never a numeric
+     *  RTL trap code (there's no RTL `TRAP` instruction behind one of
+     *  these at all — the generated code raises it directly). `code`
+     *  stays `-1` for one of these, a clear sentinel
+     *  that it's not a real RTL-assigned code (those are opaque per-rule
+     *  choices, isa-core.md §8.7 — never a fixed registry, so no risk of
+     *  colliding with one). */
+    constructor(readonly code: number, readonly reason?: string)
     {
-        super(`codec trap ${code}`)
+        super(reason ? `codec trap ${code}: ${reason}` : `codec trap ${code}`)
         this.name = "CodecTrap"
     }
 }

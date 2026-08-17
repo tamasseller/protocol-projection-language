@@ -16,7 +16,6 @@ export * from "./engine/validate-handles"
 export * from "./engine/opcodes"
 export * from "./engine/type-tree-wire"
 export * from "./engine/codec-image"
-export * from "./engine/reconcile"
 export * from "./engine/procedure-types"
 export * from "./engine/codec-ext-instr"
 

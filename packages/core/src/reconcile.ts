@@ -1,20 +1,35 @@
 /**
- * @ppl/codecs — Reconciliation (docs/codec-image.md §2/§3, ROADMAP.md item 11)
+ * @ppl/core — Reconciliation (docs/codec-image.md §2/§3, ROADMAP.md item 11)
  *
- * Target-independent, the same way `raise.ts` is in `@ppl/machine`: this
- * computes a mapping a target codegen consumes, but knows nothing about
- * any target language itself. Two functions, deliberately kept separate
- * (docs/codec-image.md §2.4 spells out why): `reconcile` is the
- * direction-agnostic lock-step walk of the image tree and the local tree
- * (§2); `resolve` turns one edge of that walk's result into what a codegen
- * should actually do, which — unlike the tree shape itself — does depend
- * on direction (§3's four relaxation rules).
+ * Target- *and* codec-independent: this computes a mapping some codegen
+ * consumes, but knows nothing about wire bytes, RTL, or any target
+ * language — the same relationship `raise.ts` has to a target's own
+ * emitter, just one layer further removed. Originally built in
+ * `@ppl/codecs` (where the problem motivating it, codec-image.md, lives)
+ * but moved here once it was clear nothing in either function below
+ * touches anything beyond `@ppl/core`'s own `TypeNode`/`defaultValueOf` —
+ * unlike `@ppl/codecs`'s own `engine/resolver.ts` (`createCodecResolver`),
+ * which genuinely can't move (it depends on `@ppl/machine`'s `Procedure`/
+ * `declareProc`/`lowerProgram`, and `@ppl/core` stays `@ppl/machine`-free
+ * on purpose), reconciling two semantic type trees by name is exactly the
+ * kind of pure, structural, metamodel-level operation `@ppl/core` already
+ * hosts elsewhere (`matchType`, `defaultValueOf`). `@ppl/codecs/engine/
+ * codec-extension.ts` re-exports `Direction` from here for its own
+ * existing consumers — it isn't redefined there.
+ *
+ * Two functions, deliberately kept separate (docs/codec-image.md §2.4
+ * spells out why): `reconcile` is the direction-agnostic lock-step walk of
+ * the image tree and the local tree (§2); `resolve` turns one edge of that
+ * walk's result into what a codegen should actually do, which — unlike the
+ * tree shape itself — does depend on direction (§3's four relaxation
+ * rules).
  *
  * "Image tree" and "local tree" are both ordinary `TypeNode` graphs here —
  * the image side is whatever `buildTypeGraph` produces from a decoded
- * `codec-image.ts`/`type-tree-wire.ts` type tree, the local side is the
- * consumer's own, independently-built graph. Nothing in this file reads a
- * value, a wire byte, or an opcode; it only walks the two type shapes.
+ * `@ppl/codecs`-side `codec-image.ts`/`type-tree-wire.ts` type tree, the
+ * local side is the consumer's own, independently-built graph. Nothing in
+ * this file reads a value, a wire byte, or an opcode; it only walks the
+ * two type shapes.
  *
  * Names live on the *edge*, never on the node — deliberately mirroring
  * `type-graph.ts`'s own `TypeEdge {step, target}` split (a `TypeNode` has
@@ -25,19 +40,27 @@
  * `Correspondence` is memoized on the (imageNode, localNode) pair (`pair`
  * below), so a cyclic or shared position returns the exact same object a
  * caller already has elsewhere — invaluable for a codegen that wants to
- * monomorphize one generated procedure per distinct pair (`resolver.ts`'s
- * own `declareProc`/cache pattern). An earlier draft of this file instead
- * put `.name`/`.parent` directly on `Correspondence`, which silently broke
- * exactly this sharing: a cyclic back-edge returned the *ancestor's*
- * name/parent instead of the edge's own. Keeping the node itself purely
- * structural (outcome + both `TypeNode`s + children/element) avoids the
- * bug entirely, rather than working around it.
+ * monomorphize one generated procedure per distinct pair (`@ppl/codecs`'s
+ * own `createCodecResolver`/`declareProc`-cache pattern). An earlier draft
+ * of this file instead put `.name`/`.parent` directly on `Correspondence`,
+ * which silently broke exactly this sharing: a cyclic back-edge returned
+ * the *ancestor's* name/parent instead of the edge's own. Keeping the node
+ * itself purely structural (outcome + both `TypeNode`s + children/element)
+ * avoids the bug entirely, rather than working around it.
  */
 
-import type { TypeNode } from "@ppl/core"
-import { SemanticTypeKinds, defaultValueOf } from "@ppl/core"
-import type { UnionType } from "@ppl/core"
-import type { Direction } from "./codec-extension"
+import type { TypeNode } from "./type-graph"
+import { SemanticTypeKinds, defaultValueOf } from "./metamodel"
+import type { UnionType } from "./metamodel"
+
+/** Which of the two ends of a codec a piece of generated/interpreted code
+ *  is playing — encoding a local value onto the wire, or decoding wire
+ *  bytes into one. A whole-program property in `@ppl/codecs` (passed in
+ *  once, read by `computeChild`'s union branch and `i0`'s own initial
+ *  stream capability — see `codec-extension.ts`'s own doc comment) and, at
+ *  a smaller grain here, `resolve`'s own per-edge parameter (§3's four
+ *  relaxation rules are direction-crossed by construction). */
+export type Direction = "encode" | "decode"
 
 export type ReconciliationOutcome = "matched" | "image-only" | "local-only"
 

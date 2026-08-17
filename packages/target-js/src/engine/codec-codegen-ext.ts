@@ -26,9 +26,11 @@
 import type {Stmt, Expr} from "@ppl/machine"
 import {ExprKind, StmtKind} from "@ppl/machine"
 import type {TypeNode} from "@ppl/core"
-import {kindOf, SemanticTypeKinds} from "@ppl/core"
-import type {Direction, CodecExtInstr} from "@ppl/codecs"
-import {requireSlotNode, intWireSize, assertNever} from "@ppl/codecs"
+import {kindOf, concreteKindOf, SemanticTypeKinds} from "@ppl/core"
+import type {Direction, Correspondence, Resolution} from "@ppl/core"
+import {resolve} from "@ppl/core"
+import type {CodecExtInstr} from "@ppl/codecs"
+import {requireSlotNode, intWireSize, assertNever, correspondenceChild, correspondenceElement} from "@ppl/codecs"
 import type {Accessor, TSTypeDecl} from "./resolver"
 import {LineBuilder} from "./line-builder"
 import {requireEdge, variantNamesOf, describeType} from "./codec-type-nav"
@@ -73,6 +75,17 @@ export interface GenCtx
      *  counter, not a per-slot key, since a `CALL_CODEC`'s own result has
      *  no slot number of its own until it's written back. */
     readonly tempCounter: {n: number}
+    /** Per-slot `Correspondence` (docs/codec-image.md §2, `@ppl/core`'s
+     *  `reconcile`) — set only when this program is being compiled against
+     *  a reconciled local schema rather than its own, i.e. this whole field
+     *  is absent/empty for every ordinary (non-bridging) call, which is the
+     *  load-bearing invariant that keeps this rework from changing a single
+     *  byte of ordinary output. When present for a given slot, its own
+     *  `localNode` (never `slotTypes`' image node) is what `localAccessorFor`
+     *  looks the `Accessor` up by — `slotTypes` itself stays image-keyed
+     *  unconditionally, since wire-format concerns (width, tag order) are
+     *  always the image's to define, reconciled or not. */
+    readonly correspondences?: Map<number, Correspondence>
 }
 
 export function accessorFor(node: TypeNode, g: GenCtx): Accessor
@@ -80,6 +93,146 @@ export function accessorFor(node: TypeNode, g: GenCtx): Accessor
     const decl = g.projection.get(node.id)
     if(!decl) throw new Error(`codec-codegen: no local-representation projection for ${describeType(node)} (node #${node.id}) — pass the same rule list to projectTSTypes and generateCodecModule`)
     return decl.access
+}
+
+/** The `Accessor` a handle slot's own local representation should be read/
+ *  written through — `accessorFor` itself, keyed by whichever `TypeNode`
+ *  actually describes that representation: the slot's own tracked
+ *  `Correspondence.localNode` when bridging (`g.correspondences` has an
+ *  entry for it), else its plain image `TypeNode` (`g.slotTypes`) exactly
+ *  as every call site already did before this field existed. Every
+ *  existing `accessorFor` call site in this file that's keyed by a handle
+ *  slot goes through this now, so bridging support is purely additive:
+ *  with `g.correspondences` absent/empty, this reduces to exactly the old
+ *  `accessorFor(requireSlotNode(...), g)` call it replaced. */
+export function localAccessorFor(slot: number, g: GenCtx): Accessor
+{
+    const c = g.correspondences?.get(slot)
+    if(!c) return accessorFor(requireSlotNode(g.slotTypes, slot, "accessor lookup"), g)
+    if(c.localNode) return accessorFor(c.localNode, g)
+    // Image-only: no local representation exists at all for this slot.
+    // Its own value is either discarded outright (decode's own "drop") or
+    // synthesized purely from the image's own declared default and never
+    // touches real local storage either way (encode's own "default") —
+    // any shape that round-trips through itself is fine, so the trivial
+    // one (the same fallback every Accessor's own optional methods
+    // already use) avoids needing a second, image-side rule projection
+    // just for subtrees nothing ever actually reads.
+    return scratchAccessorFor(concreteKindOf(c.imageNode!.type))
+}
+
+/** The trivial plain-object/array `Accessor` every rule-supplied one
+ *  already falls back to when it doesn't override `beginStruct`/
+ *  `setField`/`beginList`/`appendElement` (`resolver.ts`'s own `Accessor`
+ *  doc comment) — used here, unconditionally, for a slot with no local
+ *  representation to honor at all (see `localAccessorFor`'s own comment).
+ *  Not looked up via any projection — there is no `TypeNode` to key one
+ *  by on the local side, so this is a fixed constant per kind instead. */
+function scratchAccessorFor(kind: SemanticTypeKinds): Accessor
+{
+    switch(kind)
+    {
+        case SemanticTypeKinds.Integer: return {kind: "integer", fromWire: raw => raw, toWire: host => host}
+        case SemanticTypeKinds.Unit: return {kind: "unit", unitValue: () => "undefined"}
+        case SemanticTypeKinds.Struct: return {
+            kind: "struct", finishStruct: x => x, readField: (v, f) => `${v}.${f}`,
+            beginStruct: () => "{}", setField: (acc, f, v) => `${acc}.${f} = ${v}`,
+        }
+        case SemanticTypeKinds.Union: return {
+            kind: "union",
+            finishUnion: (variant, payload) => `{variant: ${JSON.stringify(variant)}, value: ${payload ?? "undefined"}}`,
+            activeVariantName: v => `${v}.variant`, activeVariantPayload: v => `${v}.value`,
+        }
+        case SemanticTypeKinds.List: return {
+            kind: "list", finishList: x => x, count: v => `${v}.length`, elementAt: (v, i) => `${v}[${i}]`,
+            beginList: () => "[]", appendElement: (acc, v) => `${acc}.push(${v})`,
+        }
+    }
+}
+
+/**
+ * Recursively synthesizes a JS expression for `node`'s own declared
+ * default (docs/codec-image.md §4) — driven entirely by `accessorOf`
+ * rather than by walking `defaultValueOf`'s own pre-flattened plain-JS
+ * value, so the result is representation-faithful (e.g. a bigint rule's
+ * own conversion, or a class rule's own constructor) wherever `accessorOf`
+ * points at a real rule's own `Accessor` — never a raw object literal
+ * that would silently be the *wrong* shape for an alternative rule.
+ * `accessorOf` is the caller's own choice of *which* accessor a given
+ * node's default should be built through: the real local one for §3.1's
+ * "default from local" (decode, local-only field — `emitEnter`/
+ * `emitEnterNext`'s own `injectLocalOnlyDefaults`), the trivial scratch
+ * one for §3.3's "default from image" (encode, image-only field: there is
+ * no local representation for it at all).
+ *
+ * A struct's own accumulator needs real statements (`beginStruct`/
+ * `setField`/`finishStruct`, exactly decode's own construction protocol)
+ * to stay representation-faithful, not a plain object-literal shortcut —
+ * so this emits into `b` via a fresh temp, reusing `GenCtx.tempCounter`
+ * (already shared with `emitCallCodec`'s own flushing, for the same
+ * "unique name, not a per-slot key" reason), and returns the temp's name.
+ */
+function emitDefaultValue(node: TypeNode, accessorOf: (n: TypeNode) => Accessor, g: GenCtx, b: LineBuilder): string
+{
+    const access = accessorOf(node)
+    switch(access.kind)
+    {
+        case "unit": return access.unitValue()
+
+        case "integer":
+        {
+            const intType = node.type as {min: number; max: number; default: number}
+            return access.fromWire(String(intType.default), intWireSize(intType), intType.min < 0)
+        }
+
+        case "union":
+        {
+            const unionType = node.type as {defaultVariant?: string}
+            if(unionType.defaultVariant === undefined)
+                throw new Error(`codec-codegen: default value needed for ${describeType(node)}, but it declares no defaultVariant`)
+            return access.finishUnion(unionType.defaultVariant, undefined)
+        }
+
+        // Always empty (defaultValueOf's own List case, @ppl/core) — no
+        // elements to append, so no statements needed either.
+        case "list": return access.finishList(access.beginList?.() ?? "[]")
+
+        case "struct":
+        {
+            const temp = `__def${g.tempCounter.n++}`
+            // `: any` matters, not just style — `let x = {}` (no
+            // annotation) infers the empty-object *type* `{}`, not `any`,
+            // so a later `x.field = v` would fail to typecheck (exactly
+            // `generateProcedure`'s own `v0: any` reasoning).
+            b.line(`let ${temp}: any = ${access.beginStruct?.() ?? "{}"};`)
+            for(const edge of node.edges)
+            {
+                const name = (edge.step as {field: string}).field
+                const v = emitDefaultValue(edge.target, accessorOf, g, b)
+                b.line(`${access.setField?.(temp, name, v) ?? `${temp}.${name} = ${v}`};`)
+            }
+            return access.finishStruct(temp)
+        }
+    }
+}
+
+/** For every local-only field on a `"matched"` struct correspondence
+ *  (docs/codec-image.md §3.1, decode only — encode's own mirror, §3.4, is
+ *  free: the image-derived bytecode simply never writes a local-only
+ *  field at all, so there's nothing to inject or suppress there), seed it
+ *  with its own declared default right after the struct's own accumulator
+ *  is created. There is no existing wire instruction to hook this into —
+ *  the bytecode never mentions a field the image doesn't declare — so
+ *  this is a pure injection, not a modified existing site. */
+export function injectLocalOnlyDefaults(structCorr: Correspondence, accExpr: string, g: GenCtx, b: LineBuilder): void
+{
+    const access = expectAccessor(accessorFor(structCorr.localNode!, g), "struct", structCorr.localNode!)
+    for(const edge of structCorr.children ?? [])
+    {
+        if(edge.correspondence.outcome !== "local-only") continue
+        const v = emitDefaultValue(edge.correspondence.localNode!, n => accessorFor(n, g), g, b)
+        b.line(`${access.setField?.(accExpr, edge.name, v) ?? `${accExpr}.${edge.name} = ${v}`};`)
+    }
 }
 
 /** Narrow an `Accessor` to one `kind` or throw — every call site already
@@ -172,19 +325,24 @@ export function translateExt(e: Extract<Expr<CodecExtInstr>, {kind: ExprKind.Ext
         case "LOAD_VAL":
             {
                 const node = requireSlotNode(g.slotTypes, e.src, "LOAD_VAL")
-                return expectAccessor(accessorFor(node, g), "integer", node).toWire(`v${e.src}`)
+                return expectAccessor(localAccessorFor(e.src, g), "integer", node).toWire(`v${e.src}`)
             }
 
         case "COUNT":
             {
                 const node = requireSlotNode(g.slotTypes, e.src, "COUNT")
-                return expectAccessor(accessorFor(node, g), "list", node).count(`v${e.src}`)
+                return expectAccessor(localAccessorFor(e.src, g), "list", node).count(`v${e.src}`)
             }
 
         case "TAG":
             {
+                // activeVariantName reads the *local* representation
+                // (whatever the rule actually stores); variantNamesOf
+                // stays image-side unconditionally — tagOf's own comparison
+                // set is always the image's own wire-declared variant
+                // order, reconciled or not (docs/codec-image.md §2.2).
                 const node = requireSlotNode(g.slotTypes, e.src, "TAG")
-                const activeName = expectAccessor(accessorFor(node, g), "union", node).activeVariantName(`v${e.src}`)
+                const activeName = expectAccessor(localAccessorFor(e.src, g), "union", node).activeVariantName(`v${e.src}`)
                 return `tagOf(${activeName}, ${JSON.stringify(variantNamesOf(node))})`
             }
 
@@ -198,7 +356,7 @@ export function translateExt(e: Extract<Expr<CodecExtInstr>, {kind: ExprKind.Ext
         case "WRITE_SEQ":
             {
                 const node = requireSlotNode(g.slotTypes, e.handle, "WRITE_SEQ")
-                const bulk = expectAccessor(accessorFor(node, g), "list", node).bulk
+                const bulk = expectAccessor(localAccessorFor(e.handle, g), "list", node).bulk
                 if(!bulk) throw new Error(`codec-codegen: no bulk sequential-transfer support for ${describeType(node)} (node #${node.id}) — the rule that claimed this type's Accessor doesn't provide "bulk"`)
                 return bulk.writeSeq(`v${e.handle}`, `${e.iter}`, `${e.width}`, arg(0))
             }
@@ -206,7 +364,7 @@ export function translateExt(e: Extract<Expr<CodecExtInstr>, {kind: ExprKind.Ext
         case "READ_SEQ":
             {
                 const node = requireSlotNode(g.slotTypes, e.handle, "READ_SEQ")
-                const bulk = expectAccessor(accessorFor(node, g), "list", node).bulk
+                const bulk = expectAccessor(localAccessorFor(e.handle, g), "list", node).bulk
                 if(!bulk) throw new Error(`codec-codegen: no bulk sequential-transfer support for ${describeType(node)} (node #${node.id}) — the rule that claimed this type's Accessor doesn't provide "bulk"`)
                 return bulk.readSeq(`v${e.handle}`, `${e.iter}`, `${e.width}`, `${e.signed}`, arg(0))
             }
@@ -244,12 +402,12 @@ function emitWriteBack(slot: number, value: string, g: GenCtx, b: LineBuilder): 
     const parentNode = requireSlotNode(g.slotTypes, wb.parentSlot, "write-back")
     if(wb.into === "field")
     {
-        const access = expectAccessor(accessorFor(parentNode, g), "struct", parentNode)
+        const access = expectAccessor(localAccessorFor(wb.parentSlot, g), "struct", parentNode)
         b.line(`${access.setField?.(`v${wb.parentSlot}`, wb.name, `v${slot}`) ?? `v${wb.parentSlot}.${wb.name} = v${slot}`};`)
     }
     else
     {
-        const access = expectAccessor(accessorFor(parentNode, g), "list", parentNode)
+        const access = expectAccessor(localAccessorFor(wb.parentSlot, g), "list", parentNode)
         b.line(`${access.appendElement?.(`v${wb.parentSlot}`, `v${slot}`) ?? `v${wb.parentSlot}.push(v${slot})`};`)
     }
 }
@@ -277,8 +435,31 @@ function emitEnter(dst: number, src: number, ref: number, g: GenCtx, b: LineBuil
     const srcNode = requireSlotNode(g.slotTypes, src, "ENTER")
     const edge = requireEdge(srcNode, ref, "ENTER")
     const name = (edge.step as {field: string}).field
-    g.writeBacks.set(dst, {into: "field", parentSlot: src, name})
     g.slotTypes.set(dst, edge.target)
+
+    // Bridging (docs/codec-image.md §2/§3): a struct field's own edge is
+    // either "matched" (bridge — everything below is unaffected), an
+    // image-only field on decode (drop — still read/skipped normally
+    // below, never written back anywhere real), or an image-only field on
+    // encode (default — the wire still needs real bytes at this position,
+    // substituted from the image's own declared default; a local-only
+    // field never reaches this function at all — there's no image-side
+    // ref for one to navigate by in the first place, §3.4/§3.1's own
+    // "nothing to hook into" reasoning).
+    const parentCorr = g.correspondences?.get(src)
+    const childEdge = parentCorr ? correspondenceChild(parentCorr, name) : undefined
+    const resolution: Resolution | undefined = childEdge ? resolve(parentCorr!, childEdge, g.direction) : undefined
+    if(childEdge) g.correspondences!.set(dst, childEdge.correspondence)
+
+    if(resolution?.action === "default")
+    {
+        g.writeBacks.set(dst, {into: "field", parentSlot: src, name})
+        const defaultExpr = emitDefaultValue(childEdge!.correspondence.imageNode!, n => scratchAccessorFor(concreteKindOf(n.type)), g, b)
+        emitWriteBack(dst, defaultExpr, g, b)
+        return
+    }
+
+    if(resolution?.action !== "drop") g.writeBacks.set(dst, {into: "field", parentSlot: src, name})
 
     if(g.direction === "decode")
     {
@@ -290,8 +471,10 @@ function emitEnter(dst: number, src: number, ref: number, g: GenCtx, b: LineBuil
         // initialize here for it at all.
         if(kindOf(edge.target.type) === SemanticTypeKinds.Struct)
         {
-            const access = expectAccessor(accessorFor(edge.target, g), "struct", edge.target)
+            const access = expectAccessor(localAccessorFor(dst, g), "struct", edge.target)
             b.line(`v${dst} = ${access.beginStruct?.() ?? "{}"};`)
+            const dstCorr = g.correspondences?.get(dst)
+            if(dstCorr?.outcome === "matched") injectLocalOnlyDefaults(dstCorr, `v${dst}`, g, b)
         }
     }
     else
@@ -299,7 +482,7 @@ function emitEnter(dst: number, src: number, ref: number, g: GenCtx, b: LineBuil
         // Eager: encode already holds src's full value; pull the field
         // out right now, since a later statement (load_val, or tag for a
         // hoisted union field) reads v${dst} immediately.
-        const access = accessorFor(srcNode, g)
+        const access = localAccessorFor(src, g)
         if(access.kind !== "struct") throw new Error(`codec-codegen: ENTER's parent (slot ${src}) isn't struct-kind`)
         b.line(`v${dst} = ${access.readField(`v${src}`, name)};`)
     }
@@ -312,17 +495,27 @@ function emitEnterNext(dst: number, src: number, g: GenCtx, b: LineBuilder): voi
     g.writeBacks.set(dst, {into: "append", parentSlot: src})
     g.slotTypes.set(dst, edge.target)
 
+    // A list's own element edge is always "matched" once its own kind
+    // check passes (`reconcile.ts`'s own doc comment) — only what's
+    // *nested inside* an element can diverge, handled at that nested
+    // position's own ENTER/CALL_CODEC site, never here. So this is a
+    // plain propagation, never a `resolve()` call.
+    const srcCorr = g.correspondences?.get(src)
+    if(srcCorr) g.correspondences!.set(dst, correspondenceElement(srcCorr))
+
     if(g.direction === "decode")
     {
         if(kindOf(edge.target.type) === SemanticTypeKinds.Struct)
         {
-            const access = expectAccessor(accessorFor(edge.target, g), "struct", edge.target)
+            const access = expectAccessor(localAccessorFor(dst, g), "struct", edge.target)
             b.line(`v${dst} = ${access.beginStruct?.() ?? "{}"};`)
+            const dstCorr = g.correspondences?.get(dst)
+            if(dstCorr?.outcome === "matched") injectLocalOnlyDefaults(dstCorr, `v${dst}`, g, b)
         }
     }
     else
     {
-        const access = accessorFor(srcNode, g)
+        const access = localAccessorFor(src, g)
         if(access.kind !== "list") throw new Error(`codec-codegen: ENTER_NEXT's parent (slot ${src}) isn't list-kind`)
         const idx = idxCounter(src, g, b)
         b.line(`v${dst} = ${access.elementAt(`v${src}`, `${idx}++`)};`)
@@ -334,7 +527,7 @@ function emitStoreVal(src: number, arg0: Expr<CodecExtInstr>, g: GenCtx, b: Line
     const node = requireSlotNode(g.slotTypes, src, "STORE_VAL")
     const raw = translateExpr(arg0, g)
     const value = kindOf(node.type) === SemanticTypeKinds.Integer
-        ? expectAccessor(accessorFor(node, g), "integer", node).fromWire(raw, intWireSize(node.type as {min: number, max: number}), (node.type as {min: number}).min < 0)
+        ? expectAccessor(localAccessorFor(src, g), "integer", node).fromWire(raw, intWireSize(node.type as {min: number, max: number}), (node.type as {min: number}).min < 0)
         : raw
     emitWriteBack(src, value, g, b)
 }
@@ -342,7 +535,7 @@ function emitStoreVal(src: number, arg0: Expr<CodecExtInstr>, g: GenCtx, b: Line
 function emitOpenList(src: number, g: GenCtx, b: LineBuilder): void
 {
     const node = requireSlotNode(g.slotTypes, src, "OPEN_LIST")
-    const access = expectAccessor(accessorFor(node, g), "list", node)
+    const access = expectAccessor(localAccessorFor(src, g), "list", node)
     b.line(`v${src} = ${access.beginList?.() ?? "[]"};`)
 }
 
@@ -371,13 +564,64 @@ function emitCallCodec(calleeIndex: number, src: number, ref: number | undefined
     const srcNode = requireSlotNode(g.slotTypes, src, isNext ? "CALL_CODEC_NEXT" : "CALL_CODEC")
     const edge = isNext ? requireEdge(srcNode, 0, "CALL_CODEC_NEXT") : requireEdge(srcNode, ref, "CALL_CODEC")
     const srcKind = kindOf(srcNode.type)
-    const access = accessorFor(srcNode, g)
+    const access = localAccessorFor(src, g)
+
+    // Bridging (docs/codec-image.md §2/§3). `ref`-based navigation always
+    // addresses a real image edge, so the only outcomes actually reachable
+    // here are: "bridge" (either kind); a struct's own image-only/decode
+    // ("drop") or image-only/encode ("default", from the image); a
+    // union's own image-only/decode ("default", from local, or "trap" with
+    // no local default). A union's local-only variant is caught earlier,
+    // at TAG's own `tagOf` call (`translateExt`) — it never has an image
+    // edge to reach this function through at all. "unreachable" (a real
+    // union/image-only/encode dispatch case, or a defensive fallback) is
+    // structurally dead at runtime but the bytecode still contains the
+    // instruction, so it still has to compile to *something* — a runtime
+    // throw, same as an explicit "trap", never a codegen-time error.
+    const parentCorr = g.correspondences?.get(src)
+    let childCorr: Correspondence | undefined
+    let resolution: Resolution | undefined
+    if(parentCorr)
+    {
+        if(isNext) childCorr = correspondenceElement(parentCorr)
+        else
+        {
+            const name = srcKind === SemanticTypeKinds.Union ? (edge.step as {variant: string}).variant : (edge.step as {field: string}).field
+            const childEdge = correspondenceChild(parentCorr, name)
+            childCorr = childEdge.correspondence
+            resolution = resolve(parentCorr, childEdge, g.direction)
+        }
+    }
+
+    if(resolution?.action === "trap" || resolution?.action === "unreachable")
+    {
+        const reason = resolution.action === "trap" ? resolution.reason : "structurally unreachable (docs/codec-image.md §2.4)"
+        b.line(`throw new CodecTrap(-1, ${JSON.stringify(reason)});`)
+        return
+    }
 
     if(g.direction === "decode")
     {
+        if(resolution?.action === "default")
+        {
+            // Union image-only variant, local declares a default (§3.2):
+            // still call the callee to correctly consume its own wire
+            // bytes (the bytecode already knows this variant's shape),
+            // but materialize the local default instead of the real,
+            // locally-unrecognized payload.
+            b.line(`${g.direction}_proc${calleeIndex}(ctx);`)
+            const localUnion = parentCorr!.localNode!.type as {defaultVariant?: string}
+            emitWriteBack(src, expectAccessor(access, "union", srcNode).finishUnion(localUnion.defaultVariant!, undefined), g, b)
+            return
+        }
+
         const result = `${g.direction}_proc${calleeIndex}(ctx)`
         const temp = `__tmp${g.tempCounter.n++}`
         b.line(`const ${temp} = ${result};`)
+
+        // Struct image-only field (§3.2): consumed above for wire-cursor
+        // correctness, never written back anywhere real.
+        if(resolution?.action === "drop") return
 
         if(srcKind === SemanticTypeKinds.Union)
         {
@@ -400,7 +644,16 @@ function emitCallCodec(calleeIndex: number, src: number, ref: number | undefined
     else
     {
         let argExpr: string
-        if(srcKind === SemanticTypeKinds.Union)
+        if(resolution?.action === "default")
+        {
+            // Struct image-only field, encode (§3.3): the wire still
+            // needs real bytes at this position — substitute the field's
+            // own declared default, read from the image (the only place
+            // a value for a field the local model doesn't have at all
+            // could come from), instead of ever reading local storage.
+            argExpr = emitDefaultValue(childCorr!.imageNode!, n => scratchAccessorFor(concreteKindOf(n.type)), g, b)
+        }
+        else if(srcKind === SemanticTypeKinds.Union)
         {
             if(access.kind !== "union") throw new Error(`codec-codegen: CALL_CODEC's union-kind src (slot ${src}) has a non-union accessor`)
             argExpr = access.activeVariantPayload(`v${src}`, (edge.step as {variant: string}).variant)
@@ -457,11 +710,12 @@ export function emitExtStmtIfApplicable(e: Extract<Expr<CodecExtInstr>, {kind: E
  *  exactly as they always have, so this is a bare `return;`, matching
  *  what a raised RETURN's own value already had evaluated for whatever
  *  side effect it might still carry (the caller already emitted that). */
-export function emitReturn(entryNode: TypeNode, g: GenCtx, b: LineBuilder): void
+export function emitReturn(g: GenCtx, b: LineBuilder): void
 {
     if(g.direction === "encode") { b.line("return;"); return }
 
-    const access = accessorFor(entryNode, g)
+    // Slot 0 always — a procedure's own entry point.
+    const access = localAccessorFor(0, g)
     if(access.kind === "struct") b.line(`return ${access.finishStruct("v0")};`)
     else if(access.kind === "list") b.line(`return ${access.finishList("v0")};`)
     else if(access.kind === "unit") b.line(`return ${access.unitValue()};`)

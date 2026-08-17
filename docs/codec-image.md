@@ -136,10 +136,10 @@ this walk rather than requiring the two trees to be isomorphic.
 
 ### 2.4 Implementation shape
 
-`packages/codecs/src/engine/reconcile.ts` — target-independent, like
-`raise.ts` is in `@ppl/machine`: it computes a mapping a target codegen
-consumes, but knows nothing about any target language itself. Two
-functions, deliberately kept separate:
+`packages/core/src/reconcile.ts` — target- *and* codec-independent, like
+`raise.ts` is target-independent in `@ppl/machine`: it computes a mapping
+a target codegen consumes, but knows nothing about any target language,
+wire byte, or opcode. Two functions, deliberately kept separate:
 
 ```ts
 export function reconcile(imageRoot: TypeNode, localRoot: TypeNode): Correspondence

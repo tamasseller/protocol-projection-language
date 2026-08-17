@@ -51,6 +51,7 @@ import type { RtlProgram, RtlInstr } from "@ppl/machine"
 import { isExtInstr } from "@ppl/machine"
 import type { SemanticType, TypeNode } from "@ppl/core"
 import { buildTypeGraph, SemanticTypeKinds } from "@ppl/core"
+import type { Correspondence, CorrespondenceEdge } from "@ppl/core"
 import type { CodecExtInstr } from "./codec-ext-instr"
 
 /** A struct field's/union variant's child edge, navigated the same way
@@ -195,4 +196,127 @@ export function resolveProcedureTypes(program: RtlProgram<CodecExtInstr>, rootTy
 
     visit(0, graph.root)
     return types
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Correspondence-aware navigation — for a target codegen bridging a
+// received codec image to a local schema (docs/codec-image.md §2/§3,
+// `reconcile.ts`). Mirrors everything above exactly, one level up: where
+// `childNode`/`nextNode`/`resolveHandleTypes` navigate a single `TypeNode`
+// tree, these navigate a `Correspondence` tree instead — same shape, same
+// reason for being exported here rather than left private to a single
+// caller (this file's own header: "a JS codegen needs this exact
+// bookkeeping too").
+// ─────────────────────────────────────────────────────────────────────────
+
+/** A struct field's/union variant's own `CorrespondenceEdge`, navigated by
+ *  *name* — mirrors {@link childNode}'s by-`ref` navigation into the image
+ *  tree, but into `parent.children` instead. Every name on either side has
+ *  an entry (`reconcile.ts`'s own doc comment on `Correspondence.children`),
+ *  so this never misses one for a genuinely `"matched"` `parent` — the same
+ *  precondition `resolve()` itself has. */
+export function correspondenceChild(parent: Correspondence, name: string): CorrespondenceEdge
+{
+    const edge = parent.children?.find(e => e.name === name)
+    if(!edge) throw new Error(`correspondenceChild: no edge named "${name}" on this Correspondence`)
+    return edge
+}
+
+/** A list's one element `Correspondence` — mirrors {@link nextNode}. Always
+ *  present on a `"matched"`, list-kind `Correspondence` (`reconcile.ts`'s
+ *  own doc comment: a list's element edge is always `"matched"` itself,
+ *  even when what's nested inside it diverges). */
+export function correspondenceElement(parent: Correspondence): Correspondence
+{
+    if(!parent.element) throw new Error(`correspondenceElement: no element Correspondence on this Correspondence`)
+    return parent.element
+}
+
+/** Recovers the field/variant *name* a `ref` operand addresses, off the
+ *  image side of `srcCorrespondence` — the bytecode's own `ref` operands
+ *  stay positional into the *image* tree regardless of reconciliation
+ *  (docs/codec-image.md §2.1), so this is the one place that positional
+ *  index has to be translated into the name {@link correspondenceChild}
+ *  actually looks up by. */
+function nameOfRef(srcCorrespondence: Correspondence, ref: number, opName: string): string
+{
+    const srcImage = srcCorrespondence.imageNode
+    if(!srcImage) throw new Error(`resolveHandleCorrespondences: ${opName} references a correspondence with no image node`)
+    if(srcImage.type.kind !== SemanticTypeKinds.Struct && srcImage.type.kind !== SemanticTypeKinds.Union)
+        throw new Error(`resolveHandleCorrespondences: ${opName} on a ${srcImage.type.kind} type isn't supported`)
+    const edge = srcImage.edges[ref]
+    if(!edge) throw new Error(`resolveHandleCorrespondences: no edge #${ref} on this ${srcImage.type.kind} (${srcImage.edges.length} edge(s))`)
+    const step = edge.step as { field: string } | { variant: string }
+    return "field" in step ? step.field : step.variant
+}
+
+/**
+ * Mirrors {@link resolveHandleTypes} exactly — same four-opcode,
+ * left-to-right, slot-reuse-safe scan — but threads a `Correspondence`
+ * alongside each handle slot's own image `TypeNode`, for a target codegen
+ * bridging a received codec image to a local schema. Purely navigational:
+ * direction-agnostic, matching `reconcile()`'s own nature — a caller
+ * decides `bridge`/`drop`/`default`/`trap` itself, per instruction, by
+ * calling `resolve()` on whatever this returns; this function never calls
+ * `resolve()` itself.
+ *
+ * `onCall`'s `childCorrespondence` may be `"image-only"` — nothing has gone
+ * wrong; a codegen that wants to keep navigating a dropped subtree (e.g. to
+ * correctly consume its own wire bytes even though the result gets
+ * dropped) still needs its own `Correspondence` to do so, same as
+ * {@link resolveHandleTypes}'s own `onCall` is invoked regardless of
+ * whether the caller ends up using the callee's result.
+ */
+export function resolveHandleCorrespondences(
+    body: readonly RtlInstr<CodecExtInstr>[],
+    entryCorrespondence: Correspondence,
+    onCall?: (calleeIndex: number, childCorrespondence: Correspondence) => void,
+): Map<number, Correspondence>
+{
+    const slotCorrespondences = new Map<number, Correspondence>([[0, entryCorrespondence]])
+
+    function requireSlot(slot: number, opName: string): Correspondence
+    {
+        const c = slotCorrespondences.get(slot)
+        if(!c)
+            throw new Error(`resolveHandleCorrespondences: ${opName} references frame slot ${slot} with no known correspondence (ENTER-before-use?)`)
+        return c
+    }
+
+    for(const instr of body)
+    {
+        if(!isExtInstr(instr)) continue
+
+        switch(instr.ext)
+        {
+            case "ENTER":
+            {
+                const {dst, src, ref} = instr
+                const srcC = requireSlot(src, "ENTER")
+                slotCorrespondences.set(dst, correspondenceChild(srcC, nameOfRef(srcC, ref, "ENTER")).correspondence)
+                break
+            }
+            case "ENTER_NEXT":
+            {
+                const {dst, src} = instr
+                slotCorrespondences.set(dst, correspondenceElement(requireSlot(src, "ENTER_NEXT")))
+                break
+            }
+            case "CALL_CODEC":
+            {
+                const {calleeIndex, src, ref} = instr
+                const srcC = requireSlot(src, "CALL_CODEC")
+                onCall?.(calleeIndex, correspondenceChild(srcC, nameOfRef(srcC, ref, "CALL_CODEC")).correspondence)
+                break
+            }
+            case "CALL_CODEC_NEXT":
+            {
+                const {calleeIndex, src} = instr
+                onCall?.(calleeIndex, correspondenceElement(requireSlot(src, "CALL_CODEC_NEXT")))
+                break
+            }
+        }
+    }
+
+    return slotCorrespondences
 }

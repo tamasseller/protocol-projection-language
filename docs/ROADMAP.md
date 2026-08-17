@@ -458,9 +458,12 @@ independent of a codegen consuming it." Revisited: that's true of its
 `raise.ts` has to a target's own emitter. It's target-independent (pure
 spec: kind checks, name-matching, the four relaxation rules), so it lives
 here, next to `type-tree-wire.ts`/`codec-image.ts`, not deferred into item
-12.
+12. (Since moved one layer further still, into `@ppl/core` itself, once
+neither function turned out to touch anything beyond `TypeNode`/
+`defaultValueOf` — `packages/codecs/engine/codec-extension.ts` re-exports
+its `Direction` type for existing consumers.)
 
-`packages/codecs/src/engine/reconcile.ts` — `reconcile(imageRoot,
+`packages/core/src/reconcile.ts` — `reconcile(imageRoot,
 localRoot): Correspondence`, a lock-step walk of two ordinary `TypeNode`
 graphs (the decoded image tree's own graph, and the consumer's local one)
 producing a bidirectional `"matched"`/`"image-only"`/`"local-only"` tree;
@@ -580,10 +583,9 @@ codec-image.md §2/§3 — the name-keyed reconciliation algorithm and its
 four relaxation rules — since that's precisely what turns "here's an
 image" into "here's the native accessor code bridging it to my own
 schema." That algorithm is now implemented (item 11's
-`packages/codecs/src/engine/reconcile.ts`, target-independent — see item
-11's own writeup) — what's still this item's own job is a real codegen
-actually *calling* `reconcile()`/`resolve()` and turning the result into
-native accessor code for a specific target.
+`packages/core/src/reconcile.ts`, target- and codec-independent — see item
+11's own writeup) — target-js's own codegen now does exactly that, see
+below.
 
 ### `raise.ts` shakedown — verified, two bugs found and fixed
 
@@ -701,6 +703,62 @@ Both bugs from item 12's own writeup plus these three now bring `raise.ts`
 to five found-by-actually-using-it fixes total — each one a real gap no
 amount of re-reading the code surfaced, only exercising it against real
 programs did.
+
+### Codec-image reconciliation, consumed — implemented
+
+`engine/bridging-codec-module.ts`'s `generateBridgingCodecModule` is the
+first consumer anywhere in the repo of item 11's `reconcile()`/`resolve()`.
+Parallels `codec-module.ts` almost exactly, `TypeNode` swapped for
+`Correspondence`: a new `@ppl/codecs` primitive,
+`resolveHandleCorrespondences`/`correspondenceChild`/`correspondenceElement`
+(`procedure-types.ts`, same four-opcode scan as `resolveHandleTypes`, paired
+with a `Correspondence` instead of a bare `TypeNode`) recovers each
+procedure's own boundary `Correspondence`; `generateProcedures` then roots
+the projected TS types at the *local* schema, not the image's.
+
+`codec-codegen-ext.ts`'s `GenCtx` gained an additive-only
+`correspondences?: Map<number, Correspondence>` — absent (every existing,
+non-bridging call site) ⇒ today's exact behavior, verified by running the
+full pre-existing suite unchanged before adding any `resolve()`-branching.
+Every join point (`emitEnter`/`emitEnterNext`/`emitCallCodec`) resolves its
+own edge and branches on the outcome: `"bridge"` is today's path (Accessor
+calls now routed through `localAccessorFor`, which falls back to a trivial
+`scratchAccessorFor` when a slot has no local counterpart at all — an
+image-only procedure boundary never gets a real projected TS type);
+`"drop"` suppresses the writeback but still runs the wire read/call
+(cursor correctness); `"default"` synthesizes a real, representation-
+faithful value via a new `emitDefaultValue`, which walks the *type*
+structure through the real Accessor's own `beginStruct`/`setField`/
+`finishStruct` protocol rather than literal-izing `resolve()`'s pre-
+flattened plain-JS value (wrong for any non-trivial Accessor, e.g. bigint
+or class rules); `"trap"`/`"unreachable"` both throw `CodecTrap` at
+runtime, never at codegen time — a real, dead union switch-case
+(image-only variant on encode) still has to compile to *something*, since
+the bytecode instruction genuinely exists even though the local value can
+never select it.
+
+Two real bugs found while building this: "unreachable" initially threw at
+codegen time, which broke compilation outright for any bridging schema
+with a divergent union — fixed to a runtime throw, merged with `"trap"`'s
+own code path. And `emitDefaultValue`'s struct-temp declaration (`let
+__defN = {}`) inferred the empty-object type, not `any` — only caught by
+the package's real `ts-node`-driven `npm run test`, not a bare `tsx --test`
+run — fixed with an explicit `: any` annotation, matching
+`generateProcedure`'s own `v0` convention.
+
+`tagOf` (`codec-runtime.ts`) already threw on an unrecognized variant name
+before any of this — turns out to implement the union/local-only/encode
+trap (§3.4) for free, once `TAG`'s own codegen splits `activeVariantName`
+(read via the local accessor) from the comparison list (kept image-side,
+§2.2). Now throws `CodecTrap` there too, instead of a plain `Error`, for
+consistency with every other bridging trap join point.
+
+Tests: `packages/codecs/test/procedure-types.test.ts`'s
+`resolveHandleCorrespondences`/`correspondenceChild`/`correspondenceElement`
+suite; `packages/target-js/test/bridging-codec.runtime.test.ts` — real
+image/local schema pairs compiled and *executed*, checked cell by cell
+against docs/codec-image.md §3's own resolution table (plus a byte-
+identical-to-non-bridging regression test with nothing to bridge).
 
 ## 13. Futher ideas
 

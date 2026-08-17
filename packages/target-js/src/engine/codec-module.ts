@@ -100,7 +100,13 @@ export interface CodecModuleOptions
     readonly rules?: readonly TsRule[]
 }
 
-const RUNTIME_IMPORTS = [
+/** Exported for `bridging-codec-module.ts`'s own `generateBridgingCodecModule`
+ *  — the same fixed, unconditionally-imported runtime-helper list, since a
+ *  bridged module's generated procedures call into exactly the same
+ *  `codec-runtime.ts` surface an ordinary one does (see this file's own
+ *  header for why an unused import is harmless: no `noUnusedLocals`
+ *  anywhere in this repo's tsconfigs). */
+export const RUNTIME_IMPORTS = [
     "read", "write", "hasNext", "cloneRd", "cloneWr", "seek", "writeSeq", "readSeq", "readSeqView", "writeSeqRaw",
     "tagOf", "signExtend", "revBits", "CodecTrap",
 ] as const

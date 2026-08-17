@@ -13,13 +13,16 @@
  * variant; encode only navigates one) and by `i0`'s own initial stream
  * capability (§2.1: read-only for a decoder, write-only for an encoder) —
  * every other opcode's behavior follows from which handle/iterator it's
- * pointed at.
+ * pointed at. `Direction` itself is `@ppl/core`'s own type now (it's just
+ * as meaningful to `reconcile()`'s `resolve()` as it is here, and touches
+ * nothing codec-specific) — re-exported below for every existing consumer
+ * that still reaches it through this file.
  */
 
 import type { Extension, ExecState, ExtOpEffect } from "@ppl/machine"
 import type { Rule } from "@ppl/machine"
 import { rule, leafNode, unaryNode, pBuiltinCall, pConst, pIdentifier, pRtl } from "@ppl/machine"
-import type { IntegerType, TypeNode } from "@ppl/core"
+import type { IntegerType, TypeNode, Direction } from "@ppl/core"
 import { kindOf, SemanticTypeKinds } from "@ppl/core"
 import type { CodecOpcode } from "./opcodes"
 import { assertNever } from "./opcodes"
@@ -31,7 +34,7 @@ import {
     callCodecInstr, callCodecNextInstr, writeSeqInstr, readSeqInstr,
 } from "./codec-ext-instr"
 
-export type Direction = "encode" | "decode"
+export type { Direction }
 
 /** Smallest byte width that fits an integer type's declared range — the
  *  source of truth for both `../components/binary-rules.ts` (which byte

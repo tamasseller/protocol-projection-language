@@ -127,16 +127,24 @@ Physical register for frame-relative index `k` (isa-core.md's own `rN`,
 or TOS depth relative to the current frame base):
 
 ```
-in_window(k)  ⟺  tos − k < 4
-phys(k)       =  r4 + (k mod 4)          when in_window(k)
+in_window(k)  ⟺  tos − k ≤ 4
+phys(k)       =  r7 − (k mod 4)          when in_window(k)
               =  spilled to SP stack     otherwise
 ```
 
-This is a pure function of `k` and current `tos` — **not** of push/pop
-history along whichever control-flow path reached this point. That's the
-property that makes it context-free: two `BR_TABLE` cases (or a `LOOP`
-back-edge) that reconverge at the same `tos` always agree on `phys(k)` for
-every live `k`, with no cross-path reconciliation needed.
+`phys`'s cyclic direction is descending, not the ascending `r4 + (k mod
+4)` this section originally guessed — chosen, once actually building the
+`CALL` shuffle (§6), to make historical spill-stack reloads batchable at
+all: it's what makes a real, already-emitted sequence of individual
+chronological spills exactly equivalent to one hypothetical batched
+`PUSH`, so a batched `POP` can read it back later (`jit-armv6m/prototype`'s
+`window.ts`, own header comment, has the full argument). Direction aside,
+the property that matters here is unchanged: `phys(k)` is a pure function
+of `k` and current `tos` — **not** of push/pop history along whichever
+control-flow path reached this point. That's what makes it context-free:
+two `BR_TABLE` cases (or a `LOOP` back-edge) that reconverge at the same
+`tos` always agree on `phys(k)` for every live `k`, with no cross-path
+reconciliation needed.
 
 **Spill/fill.** Pushing slot `k+4` evicts slot `k`'s current value from its
 register to the spill stack — a real, `sp`-decrementing single-register
@@ -147,6 +155,22 @@ overwritten. Popping back down unconditionally reloads it (a real
 recovered ... to keep the translator simple" per the brief. Correct but
 leaves cheap dead-reload elimination on the table; deliberate trade, not
 an oversight.
+
+**`LOAD`/`STORE` (and register-mode arithmetic operands) work the same way
+across the window boundary, not just `PUSH`/`POP`.** A slot that's fallen
+out of window — any local that survives past `WINDOW_SIZE` more pushes,
+`CALL` args among them (§6) — is still a completely ordinary reference;
+`LOAD`/`STORE`/a `REG_ACC`/`REG_REG` operand just resolve to the spill
+stack (`spillOffset`, below) instead of a register, one `LDR`/`STR`
+against `sp` instead of zero. Not a separate mechanism from the
+window's own spill/fill — the same "most recently spilled closest to
+`sp`" addressing, just read directly instead of via a `PUSH`/`POP` pair.
+Prototyped in `jit-armv6m/prototype` (`window.ts`'s `spillOffset`,
+`translateProc.ts`'s `LOAD`/`STORE`/arithmetic-operand cases) once it
+became clear `CALL`'s own `stackArgs ≥ WINDOW_SIZE` case needed exactly
+this (§6) — genuinely general, not `CALL`-specific: any procedure with
+more than `WINDOW_SIZE` concurrently-live locals hits it, no `CALL`
+involved at all.
 
 **Block-exit truncation is not free.** isa-core.md §8.1: at `BLOCK_END`/
 `RETURN`, TOS surplus above the enclosing entry depth is *implicitly
@@ -287,6 +311,42 @@ found only once a real, multi-procedure `CALL` existed to expose them:
   land strictly below whatever the caller had already pushed, purely
   because `sp` only ever moves further down under it, never sideways.
 
+**`stackArgs ≥ WINDOW_SIZE` — resolved, and it turned out to be almost
+free.** The shuffle above was originally described (and implemented) only
+for `stackArgs ≤ WINDOW_SIZE` — a callee with more stack-passed arguments
+than the window holds needs some of its own arguments addressable from
+its very first instruction despite starting below the window, which needs
+§5's spill-stack addressing to work for `LOAD`/`STORE` generally, not just
+`PUSH`/`POP` at the window boundary (§5's own text now describes this).
+Once that existed, `spillForCall`/`reloadAfterCall` needed no logic
+changes at all — the "natural chronological ordering" invariant they
+already rely on happens to produce exactly the right memory layout for a
+callee's deep arguments for free. Two real bugs surfaced only by actually
+building the concrete case (`jit-armv6m/prototype/test/deep-args.test.ts`,
+real QEMU), both latent and unexercised by any prior test:
+
+- `fillCalleeArgs` had an off-by-one — `stackArgs === WINDOW_SIZE` exactly
+  already silently dropped argument 0 (`physReg(0)` and the callee's own
+  acc-delivered last argument land on the *same* physical register,
+  `physReg` being periodic mod `WINDOW_SIZE` — the callee's prologue write
+  clobbers what `fillCalleeArgs` just placed there). Fixed by capping at
+  `WINDOW_SIZE - 1`.
+- Once genuinely deep arguments exist, `fillCalleeArgs`'s own naive single
+  batched `POP` stopped being valid — the args needing register delivery
+  no longer start at phase 0, so the range can wrap `physReg`'s cyclic
+  boundary, and a combined pop across that wrap silently reassigns which
+  value lands in which register. Needed the same "at most two batched
+  `POP`s, larger-`k`-first" mechanism (`popRuns`) `restoreWindow`/
+  `reloadAfterCall` already use for historical spilled data.
+- `reloadAfterCall` assumed everything below the caller's own
+  currently-resident window was unrelated leftover data the caller still
+  needs post-call — true whenever `stackArgs ≤` that window (every test
+  before this one), but not once `stackArgs` exceeds it: some of what's
+  "deeper" was itself consumed as an argument, not surviving caller state,
+  and reloading it anyway reads memory the callee's own epilogue had
+  already reclaimed. Fixed by capping the historical-reload range at
+  `targetTos`, not just the window's own bottom.
+
 **Callee-side prologue.** The shuffle above is the *caller's* job. The
 callee has its own, smaller obligation: isa-core.md §4.6's last argument
 arrives in `acc`, not at its frame-relative home register `phys(argidx)`
@@ -378,9 +438,39 @@ per-opcode-class notes:
   window, unconditional refill per §5).
 - **`BR_TABLE`** — no `TBB`/`TBH` on ARMv6-M (Thumb-2 only). `N ≤ 2` (the
   overwhelming common case — `if`/`if-else`, isa-core.md §7.1) compiles to a
-  plain `CMP` + conditional branch, no table at all. Larger `N` needs an
-  actual literal-pool jump table plus computed `BX` (load target into a
-  register, branch to it — ARMv6-M has no memory-indirect branch).
+  plain `CMP` + conditional branch, no table at all. `N > 2` — prototyped,
+  `jit-armv6m/prototype`'s `blocks.ts` (`openBrTableJump`/
+  `emitBrTableHelper`), real QEMU (`test/br-table.test.ts`) — needs an
+  actual literal-pool jump table plus computed `BX`, but not a per-call-site
+  one: a single small dispatch routine, shared by every `BR_TABLE N>2` site
+  in the same procedure, reached by `BL` with the call site's own table
+  addressed relative to `lr` (the same "shared reserved routine" pattern
+  §11 uses for `RETURN`/`CLZ`/`REVBITS`, here validated for computed jumps
+  too). Table entries are clamped to `N` (one slot *past* the last real
+  case), not `N - 1` — isa-core.md's own `acc ≥ N` behavior is "no case
+  body runs at all, `acc` left untouched," not "re-run the last case,"
+  which is what a naive `N`-entry clamp would silently do instead; the
+  register holding the clamped index is deliberately never `acc` itself,
+  so it survives the dispatch unmodified on both the in-range and
+  out-of-range path. **A genuinely non-obvious ARMv6-M trap, caught only
+  by tracing a real QEMU hang down to a live instruction trace:** `BL`
+  always sets `lr` with bit 0 forced to 1 (the Thumb-mode marker a later
+  `BX`/`POP{PC}` needs) — harmless for a branch target, since hardware
+  strips it there, but reading `lr` into a general register for ordinary
+  address arithmetic (this dispatch routine's whole mechanism) carries
+  that bit straight into the computation. Left in place, it makes the
+  *table lookup* address odd — `LDRH` needs an aligned address, and a
+  Cortex-M0 with no real fault handler installed just hangs, not errors.
+  Cleared for the lookup and *not* restored before the final `BX`, it makes
+  the *jump target* even — `BX` reads bit 0 as an ARM/Thumb mode switch,
+  not part of the address, so clearing it there flips the CPU into ARM
+  mode and it starts decoding the same Thumb bytes as ARM instructions.
+  Both failure modes look identical from the outside (a silent hang, no
+  fault message) and only diverge once actually traced. Any future
+  mechanism that reads `lr`/`pc` into a register for address math — §7's
+  `dispatch_return`, §9's dispatch-table trampolines, anything computed
+  relative to a return address rather than a literal pool — needs the same
+  clear-for-arithmetic, restore-for-branching discipline.
 - **`CLZ`/`REVBITS`** — no ARMv6-M instruction for either (`CLZ` is
   ARMv5T+Thumb-2; `RBIT` is ARMv7-M+). Both compile to a `BL` into a fixed
   software helper routine, not inline code. Real cost, but not a
@@ -517,21 +607,30 @@ sound with no lookahead beyond the one-token fold/flush decision above:
 - A second consecutive `STORE`/`PUSH` reading the same `acc` value just
   works, unmodified, since `CLEAN`'s `reg` already points at the value —
   no special-casing needed.
-- The only remaining danger: §5's window rotation evicting the *specific*
-  physical register a fused result now lives in, before a new producer
-  ever supersedes it — only reachable if enough consecutive `PUSH`es land
-  inside the same acc-reading run to rotate that exact slot out (§5's
-  4-deep window). Cheap, mechanical, rare-to-trigger fallback bolted onto
-  rotation logic §5 already runs: emit one `MOVS r0, reg` first, then
-  proceed as if `CLEAN(r0)` had held all along.
+- **Looked like a remaining danger, resolved without needing a
+  fallback.** §5's window rotation evicting the *specific* physical
+  register a fused result now lives in, before a new producer ever
+  supersedes it, seemed to need a rescue instruction — but worked through
+  concretely (`jit-armv6m/prototype`'s `window.ts`, `test/rotation.test.ts`,
+  real QEMU; §16 item 6), it isn't reachable the way first assumed.
+  `accState` can only depend on the *exact* register a given `PUSH` is
+  about to evict by directly referencing that same slot in the first
+  place — nothing else currently maps to that register — which makes the
+  value about to be pushed and the value about to be evicted provably
+  identical: one `PUSH` away (a `LOAD`/destination-fold of the window's
+  oldest slot immediately followed by a `PUSH`), not "enough consecutive
+  `PUSH`es to rotate a slot out." The ordinary spill-then-flush a `PUSH`
+  already emits handles it for free — the flush's destination and the
+  dependency's register are the same one (`physReg(evictedByPush) ===
+  physReg(tos)`, both reducing to the same `k mod WINDOW_SIZE`), so it's a
+  same-register self-move that `materializeShape` already elides. No
+  separate fallback, no extra instruction, nothing bolted onto rotation
+  logic.
 
 Not specific to this project's own `lower.ts` output either — it holds
 against any bytecode that honors the acc-clobbering convention discussed
 above (not yet statically enforced — §16 item 6), not just "well-behaved"
-DSL-generated programs specifically. In practice (this project's own
-generated code included), the fallback essentially never fires — real
-generated code doesn't chain four `PUSH`es between a stored value and its
-next use — but nothing here *requires* that to be true for soundness.
+DSL-generated programs specifically.
 
 **Callee-side prologue as a fold.** isa-core.md §4.6's last argument
 arrives in `acc`, not at its frame-relative home register `phys(argidx)`
@@ -567,14 +666,19 @@ this scheme — the obligation just persists across the same
 `STORE`/`PUSH`-shaped run already bounded above, rather than resolving
 within a single step.
 
-**Pass 2 — fixup.** Two independent jobs, not one:
+**Pass 2 — fixup.** Down to one job, not two, once actually built:
 - *Branch range.* Thumb conditional branches are ±252 bytes (8-bit signed
   imm×2); a procedure whose basic blocks span further needs the standard
   invert-and-long-branch idiom any Thumb-1 assembler already uses. This is
   the same reason a fixup pass is needed at all, not just for
-  procedure-external targets.
-- *Jump tables.* Materializes the `BR_TABLE N>2` literal-pool tables once
-  every case's final address is known.
+  procedure-external targets — still unprototyped.
+- *Jump tables* — turned out **not** to need one. `BR_TABLE N>2`'s own
+  table entries resolve exactly the same way ordinary branch targets
+  already do (blocks.ts's header): each slot is a deferred fixup, patched
+  the moment the corresponding case's `BLOCK_END` is reached in the single
+  forward pass, never needing to have seen anything past that point. No
+  case's final address needs to be known any earlier than an ordinary
+  branch target already requires — see §10's own `BR_TABLE` entry above.
 
 ---
 
@@ -736,7 +840,7 @@ destination-folding joins in, and 10 (20 bytes) with the full §10.1 scheme
 byte size, not just "the good end of" some expansion range. Caveat: this
 example has no `CALL` and never crosses the 4-register window boundary, so
 it doesn't exercise §6's shuffle, §5's spill/fill, or §10.1's
-rotation-eviction fallback at all — see §16.
+rotation-eviction case at all — see §16.
 
 Translation throughput itself (JIT compiling the JIT, so to speak) should
 land in the few-hundred-native-instructions-per-bytecode-instruction range
@@ -938,8 +1042,9 @@ binary-op ceiling bounds this cleanly.
 **Not exercised by this example** (§16 item 5): no `CALL`, so no instance
 of §6's shuffle; `tos` never moves past 1, so no instance of §5's
 spill/fill across the 4-register boundary, and so no instance of §10.1's
-rotation-eviction fallback either. A second worked example covering all
-three is the next thing worth hand-translating.
+rotation-eviction case either. `jit-armv6m/prototype/test/call.test.ts` and
+`test/rotation.test.ts` since covered all three, on real hardware rather
+than by hand-translation — see §16 items 5/6.
 
 ---
 
@@ -981,7 +1086,9 @@ three is the next thing worth hand-translating.
    the case this item's own worry is actually about: a phase-misaligned
    shuffle (args landing at a non-zero window phase) with non-argument
    locals resident in the same 4-register window that must survive the
-   call untouched.
+   call untouched. Extended since to `stackArgs ≥ WINDOW_SIZE` too — see
+   §6's own "resolved, and it turned out to be almost free" note and
+   `test/deep-args.test.ts`.
 2. **`validateProgram` max-call-depth** — not yet exposed (§2); needed to
    size the return-address stack from real data instead of a guess.
 3. **Compaction vs. fixed helper calls** (§11) — per-call-site literal-pool
@@ -1002,16 +1109,15 @@ three is the next thing worth hand-translating.
    arguments, 2 stack-passed) with a deliberately phase-misaligned window
    and non-argument locals resident alongside the args, verified on real
    `qemu-system-arm` — and it's what let item 1's shuffle-bound question
-   actually get settled (see item 1). Still not covered by any prototype:
-   §8's pinning and §9's dispatch table/eviction (this prototype
-   deliberately has neither — see jit-armv6m/prototype's own scope notes,
-   `translateProc.ts`'s header), and §10.1's rotation-eviction fallback
-   specifically (the corpus so far, this `CALL` test included, has never
-   hit the "fused result's own register gets evicted by rotation before
-   its next read" case — it's still exactly as rare as §10.1 predicted).
-6. **§10.1's `CLEAN`/`PENDING` state machine is reasoned, not implemented
-   or tested** — the soundness argument rests on "every op either
-   overwrites `acc`, is a pure capture (`STORE`/`PUSH`), or is a
+   actually get settled (see item 1). `jit-armv6m/prototype/test/rotation.test.ts`
+   subsequently covered §10.1's rotation-eviction case too — see item 6.
+   Still not covered by any prototype: §8's pinning and §9's dispatch
+   table/eviction (this prototype deliberately has neither — see
+   jit-armv6m/prototype's own scope notes, `translateProc.ts`'s header).
+6. **§10.1's `CLEAN`/`PENDING` state machine is reasoned, and two of its
+   corners are now implemented and tested — the acc-liveness enforcement
+   half is still open.** The soundness argument rests on "every
+   op either overwrites `acc`, is a pure capture (`STORE`/`PUSH`), or is a
    write-back-in-place combo (`REG_REG`/`PEEK_PEEK`), which is declared
    (not physically forced) to clobber `acc` the same way." That declaration
    already exists and is already load-bearing elsewhere — rtl.ts's combo
@@ -1023,14 +1129,53 @@ three is the next thing worth hand-translating.
    doesn't poison `acc` after a `REG_REG`/`PEEK_PEEK` write the way
    raise.ts does — so a hand-crafted program that violates the convention
    would silently compute the bit-accurate-by-luck answer under `vm.ts`
-   rather than get caught. Worth closing before a real translator leans on
-   it: a `validate.ts` acc-liveness check (structurally similar to its
-   existing per-procedure walk) plus matching `vm.ts` poisoning, with test
-   cases for both. Separately, a dedicated small JIT test case (a producer
-   immediately followed by a `STORE`, then enough `PUSH`es to rotate the
-   aliased register out before the next real producer) is worth adding once
-   there's a translator to run it against. The consumer-class table (§10.1)
-   is also reasoned per-op by hand, not derived mechanically from
-   armv6.h's own encoder signatures — worth cross-checking the two once a
-   translator exists, since a transcription error there would silently
-   misclassify one op's foldability rather than fail loudly.
+   rather than get caught. Still worth closing before a real translator
+   leans on it: a `validate.ts` acc-liveness check (structurally similar to
+   its existing per-procedure walk) plus matching `vm.ts` poisoning, with
+   test cases for both.
+
+   The rotation-eviction corner *has* now been built and worked through
+   (`jit-armv6m/prototype`'s `window.ts`, `test/rotation.test.ts`, real
+   QEMU) — see §10.1's own updated account. It turned out not to need the
+   rescue instruction originally envisioned: the hazard is only reachable
+   one `PUSH` away from a direct reference to the window's oldest slot (a
+   `LOAD` or a destination-fold `STORE` of exactly that slot, immediately
+   followed by a `PUSH`), not "enough consecutive `PUSH`es to rotate a slot
+   out" as first framed here — and in that exact case the value being
+   pushed and the value being evicted are provably identical, so the
+   ordinary spill-then-flush already emitted handles it for free (a
+   same-register self-move, elided by `materializeShape`). Both fold shapes
+   that can reach it (`LOAD`'s operand-fold, a `STORE`'s destination-fold)
+   are covered by `test/rotation.test.ts`'s two cases.
+
+   A second, genuinely distinct gap in the same state machine surfaced
+   while building `BR_TABLE N>2` (§10, §16 item 1's own extension): a
+   `case` boundary (any `BR_TABLE`, `N ≤ 2` or `N > 2` alike) is a
+   control-flow *merge* point, but `accState` is one linear,
+   compile-time-sequential belief threaded through a single forward pass.
+   A value left `PENDING` at the end of one case — never itself read again
+   within that case, e.g. a bare `CONST` immediately followed by
+   `BLOCK_END`, as a `switch`-like construct that just returns a per-case
+   constant would produce — survived past that case's own close and got
+   silently overwritten by the *next* case's own translation, so whatever
+   the merged code read afterward ended up being the *last* case's value,
+   never whichever case actually ran. Unexercised by every prior test
+   (including `call.test.ts`/`rotation.test.ts`), since nothing in that
+   corpus ever left a value pending across a case boundary specifically.
+   Fixed by flushing `accState` unconditionally at every case boundary
+   (`blocks.ts`'s `closeBlockEnd`, `accstate.ts`'s new `flushLive` — a
+   no-op when already `CLEAN`, and safe to call when `POISONED` too,
+   unlike a bare `flush`) — cheap when nothing was actually left pending,
+   the real cost paid only in the exact case that needed it.
+   `LOOP`'s own back-edge is structurally the same kind of merge (initial
+   fall-through vs. the body's back-edge reconverging on one, shared,
+   already-emitted condition block) and wasn't audited for the identical
+   risk — every existing loop condition happens to start with a fresh
+   producer of its own, which sidesteps it by construction, but that's an
+   empirical property of the current corpus, not a guarantee.
+
+   The consumer-class table (§10.1) is also reasoned per-op by hand, not
+   derived mechanically from armv6.h's own encoder signatures — worth
+   cross-checking the two now that a translator exists, since a
+   transcription error there would silently misclassify one op's
+   foldability rather than fail loudly.

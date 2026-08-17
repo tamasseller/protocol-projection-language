@@ -83,13 +83,13 @@
 import type {Stmt, Expr, RaisedProc, BinaryOpcode, UnaryOpcode} from "@ppl/machine"
 import {ExprKind, StmtKind} from "@ppl/machine"
 import type {TypeNode} from "@ppl/core"
-import {kindOf, SemanticTypeKinds} from "@ppl/core"
-import type {Direction, CodecExtInstr} from "@ppl/codecs"
+import type {Direction, Correspondence} from "@ppl/core"
+import type {CodecExtInstr} from "@ppl/codecs"
 import type {TSTypeDecl} from "./resolver"
 import {LineBuilder} from "./line-builder"
 import {describeType} from "./codec-type-nav"
 import type {GenCtx} from "./codec-codegen-ext"
-import {prescan, translateExt, emitExtStmtIfApplicable, emitReturn, idxCounter, expectAccessor} from "./codec-codegen-ext"
+import {prescan, translateExt, emitExtStmtIfApplicable, emitReturn, idxCounter, localAccessorFor, injectLocalOnlyDefaults} from "./codec-codegen-ext"
 
 // ─────────────────────────────────────────────────────────────────────────
 // Binary/unary op rendering — inline JS text, not a runtime evalBinary/
@@ -206,7 +206,7 @@ function translateStmt(s: Stmt<CodecExtInstr>, entryNode: TypeNode | undefined, 
             // (that's entryNode's own accessor, via emitReturn).
             if(!(s.value.kind === ExprKind.Ext && emitExtStmtIfApplicable(s.value, g, b)))
                 b.line(`${translateExpr(s.value, g)};`)
-            emitReturn(entryNode, g, b)
+            emitReturn(g, b)
             return
 
         case StmtKind.Trap:
@@ -251,15 +251,30 @@ function translateStmts(stmts: readonly Stmt<CodecExtInstr>[], entryNode: TypeNo
  *  this once per procedure and stitches the results together.
  *  `projection` is the same `Map<number, TSTypeDecl>` `projectTSTypes`
  *  produced for the public declarations — this is what supplies every
- *  `Accessor` this module consults, keyed by `TypeNode.id`. */
+ *  `Accessor` this module consults, keyed by `TypeNode.id`.
+ *
+ *  `entryCorrespondence`, when given (docs/codec-image.md §2 — bridging a
+ *  received codec image to a local schema), is this procedure's own
+ *  boundary `Correspondence` — `entryNode` stays the *image* node
+ *  unconditionally either way (wire-format concerns, unaffected by
+ *  reconciliation), while `entryCorrespondence.localNode` (absent for a
+ *  procedure boundary reached entirely through image-only navigation) is
+ *  what actually governs this function's own declared parameter/return
+ *  type and its `v0` accumulator's real shape — `localAccessorFor(0, g)`
+ *  makes that same "local when present, else the trivial scratch shape"
+ *  decision every other join point in `codec-codegen-ext.ts` already
+ *  makes, so this reduces to exactly today's behavior whenever
+ *  `entryCorrespondence` is omitted. */
 export function generateProcedure(
     index: number, raised: RaisedProc<CodecExtInstr>, entryNode: TypeNode | undefined, direction: Direction,
     projection: ReadonlyMap<number, TSTypeDecl>,
+    entryCorrespondence?: Correspondence,
 ): string
 {
     const slotTypes = new Map<number, TypeNode>(entryNode ? [[0, entryNode]] : [])
     const {maxSlot, listTraversalSlots} = prescan(raised.body)
-    const g: GenCtx = {direction, slotTypes, projection, writeBacks: new Map(), idxDeclared: new Set(), tempCounter: {n: 0}}
+    const correspondences = entryCorrespondence ? new Map([[0, entryCorrespondence]]) : undefined
+    const g: GenCtx = {direction, slotTypes, projection, writeBacks: new Map(), idxDeclared: new Set(), tempCounter: {n: 0}, correspondences}
 
     const b = new LineBuilder()
 
@@ -282,30 +297,46 @@ export function generateProcedure(
         return b.toString()
     }
 
-    const entryDecl = g.projection.get(entryNode.id)
-    if(!entryDecl) throw new Error(`codec-codegen: no local-representation projection for ${describeType(entryNode)} (node #${entryNode.id})`)
-    const entryKind = kindOf(entryNode.type)
+    // A procedure boundary reached entirely through image-only navigation
+    // (docs/codec-image.md §2/§3) has no local representation at all — no
+    // `TSTypeDecl` to name a real declared type from, so its own
+    // parameter/return type is `any` (there is no local type to mean).
+    let ref: string
+    if(entryCorrespondence && !entryCorrespondence.localNode)
+    {
+        ref = "any"
+    }
+    else
+    {
+        const node = entryCorrespondence?.localNode ?? entryNode
+        const entryDecl = projection.get(node.id)
+        if(!entryDecl) throw new Error(`codec-codegen: no local-representation projection for ${describeType(node)} (node #${node.id})`)
+        ref = entryDecl.ref
+    }
+    const entryAccess = localAccessorFor(0, g)
 
     b.line(`// proc ${index}: ${describeType(entryNode)}`)
 
     if(direction === "decode")
     {
-        b.block(`function decode_proc${index}(ctx: Ctx): ${entryDecl.ref} {`, () =>
+        b.block(`function decode_proc${index}(ctx: Ctx): ${ref} {`, () =>
         {
             if(raised.peakSlots > 0) b.line(`let ${Array.from({length: raised.peakSlots}, (_, i) => `s${i}`).join(", ")};`)
             if(maxSlot > 0) b.line(`let ${Array.from({length: maxSlot}, (_, i) => `v${i + 1}`).join(", ")};`)
             b.line(
-                entryKind === SemanticTypeKinds.Struct ? `let v0: any = ${expectAccessor(entryDecl.access, "struct", entryNode).beginStruct?.() ?? "{}"};` :
-                entryKind === SemanticTypeKinds.List ? `let v0: any = ${expectAccessor(entryDecl.access, "list", entryNode).beginList?.() ?? "[]"};` :
+                entryAccess.kind === "struct" ? `let v0: any = ${entryAccess.beginStruct?.() ?? "{}"};` :
+                entryAccess.kind === "list" ? `let v0: any = ${entryAccess.beginList?.() ?? "[]"};` :
                 "let v0: any;",
             )
+            if(entryAccess.kind === "struct" && entryCorrespondence?.outcome === "matched")
+                injectLocalOnlyDefaults(entryCorrespondence, "v0", g, b)
             translateStmts(raised.body, entryNode, g, b)
-            if(!endsInTerminator(raised.body)) emitReturn(entryNode, g, b)
+            if(!endsInTerminator(raised.body)) emitReturn(g, b)
         })
     }
     else
     {
-        b.block(`function encode_proc${index}(v0: ${entryDecl.ref}, ctx: Ctx): void {`, () =>
+        b.block(`function encode_proc${index}(v0: ${ref}, ctx: Ctx): void {`, () =>
         {
             if(raised.peakSlots > 0) b.line(`let ${Array.from({length: raised.peakSlots}, (_, i) => `s${i}`).join(", ")};`)
             if(maxSlot > 0) b.line(`let ${Array.from({length: maxSlot}, (_, i) => `v${i + 1}`).join(", ")};`)
