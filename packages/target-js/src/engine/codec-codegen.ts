@@ -52,168 +52,119 @@
  * `CodecRule`-authored body compiles at any nesting depth, in any order.
  * What replaces `Handle` is two pieces of purely compile-time bookkeeping,
  * both scoped to one procedure's own body and never crossing a procedure
- * boundary as a runtime value:
+ * boundary as a runtime value — recorded and consulted in
+ * `codec-codegen-ext.ts`, not here (see that file's own header):
+ * a per-slot write-back descriptor and an encode-side ascending index
+ * counter for list traversal.
  *
- * - A **write-back descriptor** per handle slot (`WriteBack`, below):
- *   where does *this* slot's eventual value belong, once known — a named
- *   field of another slot's own accumulator, or an appended list element.
- *   Recorded once, whenever `ENTER`/`ENTER_NEXT` names a new slot.
- * - A plain, uniform, per-slot **accumulator** local (`v0`, `v1`, ...) —
- *   `{}` for a struct, `[]` for a list, reassigned wholesale (never
- *   incrementally mutated) for a union or leaf. Always this shape
- *   internally, regardless of what the target `TypeNode`'s own `Accessor`
- *   eventually converts it to — that conversion (`finishStruct`/
- *   `finishUnion`/`finishList`) happens exactly once, at the point a
- *   value is about to cross a procedure boundary (a `return`, or a
- *   `call_codec` argument), never per field/element.
+ * This file itself stays the generic half: the `Stmt`/`Expr` tree walk
+ * that applies to *any* raised body (`Assign`/`ExprStmt`/`Return`/`Trap`/
+ * `Dispatch`/`Loop`, and the non-`Ext` expression kinds), plus the
+ * per-procedure driver (`generateProcedure`) that wraps it in a real
+ * `function`. The one thing it doesn't know how to translate — an `Ext`
+ * node, i.e. one of the 17 codec-extension opcodes — it simply hands off
+ * to `codec-codegen-ext.ts` at the two join points a raised body actually
+ * has one (a nestable expression, via `translateExt`; a statement-only
+ * op, via `emitExtStmtIfApplicable`), plus `emitReturn` for a procedure's
+ * own `Accessor`-dependent exit value.
  *
- * Decode and encode are asymmetric here, not by an oversight but because
- * they have opposite jobs at a slot's own creation site: decode has
- * nothing to compute yet at `ENTER`/`ENTER_NEXT` (the value doesn't exist
- * until something *writes* it later), so it's pure, deferred bookkeeping.
- * Encode already holds the full parent value and has nothing to defer —
- * `ENTER`/`ENTER_NEXT` must *eagerly* pull the child value out right
- * there, because a later statement (`load_val`, or `tag`, for a hoisted
- * union field) reads it immediately after. List traversal specifically
- * needs one further piece of encode-only bookkeeping the RTL doesn't hand
- * over for free: the raised loop only counts elements *down* (`left`),
- * but `Accessor.elementAt` needs an *ascending* index — so this module
- * introduces its own counter, once per list slot ever traversed for
- * encode.
- *
- * Split across three siblings so this file stays just the tree walk:
- * `line-builder.ts` owns indentation (`LineBuilder`), `codec-type-nav.ts`
- * owns the pure `TypeNode`/`TypeEdge` questions, and `codec-module.ts` is
- * the whole-program entry point (`generateCodecModule`) that drives this
- * file once per procedure, threading through the `Accessor` projection.
+ * Split across five siblings so this file stays just the generic tree
+ * walk: `line-builder.ts` owns indentation (`LineBuilder`),
+ * `codec-type-nav.ts` owns the pure `TypeNode`/`TypeEdge` questions,
+ * `codec-codegen-ext.ts` owns everything specific to the 17
+ * `CodecExtInstr` opcodes (`GenCtx`, the write-back/index bookkeeping,
+ * `Accessor` lookup, and `ENTER`/`CALL_CODEC`/`TAG`/`WRITE_SEQ`/...
+ * translation), `resolver.ts` owns the `Accessor`/`TSTypeDecl` shapes
+ * themselves, and `codec-module.ts` is the whole-program entry point
+ * (`generateCodecModule`) that drives this file once per procedure,
+ * threading through the `Accessor` projection.
  */
 
-import type {Stmt, Expr, RaisedProc} from "@ppl/machine"
+import type {Stmt, Expr, RaisedProc, BinaryOpcode, UnaryOpcode} from "@ppl/machine"
 import {ExprKind, StmtKind} from "@ppl/machine"
-import type {TypeNode, TypeEdge} from "@ppl/core"
+import type {TypeNode} from "@ppl/core"
 import {kindOf, SemanticTypeKinds} from "@ppl/core"
 import type {Direction, CodecExtInstr} from "@ppl/codecs"
-import {requireSlotNode, intWireSize, assertNever} from "@ppl/codecs"
-import type {Accessor, TSTypeDecl} from "./resolver"
+import type {TSTypeDecl} from "./resolver"
 import {LineBuilder} from "./line-builder"
-import {requireEdge, variantNamesOf, describeType} from "./codec-type-nav"
-
-const jsString = (s: string): string => JSON.stringify(s)
-
-// ─────────────────────────────────────────────────────────────────────────
-// Generation context
-// ─────────────────────────────────────────────────────────────────────────
-
-/** Where a handle slot's own eventual value belongs, once known — recorded
- *  when `ENTER`/`ENTER_NEXT` names the slot, consulted whenever something
- *  later produces that slot's real value (`STORE_VAL`, or a nested
- *  `CALL_CODEC(_NEXT)`'s own return). A slot with none at all is either
- *  slot 0 (a procedure's own top — never written back into anything
- *  *within* this procedure; its value crosses the procedure boundary
- *  itself, via `return`/the parameter) or a slot re-entered from a
- *  hoisted union field (`{into: "field", ...}` already recorded once,
- *  reused as-is across the field's own bitmap `switch`). */
-type WriteBack =
-    | {readonly into: "field"; readonly parentSlot: number; readonly name: string}
-    | {readonly into: "append"; readonly parentSlot: number}
-
-interface GenCtx
-{
-    readonly direction: Direction
-    /** Image `TypeNode` per handle slot — wire-format concerns only
-     *  (width, tag-index-into-the-image's-own-variant-order). Unaffected
-     *  by anything in this rework. */
-    readonly slotTypes: Map<number, TypeNode>
-    /** Local-representation projection, keyed by `TypeNode.id` — the
-     *  source of every `Accessor` this module consults. Built once per
-     *  whole program (`codec-module.ts`), shared read-only across every
-     *  procedure. */
-    readonly projection: ReadonlyMap<number, TSTypeDecl>
-    readonly writeBacks: Map<number, WriteBack>
-    /** Which slots already have an encode-side ascending index counter
-     *  (`__idx${slot}`) declared — `ENTER_NEXT`/`CALL_CODEC_NEXT` need one
-     *  the first time a given slot is traversed, never again after. */
-    readonly idxDeclared: Set<number>
-}
-
-function accessorFor(node: TypeNode, g: GenCtx): Accessor
-{
-    const decl = g.projection.get(node.id)
-    if(!decl) throw new Error(`codec-codegen: no local-representation projection for ${describeType(node)} (node #${node.id}) — pass the same rule list to projectTSTypes and generateCodecModule`)
-    return decl.access
-}
-
-/** Narrow an `Accessor` to one `kind` or throw — every call site already
- *  knows which kind it expects from the surrounding opcode/slot-kind
- *  logic; this is purely what lets TS's own discriminated-union narrowing
- *  see it too, with a clear error if a rule's own `access` disagreed with
- *  its `pattern` (a rule bug, not a codegen one). */
-function expectAccessor<K extends Accessor["kind"]>(access: Accessor, kind: K, node: TypeNode): Extract<Accessor, {kind: K}>
-{
-    if(access.kind !== kind)
-        throw new Error(`codec-codegen: expected a "${kind}" accessor for ${describeType(node)}, got "${access.kind}" — the rule that claimed this type has an access() that disagrees with its own pattern`)
-    return access as Extract<Accessor, {kind: K}>
-}
+import {describeType} from "./codec-type-nav"
+import type {GenCtx} from "./codec-codegen-ext"
+import {prescan, translateExt, emitExtStmtIfApplicable, emitReturn, idxCounter, expectAccessor} from "./codec-codegen-ext"
 
 // ─────────────────────────────────────────────────────────────────────────
-// Pre-scan — handle-slot count and which slots need an encode-side index
+// Binary/unary op rendering — inline JS text, not a runtime evalBinary/
+// evalUnary call. `@ppl/machine`'s `vm.ts` (where those live) is an
+// interpreter designed as a testing oracle, not a production dependency —
+// generated code must not import it. `BinaryOpcode`/`UnaryOpcode` are
+// small, closed enumerations (never extended by a rule author), so each
+// case is inlined directly, exactly matching `evalBinary`/`evalUnary`'s
+// own semantics (verified against them by
+// `binary-op-codegen.runtime.test.ts`, the same differential-oracle
+// pattern `raise.ts`'s own test suite already uses for the same reason).
+// Every operand is parenthesized — `l`/`r`/`v` are arbitrary nested
+// expression text, never guaranteed to already be atoms.
 // ─────────────────────────────────────────────────────────────────────────
 
-/** Pre-scan a raised body for the highest handle-table index referenced
- *  (so the generated function can declare `let v1, v2, ..., vN;` once up
- *  front — every slot var is function-scoped and reassigned in place,
- *  never re-`let`, matching the interpreted runtime's own flat, function-
- *  lifetime frame) and which slots are ever the `src` of an `ENTER_NEXT`/
- *  `CALL_CODEC_NEXT` (encode needs an ascending index counter for each,
- *  declared alongside — see this file's own header for why). */
-function prescan(stmts: readonly Stmt<CodecExtInstr>[]): {maxSlot: number; listTraversalSlots: ReadonlySet<number>}
+export function binaryOpToJs(op: BinaryOpcode, l: string, r: string): string
 {
-    let max = 0
-    const bumpAll = (indices: readonly number[]): void => {for(const i of indices) if(i > max) max = i}
-    const listTraversalSlots = new Set<number>()
-
-    function visitExpr(e: Expr<CodecExtInstr>): void
+    switch(op)
     {
-        if(e.kind === ExprKind.Ext)
-        {
-            switch(e.ext)
-            {
-                case "ENTER": bumpAll([e.dst, e.src, e.ref]); break
-                case "ENTER_NEXT": bumpAll([e.dst, e.src]); listTraversalSlots.add(e.src); break
-                case "LOAD_VAL": case "STORE_VAL": case "COUNT": case "TAG": case "OPEN_LIST":
-                    bumpAll([e.src]); break
-                case "CALL_CODEC": bumpAll([e.src]); break
-                case "CALL_CODEC_NEXT": bumpAll([e.src]); listTraversalSlots.add(e.src); break
-                case "WRITE_SEQ": case "READ_SEQ": bumpAll([e.handle]); break
-                // Iterator ids, never handle-table slots — nothing to bump.
-                case "READ": case "WRITE": case "HAS_NEXT": case "CLONE_RD": case "CLONE_WR": case "SEEK": break
-                default: assertNever(e)
-            }
-            for(const a of e.args) visitExpr(a)
-        }
-        else if(e.kind === ExprKind.Binary) {visitExpr(e.left); visitExpr(e.right)}
-        else if(e.kind === ExprKind.Unary) visitExpr(e.value)
-        else if(e.kind === ExprKind.Call) for(const a of e.args) visitExpr(a)
+        case "ADD": return `((${l}) + (${r})) >>> 0`
+        case "SUB": return `((${l}) - (${r})) >>> 0`
+        case "RSUB": return `((${r}) - (${l})) >>> 0`
+        case "MUL": return `Math.imul(${l}, ${r}) >>> 0`
+        // No `>>> 0` wrap — matches evalBinary's own (unwrapped, signed-
+        // result) behavior exactly, not "fixing" a quirk that isn't a bug.
+        case "AND": return `(${l}) & (${r})`
+        case "OR": return `(${l}) | (${r})`
+        case "XOR": return `(${l}) ^ (${r})`
+        case "SHL": return `((${l}) << ((${r}) & 31)) >>> 0`
+        case "SHR": return `(${l}) >>> ((${r}) & 31)`
+        case "ASR": return `((${l}) >> ((${r}) & 31)) >>> 0`
+        case "EQ": return `((${l}) === (${r}) ? 1 : 0)`
+        case "NE": return `((${l}) !== (${r}) ? 1 : 0)`
+        case "LT_S": return `(((${l})|0) < ((${r})|0) ? 1 : 0)`
+        case "LE_S": return `(((${l})|0) <= ((${r})|0) ? 1 : 0)`
+        case "GT_S": return `(((${l})|0) > ((${r})|0) ? 1 : 0)`
+        case "GE_S": return `(((${l})|0) >= ((${r})|0) ? 1 : 0)`
+        case "LT_U": return `((${l}) < (${r}) ? 1 : 0)`
+        case "LE_U": return `((${l}) <= (${r}) ? 1 : 0)`
+        case "GT_U": return `((${l}) > (${r}) ? 1 : 0)`
+        case "GE_U": return `((${l}) >= (${r}) ? 1 : 0)`
     }
+}
 
-    function visitStmts(stmts: readonly Stmt<CodecExtInstr>[]): void
+export function unaryOpToJs(op: UnaryOpcode, v: string): string
+{
+    switch(op)
     {
-        for(const s of stmts)
-        {
-            switch(s.kind)
-            {
-                case StmtKind.Assign: visitExpr(s.value); break
-                case StmtKind.ExprStmt: visitExpr(s.value); break
-                case StmtKind.Return: visitExpr(s.value); break
-                case StmtKind.Trap: break
-                case StmtKind.Dispatch: visitExpr(s.test); for(const c of s.cases) visitStmts(c); break
-                case StmtKind.Loop: visitStmts(s.cond); visitExpr(s.test); visitStmts(s.body); break
-            }
-        }
+        case "NEG": return `(-(${v})) >>> 0`
+        case "NOT": return `(~(${v})) >>> 0`
+        case "CLZ": return `Math.clz32(${v})`
+        // Not a single JS expression (a 5-step bit-reversal) — a named
+        // runtime helper instead, same idea as evalUnary's own MUL/CLZ
+        // leaning on Math.imul/Math.clz32 rather than hand-rolling them.
+        case "REVBITS": return `revBits(${v})`
     }
+}
 
-    visitStmts(stmts)
-    return {maxSlot: max, listTraversalSlots}
+// ─────────────────────────────────────────────────────────────────────────
+// Expression translation — everything that's still a single, nestable
+// value expression (unaffected by the write-back rework: none of these
+// ever depended on `Handle`, only on a slot's own current value).
+// ─────────────────────────────────────────────────────────────────────────
+
+export function translateExpr(e: Expr<CodecExtInstr>, g: GenCtx): string
+{
+    switch(e.kind)
+    {
+        case ExprKind.Const: return String(e.value)
+        case ExprKind.Slot: return `s${e.index}`
+        case ExprKind.Binary: return binaryOpToJs(e.op, translateExpr(e.left, g), translateExpr(e.right, g))
+        case ExprKind.Unary: return unaryOpToJs(e.op, translateExpr(e.value, g))
+        case ExprKind.Call: return `${g.direction}_proc${e.calleeIndex}(${[...e.args.map(a => translateExpr(a, g)), "ctx"].join(", ")})`
+        case ExprKind.Ext: return translateExt(e, g)
+    }
 }
 
 function endsInTerminator(stmts: readonly Stmt<CodecExtInstr>[]): boolean
@@ -223,290 +174,10 @@ function endsInTerminator(stmts: readonly Stmt<CodecExtInstr>[]): boolean
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Expression translation — everything that's still a single, nestable
-// value expression (unaffected by the write-back rework: none of these
-// ever depended on `Handle`, only on a slot's own current value).
-// ─────────────────────────────────────────────────────────────────────────
-
-function translateExpr(e: Expr<CodecExtInstr>, g: GenCtx): string
-{
-    switch(e.kind)
-    {
-        case ExprKind.Const: return String(e.value)
-        case ExprKind.Slot: return `s${e.index}`
-        case ExprKind.Binary: return `evalBinary(${translateExpr(e.left, g)}, ${translateExpr(e.right, g)}, ${jsString(e.op)})`
-        case ExprKind.Unary: return `evalUnary(${translateExpr(e.value, g)}, ${jsString(e.op)})`
-        case ExprKind.Call: throw new Error(`codec-codegen: a plain CALL (to procedure ${e.calleeIndex}) isn't supported — no codec rule in this codebase emits one`)
-        case ExprKind.Ext: return translateExt(e, g)
-    }
-}
-
-function translateExt(e: Extract<Expr<CodecExtInstr>, {kind: ExprKind.Ext}>, g: GenCtx): string
-{
-    const arg = (i: number): string => translateExpr(e.args[i]!, g)
-
-    switch(e.ext)
-    {
-        case "ENTER": case "ENTER_NEXT": case "STORE_VAL": case "OPEN_LIST":
-        case "CALL_CODEC": case "CALL_CODEC_NEXT":
-            throw new Error(`codec-codegen: ${e.ext} should only ever appear as its own statement, never nested in an expression`)
-
-        case "LOAD_VAL":
-            {
-                const node = requireSlotNode(g.slotTypes, e.src, "LOAD_VAL")
-                return expectAccessor(accessorFor(node, g), "integer", node).toWire(`v${e.src}`)
-            }
-
-        case "COUNT":
-            {
-                const node = requireSlotNode(g.slotTypes, e.src, "COUNT")
-                return expectAccessor(accessorFor(node, g), "list", node).count(`v${e.src}`)
-            }
-
-        case "TAG":
-            {
-                const node = requireSlotNode(g.slotTypes, e.src, "TAG")
-                const activeName = expectAccessor(accessorFor(node, g), "union", node).activeVariantName(`v${e.src}`)
-                return `tagOf(${activeName}, ${JSON.stringify(variantNamesOf(node))})`
-            }
-
-        case "READ": return `read(ctx, ${e.iter}, ${e.width})`
-        case "HAS_NEXT": return `hasNext(ctx, ${e.iter})`
-        case "CLONE_RD": return `cloneRd(ctx, ${e.src}, ${e.dst})`
-        case "CLONE_WR": return `cloneWr(ctx, ${e.src}, ${e.dst})`
-        case "SEEK": return `seek(ctx, ${e.iter}, ${e.delta})`
-        case "WRITE": return `write(ctx, ${e.iter}, ${e.width}, ${arg(0)})`
-
-        case "WRITE_SEQ":
-            {
-                const node = requireSlotNode(g.slotTypes, e.handle, "WRITE_SEQ")
-                const bulk = expectAccessor(accessorFor(node, g), "list", node).bulk
-                if(!bulk) throw new Error(`codec-codegen: no bulk sequential-transfer support for ${describeType(node)} (node #${node.id}) — the rule that claimed this type's Accessor doesn't provide "bulk"`)
-                return bulk.writeSeq(`v${e.handle}`, `${e.iter}`, `${e.width}`, arg(0))
-            }
-
-        case "READ_SEQ":
-            {
-                const node = requireSlotNode(g.slotTypes, e.handle, "READ_SEQ")
-                const bulk = expectAccessor(accessorFor(node, g), "list", node).bulk
-                if(!bulk) throw new Error(`codec-codegen: no bulk sequential-transfer support for ${describeType(node)} (node #${node.id}) — the rule that claimed this type's Accessor doesn't provide "bulk"`)
-                return bulk.readSeq(`v${e.handle}`, `${e.iter}`, `${e.width}`, `${e.signed}`, arg(0))
-            }
-
-        default:
-            return assertNever(e)
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────
-// Statement-only ops — everything that writes a slot's own value, or
-// names/traverses one. None of these can appear nested in an expression
-// (confirmed by reading every existing `CodecRule` in this codebase); see
-// `emitExtStmt` for the one place that still has to check, since a raised
-// `RETURN`'s own value can embed a pending one of these (`raise.ts`'s own
-// `killAcc`/`readAcc` — a value read here was never necessarily flushed as
-// its own statement first).
-// ─────────────────────────────────────────────────────────────────────────
-
-/** Assign `value` into slot `slot`'s own accumulator variable, then
- *  propagate it into whatever `slot` itself was written back into, if
- *  anything (a named field, or an appended list element) — the one place
- *  a slot's value ever moves "up" to its own parent within a procedure.
- *  A no-op propagation for slot 0: it has no write-back descriptor by
- *  construction (its value crosses the *procedure* boundary instead, via
- *  `return`/the parameter, handled separately by `emitReturn`). */
-function emitWriteBack(slot: number, value: string, g: GenCtx, b: LineBuilder): void
-{
-    b.line(`v${slot} = ${value};`)
-    const wb = g.writeBacks.get(slot)
-    if(!wb) return
-    if(wb.into === "field") b.line(`v${wb.parentSlot}.${wb.name} = v${slot};`)
-    else b.line(`v${wb.parentSlot}.push(v${slot});`)
-}
-
-/** The encode-side ascending index counter `ENTER_NEXT`/`CALL_CODEC_NEXT`
- *  need for `Accessor.elementAt` (this file's own header explains why the
- *  RTL's descending `left` isn't enough) — declared once, at the point of
- *  first use, then just referenced (and incremented) everywhere else. */
-function idxCounter(slot: number, g: GenCtx, b: LineBuilder): string
-{
-    const name = `__idx${slot}`
-    if(!g.idxDeclared.has(slot))
-    {
-        g.idxDeclared.add(slot)
-        b.line(`let ${name} = 0;`)
-    }
-    return name
-}
-
-function emitEnter(dst: number, src: number, ref: number, g: GenCtx, b: LineBuilder): void
-{
-    // Bare ENTER's own parent is always struct-kind — union navigation is
-    // always atomic, via CALL_CODEC (see emitCallCodec); a list has no
-    // named field/variant to ENTER by ref at all (ENTER_NEXT only).
-    const srcNode = requireSlotNode(g.slotTypes, src, "ENTER")
-    const edge = requireEdge(srcNode, ref, "ENTER")
-    const name = (edge.step as {field: string}).field
-    g.writeBacks.set(dst, {into: "field", parentSlot: src, name})
-    g.slotTypes.set(dst, edge.target)
-
-    if(g.direction === "decode")
-    {
-        // Deferred: nothing to compute yet. A struct-kind dst needs its
-        // own fresh accumulator right away, though, so whatever writes
-        // into it later (STORE_VAL, or a nested CALL_CODEC's own return)
-        // has a real object to assign a field on. A union-kind dst gets
-        // its real value later, atomically, via CALL_CODEC — nothing to
-        // initialize here for it at all.
-        if(kindOf(edge.target.type) === SemanticTypeKinds.Struct) b.line(`v${dst} = {};`)
-    }
-    else
-    {
-        // Eager: encode already holds src's full value; pull the field
-        // out right now, since a later statement (load_val, or tag for a
-        // hoisted union field) reads v${dst} immediately.
-        const access = accessorFor(srcNode, g)
-        if(access.kind !== "struct") throw new Error(`codec-codegen: ENTER's parent (slot ${src}) isn't struct-kind`)
-        b.line(`v${dst} = ${access.readField(`v${src}`, name)};`)
-    }
-}
-
-function emitEnterNext(dst: number, src: number, g: GenCtx, b: LineBuilder): void
-{
-    const srcNode = requireSlotNode(g.slotTypes, src, "ENTER_NEXT")
-    const edge = requireEdge(srcNode, 0, "ENTER_NEXT")
-    g.writeBacks.set(dst, {into: "append", parentSlot: src})
-    g.slotTypes.set(dst, edge.target)
-
-    if(g.direction === "decode")
-    {
-        if(kindOf(edge.target.type) === SemanticTypeKinds.Struct) b.line(`v${dst} = {};`)
-    }
-    else
-    {
-        const access = accessorFor(srcNode, g)
-        if(access.kind !== "list") throw new Error(`codec-codegen: ENTER_NEXT's parent (slot ${src}) isn't list-kind`)
-        const idx = idxCounter(src, g, b)
-        b.line(`v${dst} = ${access.elementAt(`v${src}`, `${idx}++`)};`)
-    }
-}
-
-function emitStoreVal(src: number, arg0: Expr<CodecExtInstr>, g: GenCtx, b: LineBuilder): void
-{
-    const node = requireSlotNode(g.slotTypes, src, "STORE_VAL")
-    const raw = translateExpr(arg0, g)
-    const value = kindOf(node.type) === SemanticTypeKinds.Integer
-        ? expectAccessor(accessorFor(node, g), "integer", node).fromWire(raw, intWireSize(node.type as {min: number, max: number}), (node.type as {min: number}).min < 0)
-        : raw
-    emitWriteBack(src, value, g, b)
-}
-
-function emitOpenList(src: number, g: GenCtx, b: LineBuilder): void
-{
-    b.line(`v${src} = [];`)
-}
-
-/** `CALL_CODEC`/`CALL_CODEC_NEXT` — the one place a real function call
- *  happens, and the one place a *union* is ever resolved: whether `ref`
- *  is a field or a variant index is decided by `src`'s own kind (not the
- *  target's — mirrors `codec-extension.ts`'s own `computeChild` exactly:
- *  a struct-kind src writes the callee's result into one of its own named
- *  fields; a union-kind src has its *entire* value replaced with
- *  `{variant, payload}`, atomically, the moment the payload is known — no
- *  intermediate state survives across statements for a union at all). */
-function emitCallCodec(calleeIndex: number, src: number, ref: number | undefined, g: GenCtx, b: LineBuilder): void
-{
-    const isNext = ref === undefined
-    const srcNode = requireSlotNode(g.slotTypes, src, isNext ? "CALL_CODEC_NEXT" : "CALL_CODEC")
-    const edge = isNext ? requireEdge(srcNode, 0, "CALL_CODEC_NEXT") : requireEdge(srcNode, ref, "CALL_CODEC")
-    const srcKind = kindOf(srcNode.type)
-    const access = accessorFor(srcNode, g)
-
-    if(g.direction === "decode")
-    {
-        const result = `${g.direction}_proc${calleeIndex}(ctx)`
-        if(srcKind === SemanticTypeKinds.Union)
-        {
-            if(access.kind !== "union") throw new Error(`codec-codegen: CALL_CODEC's union-kind src (slot ${src}) has a non-union accessor`)
-            const variant = (edge.step as {variant: string}).variant
-            b.line(`const payload = ${result};`)
-            emitWriteBack(src, access.finishUnion(variant, "payload"), g, b)
-        }
-        else if(isNext) b.line(`v${src}.push(${result});`)
-        else b.line(`v${src}.${(edge.step as {field: string}).field} = ${result};`)
-    }
-    else
-    {
-        let argExpr: string
-        if(srcKind === SemanticTypeKinds.Union)
-        {
-            if(access.kind !== "union") throw new Error(`codec-codegen: CALL_CODEC's union-kind src (slot ${src}) has a non-union accessor`)
-            argExpr = access.activeVariantPayload(`v${src}`, (edge.step as {variant: string}).variant)
-        }
-        else if(isNext)
-        {
-            if(access.kind !== "list") throw new Error(`codec-codegen: CALL_CODEC_NEXT's src (slot ${src}) isn't list-kind`)
-            argExpr = access.elementAt(`v${src}`, `${idxCounter(src, g, b)}++`)
-        }
-        else
-        {
-            if(access.kind !== "struct") throw new Error(`codec-codegen: CALL_CODEC's src (slot ${src}) isn't struct-kind`)
-            argExpr = access.readField(`v${src}`, (edge.step as {field: string}).field)
-        }
-        b.line(`${g.direction}_proc${calleeIndex}(${argExpr}, ctx);`)
-    }
-}
-
-/** Every EXT op that writes/names a slot rather than yielding a nestable
- *  expression — used both for a bare `ExprStmt` and (see `emitReturn`'s
- *  own caller) a `RETURN` whose own value embeds one of these unflushed
- *  (`raise.ts`'s own `readAcc`, called without a prior flush whenever the
- *  preceding op's effect didn't declare `readsAcc`). Returns `false` for
- *  anything that isn't one of these, so the caller falls back to plain
- *  expression translation. */
-function emitExtStmtIfApplicable(e: Extract<Expr<CodecExtInstr>, {kind: ExprKind.Ext}>, g: GenCtx, b: LineBuilder): boolean
-{
-    switch(e.ext)
-    {
-        case "ENTER": emitEnter(e.dst, e.src, e.ref, g, b); return true
-        case "ENTER_NEXT": emitEnterNext(e.dst, e.src, g, b); return true
-        case "STORE_VAL": emitStoreVal(e.src, e.args[0]!, g, b); return true
-        case "OPEN_LIST": emitOpenList(e.src, g, b); return true
-        case "CALL_CODEC": emitCallCodec(e.calleeIndex, e.src, e.ref, g, b); return true
-        case "CALL_CODEC_NEXT": emitCallCodec(e.calleeIndex, e.src, undefined, g, b); return true
-        default: return false
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────
 // Statement translation
 // ─────────────────────────────────────────────────────────────────────────
 
-/** The value this procedure's own body eventually returns — `v0`, run
- *  through the entry `TypeNode`'s own `finishStruct`/`finishList` (the one
- *  conversion from "plain accumulator" to this rule's chosen shape), or
- *  used directly for a union/leaf (already finished — a union the moment
- *  its own CALL_CODEC resolved it, a leaf the moment STORE_VAL ran) or a
- *  unit (never touched at all — `unitValue()` stands in for the v0 that
- *  was never assigned, since a unit's own procedure body is empty).
- *
- *  Encode never builds a value of its own type at all (it only ever reads
- *  *from* the value it was given) — its own procedures stay `void`
- *  exactly as they always have, so this is a bare `return;`, matching
- *  what a raised RETURN's own value already had evaluated for whatever
- *  side effect it might still carry (the caller already emitted that). */
-function emitReturn(entryNode: TypeNode, g: GenCtx, b: LineBuilder): void
-{
-    if(g.direction === "encode") { b.line("return;"); return }
-
-    const access = accessorFor(entryNode, g)
-    if(access.kind === "struct") b.line(`return ${access.finishStruct("v0")};`)
-    else if(access.kind === "list") b.line(`return ${access.finishList("v0")};`)
-    else if(access.kind === "unit") b.line(`return ${access.unitValue()};`)
-    else b.line("return v0;")
-}
-
-function translateStmt(s: Stmt<CodecExtInstr>, entryNode: TypeNode, g: GenCtx, b: LineBuilder): void
+function translateStmt(s: Stmt<CodecExtInstr>, entryNode: TypeNode | undefined, g: GenCtx, b: LineBuilder): void
 {
     switch(s.kind)
     {
@@ -520,6 +191,11 @@ function translateStmt(s: Stmt<CodecExtInstr>, entryNode: TypeNode, g: GenCtx, b
             return
 
         case StmtKind.Return:
+            // A GENERIC-ABI procedure (no entryNode — a plain-CALL helper
+            // like delta-leb128.ts's leb128_encode/decode) has no separate
+            // handle/Accessor exit value: s.value *is* the real result.
+            if(entryNode === undefined) { b.line(`return ${translateExpr(s.value, g)};`); return }
+
             // s.value's own evaluation can carry a real, still-pending
             // side effect (raise.ts's own killAcc/readAcc distinction —
             // e.g. delta-leb128.ts's `if (left == 0) { return; }` right
@@ -562,7 +238,7 @@ function translateStmt(s: Stmt<CodecExtInstr>, entryNode: TypeNode, g: GenCtx, b
     }
 }
 
-function translateStmts(stmts: readonly Stmt<CodecExtInstr>[], entryNode: TypeNode, g: GenCtx, b: LineBuilder): void
+function translateStmts(stmts: readonly Stmt<CodecExtInstr>[], entryNode: TypeNode | undefined, g: GenCtx, b: LineBuilder): void
 {
     for(const s of stmts) translateStmt(s, entryNode, g, b)
 }
@@ -577,19 +253,39 @@ function translateStmts(stmts: readonly Stmt<CodecExtInstr>[], entryNode: TypeNo
  *  produced for the public declarations — this is what supplies every
  *  `Accessor` this module consults, keyed by `TypeNode.id`. */
 export function generateProcedure(
-    index: number, raised: RaisedProc<CodecExtInstr>, entryNode: TypeNode, direction: Direction,
+    index: number, raised: RaisedProc<CodecExtInstr>, entryNode: TypeNode | undefined, direction: Direction,
     projection: ReadonlyMap<number, TSTypeDecl>,
 ): string
 {
-    const slotTypes = new Map<number, TypeNode>([[0, entryNode]])
+    const slotTypes = new Map<number, TypeNode>(entryNode ? [[0, entryNode]] : [])
     const {maxSlot, listTraversalSlots} = prescan(raised.body)
-    const g: GenCtx = {direction, slotTypes, projection, writeBacks: new Map(), idxDeclared: new Set()}
+    const g: GenCtx = {direction, slotTypes, projection, writeBacks: new Map(), idxDeclared: new Set(), tempCounter: {n: 0}}
+
+    const b = new LineBuilder()
+
+    // GENERIC-ABI helper procedure (no header, e.g. delta-leb128.ts's
+    // leb128_encode/decode) — a plain-CALL callee: real numeric
+    // parameters/return, no v0/Accessor/handle-slot machinery at all.
+    // `entryTypes.get(i)` (codec-module.ts) is undefined for exactly these
+    // — never a CALL_CODEC target, so procedureBoundaryTypes never visits
+    // them.
+    if(entryNode === undefined)
+    {
+        b.line(`// proc ${index}: GENERIC helper`)
+        const params = [...Array.from({length: raised.argCount}, (_, i) => `s${i}: number`), "ctx: Ctx"].join(", ")
+        b.block(`function ${direction}_proc${index}(${params}): number {`, () =>
+        {
+            if(raised.peakSlots > raised.argCount)
+                b.line(`let ${Array.from({length: raised.peakSlots - raised.argCount}, (_, i) => `s${i + raised.argCount}`).join(", ")};`)
+            translateStmts(raised.body, undefined, g, b)
+        })
+        return b.toString()
+    }
 
     const entryDecl = g.projection.get(entryNode.id)
     if(!entryDecl) throw new Error(`codec-codegen: no local-representation projection for ${describeType(entryNode)} (node #${entryNode.id})`)
     const entryKind = kindOf(entryNode.type)
 
-    const b = new LineBuilder()
     b.line(`// proc ${index}: ${describeType(entryNode)}`)
 
     if(direction === "decode")
@@ -599,8 +295,8 @@ export function generateProcedure(
             if(raised.peakSlots > 0) b.line(`let ${Array.from({length: raised.peakSlots}, (_, i) => `s${i}`).join(", ")};`)
             if(maxSlot > 0) b.line(`let ${Array.from({length: maxSlot}, (_, i) => `v${i + 1}`).join(", ")};`)
             b.line(
-                entryKind === SemanticTypeKinds.Struct ? "let v0: any = {};" :
-                entryKind === SemanticTypeKinds.List ? "let v0: any = [];" :
+                entryKind === SemanticTypeKinds.Struct ? `let v0: any = ${expectAccessor(entryDecl.access, "struct", entryNode).beginStruct?.() ?? "{}"};` :
+                entryKind === SemanticTypeKinds.List ? `let v0: any = ${expectAccessor(entryDecl.access, "list", entryNode).beginList?.() ?? "[]"};` :
                 "let v0: any;",
             )
             translateStmts(raised.body, entryNode, g, b)

@@ -36,6 +36,11 @@ test("ts-target: TelemetryPacket has readings as SensorReading[]", () =>
     assert.ok(result.get(g.root.id)!.decl!.includes("readings: SensorReading[];"))
 })
 
+test("ts-target: TelemetryPacket has acoustic as number[]", () =>
+{
+    assert.ok(result.get(g.root.id)!.decl!.includes("acoustic: number[];"))
+})
+
 test("ts-target: TelemetryPacket has status: number", () =>
 {
     assert.ok(result.get(g.root.id)!.decl!.includes("status: number;"))

@@ -301,6 +301,87 @@ export function readSeq(ctx: Ctx, iterIdx: number, arr: number[], width: number,
     }
 }
 
+/** The genuinely direct alternative to `readSeq`/`writeSeq` above — for a
+ *  rule whose own local representation *is* a typed array with byte
+ *  layout matching the wire exactly (`ts-alternative-rules.ts`'s
+ *  `int16ListAsInt16ArrayRule`), not a plain `number[]` that merely
+ *  converts quickly. `readSeqView` doesn't copy at all: it returns a
+ *  *view* directly over `ctx.buffer`'s own backing memory, advancing the
+ *  iterator by the bytes it covers — the returned value's memory literally
+ *  aliases the original input bytes, for a caller that never touches
+ *  individual elements itself (e.g. handing a decoded burst straight to a
+ *  raw file write). `writeSeqRaw`'s own copy — into `ctx.buffer`, which
+ *  every procedure's own output necessarily assembles into — is a single
+ *  native block copy (`Uint8Array.prototype.set`), never a per-element
+ *  loop; encode has no "just return a view" option the way decode does,
+ *  since the whole packet's bytes are one contiguous buffer this call is
+ *  only ever one part of.
+ *
+ *  Deliberately does nothing defensive about endianness or alignment —
+ *  the opposite tradeoff from every other helper in this file. A typed
+ *  array's own backing bytes are always native/platform-endian; matching
+ *  that against this module's own little-endian wire convention (`view`'s
+ *  own `DataView` calls throughout this file) is the *rule's* contract to
+ *  uphold, not something checked here — the whole point is to step out of
+ *  the way and let bulk data move at the platform's own native speed. A
+ *  misaligned wire position (not a multiple of `ctor.BYTES_PER_ELEMENT`)
+ *  throws — via the typed-array constructor itself — rather than silently
+ *  misbehaving; that's a schema-layout concern for whoever placed this
+ *  field, not something this helper works around. */
+export function readSeqView<A extends ArrayBufferView>(
+    ctx: Ctx, iterIdx: number,
+    ctor: new (buffer: ArrayBufferLike, byteOffset: number, length: number) => A,
+    count: number,
+): A
+{
+    const it = iterAt(ctx, iterIdx)
+    if(it.capability !== "read")
+    {
+        throw new Error(`codec: READ_SEQ on write-only iterator ${iterIdx}`)
+    }
+
+    const result = new ctor(ctx.buffer.buffer, ctx.buffer.byteOffset + it.pos, count)
+    it.pos += result.byteLength
+    return result
+}
+
+export function writeSeqRaw(ctx: Ctx, iterIdx: number, src: ArrayBufferView): void
+{
+    const it = iterAt(ctx, iterIdx)
+    if(it.capability !== "write")
+    {
+        throw new Error(`codec: WRITE_SEQ on read-only iterator ${iterIdx}`)
+    }
+
+    if(it.overwriteOnly && it.pos + src.byteLength > ctx.length)
+    {
+        throw new Error(`codec: iterator ${iterIdx} (a CLONE_WR fork) can't append — only the root iterator appends`)
+    }
+
+    ensureCapacity(ctx, it.pos + src.byteLength)
+    ctx.buffer.set(new Uint8Array(src.buffer, src.byteOffset, src.byteLength), it.pos)
+    it.pos += src.byteLength
+    ctx.length = Math.max(ctx.length, it.pos)
+}
+
+/** `UnaryOpcode`'s one case that isn't a single JS expression — codegen
+ *  (`codec-codegen.ts`'s `unaryOpToJs`) inlines every other op directly as
+ *  text; this is the one that gets a named call instead, the same way
+ *  `evalUnary`'s own `MUL`/`CLZ` equivalents lean on `Math.imul`/
+ *  `Math.clz32` rather than hand-rolling them inline. Byte-for-byte the
+ *  same algorithm as `@ppl/machine`'s own `evalUnary`'s `REVBITS` case —
+ *  verified against it directly by `binary-op-codegen.runtime.test.ts`,
+ *  not just asserted to match by comment. */
+export function revBits(x: number): number
+{
+    let v = x
+    v = ((v & 0x55555555) << 1) | ((v >>> 1) & 0x55555555)
+    v = ((v & 0x33333333) << 2) | ((v >>> 2) & 0x33333333)
+    v = ((v & 0x0F0F0F0F) << 4) | ((v >>> 4) & 0x0F0F0F0F)
+    v = ((v & 0x00FF00FF) << 8) | ((v >>> 8) & 0x00FF00FF)
+    return ((v << 16) | (v >>> 16)) >>> 0
+}
+
 export class CodecTrap extends Error
 {
     constructor(readonly code: number)

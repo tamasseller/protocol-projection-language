@@ -132,6 +132,60 @@ export const byteListAsUint8ArrayRule: TsRule = tsRule(pList(pInteger(0, 255)),
         },
     } as TSTypeDecl]]))
 
+// ── List<int16> → Int16Array, genuinely zero-copy where the wire allows ──
+
+/** The direct-mapping alternative to `byteListAsUint8ArrayRule`'s own
+ *  trivial `bulk` forwarding above: `bulk.readSeq` returns a live view
+ *  straight over the wire bytes (`codec-runtime.ts`'s `readSeqView`) — the
+ *  decoded value's memory literally *is* a slice of the original input,
+ *  not a copy of it — and `bulk.writeSeq` blits the source array's own
+ *  backing bytes in one native block copy (`writeSeqRaw`), never a per-
+ *  element conversion loop. Endianness matching between `Int16Array`'s
+ *  native byte order and this project's own little-endian wire convention
+ *  is deliberately this rule's own contract, not something either helper
+ *  checks — see their own doc comments in `codec-runtime.ts`.
+ *
+ *  The element-level fallback — no bulk transfer possible at all, e.g.
+ *  `delta-leb128.ts`'s SLEB128 delta coder, which must read every element
+ *  to compute the next delta and so never emits `WRITE_SEQ`/`READ_SEQ` —
+ *  needs no `beginList`/`appendElement` override: the default plain-array
+ *  accumulator already works there, converted to a real `Int16Array` only
+ *  once, at `finishList`, same uniform-accumulator discipline as
+ *  `byteListAsUint8ArrayRule` above. */
+export const int16ListAsInt16ArrayRule: TsRule = tsRule(pList(pInteger(-32768, 32767)),
+    () => "Int16Array",
+    () => ({ deps: [] }),
+    () => ({
+        kind: "list",
+        // `x` may already be a real Int16Array here — the bulk path's own
+        // `readSeq` (below) assigns one straight into the accumulator, and
+        // `finishList` runs unconditionally at procedure exit regardless
+        // of which path produced it. `Int16Array.from` always copies, even
+        // from another typed array, so re-wrapping unconditionally would
+        // silently defeat the whole point of the bulk path's zero-copy
+        // view — this check is the difference between "genuinely aliases
+        // the wire bytes" and "aliases them, then immediately copies them
+        // anyway when the procedure returns".
+        finishList: x => `(${x} instanceof Int16Array ? ${x} : Int16Array.from(${x}))`,
+        count: v => `${v}.length`,
+        elementAt: (v, i) => `${v}[${i}]`,
+        bulk: {
+            writeSeq: (v, iter) => `writeSeqRaw(ctx, ${iter}, ${v})`,
+            readSeq: (acc, iter, _width, _signed, count) => `${acc} = readSeqView(ctx, ${iter}, Int16Array, ${count})`,
+        },
+    }),
+    // Same reasoning as byteListAsUint8ArrayRule's own claims — a concrete
+    // `pInteger` sub-pattern absorbs the element in this rule's own match.
+    (match) => new Map([[match.elementType, {
+        ref: "number",
+        deps: [],
+        access: {
+            kind: "integer",
+            fromWire: (raw, width, signed) => signed ? `signExtend(${width * 8}, ${raw})` : raw,
+            toWire: x => `(${x}) >>> 0`,
+        },
+    } as TSTypeDecl]]))
+
 // ── List<T> capacity ≤1 → optional field ─────────────────────────────────
 
 /** A list capped at one element is isomorphic to an optional value.

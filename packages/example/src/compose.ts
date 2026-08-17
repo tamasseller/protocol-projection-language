@@ -28,7 +28,7 @@ import {buildTypeGraph, TypeGraph} from "@ppl/core"
 import {projectCTypes, emitCHeader, CTypeDecl} from "@ppl/target-cpp"
 import {buildCodec, buildJsonEncoder, createCodecExtension, binaryEncodeRules, binaryDecodeRules, Handle, CodecExtInstr} from "@ppl/codecs"
 import {validateProgram, run, RtlProgram} from "@ppl/machine"
-import {projectTSTypes, emitTSDeclarations, tsTypeRules, TSTypeDecl} from "@ppl/target-js"
+import {projectTSTypes, emitTSDeclarations, tsTypeRules, TSTypeDecl, generateCodecModule} from "@ppl/target-js"
 
 import {TelemetryPacket} from "./schema"
 
@@ -93,6 +93,7 @@ export const sampleTelemetryPacket = {
         {sensor: {variant: "temperature", value: undefined}, value: 235, unit: 1},
         {sensor: {variant: "humidity", value: undefined}, value: 55, unit: 2},
     ],
+    acoustic: [1000, -1000, 32767],
     status: 0,
 }
 
@@ -117,3 +118,21 @@ export const jsonSample: string = toJson(sampleTelemetryPacket)
 /** TypeScript declarations (desktop/server) projected from the schema. */
 export const tsTypes: Map<number, TSTypeDecl> = projectTSTypes(TelemetryPacket, tsTypeRules)
 export const tsDeclarations: string = emitTSDeclarations(tsTypes)
+
+/**
+ * The literal compiled TypeScript source for this schema's encode/decode
+ * pair — real `encode_proc0`/`decode_proc0` functions (`@ppl/target-js`'s
+ * `generateCodecModule`), not the interpreted `RtlProgram` + `run()` path
+ * `encodeTelemetryPacket`/`decodeTelemetryPacket` above use. Reuses the
+ * same `encodeProgram`/`decodeProgram` this file already built — nothing
+ * about compilation rebuilds them. `src/generate.ts` (`npm run generate`)
+ * writes this — and `cHeader`/`tsDeclarations` — to real files under
+ * `generated/`, so the actual generated code can be opened and read
+ * directly, not just asserted against in tests.
+ */
+export const jsCodecModule: string = generateCodecModule({
+    name: "TelemetryPacket",
+    rootType: TelemetryPacket,
+    encodeProgram,
+    decodeProgram,
+})

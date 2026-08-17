@@ -5,6 +5,7 @@ import "./ts-emitter.runtime.test"
 import "./ts-alternative-rules.runtime.test"
 import "./codec-codegen.runtime.test"
 import "./codec-codegen-alt-rules.runtime.test"
+import "./binary-op-codegen.runtime.test"
 
 import {generateJsTypes, generateJsCodecs} from "../src/index"
 import {struct, integer, named} from "@ppl/core"

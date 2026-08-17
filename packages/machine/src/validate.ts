@@ -25,7 +25,7 @@
  */
 
 import type { RtlProc, RtlProgram, RtlInstr, ExtOpPayload } from "./rtl"
-import { isExtInstr, isStackComboInstr } from "./rtl"
+import { isExtInstr, isStackComboInstr, isRegComboInstr } from "./rtl"
 import type { Extension, ExtOpEffect } from "./extension"
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -210,8 +210,19 @@ function walkProcedure<E extends { ext: string } = ExtOpPayload>(
                 pc = body_.nextPc; continue
             }
 
-            // LOAD/STORE/CONST, REG_ACC/REG_REG/IMM_ACC combos, unary ops:
-            // none of these touch TOS.
+            // A register only becomes live once TOS has grown past it (via
+            // PUSH, or the initial arg_count frame slots) — never touching
+            // TOS itself doesn't mean "no constraint," it means the
+            // constraint is a plain bound against whatever TOS already is.
+            if((instr.op === "LOAD" || instr.op === "STORE") && instr.target >= tos)
+                fail(pc, `${instr.op} ${instr.target}: register not below current TOS (${tos}) — never established by a PUSH`)
+
+            if(isRegComboInstr(instr) && instr.target >= tos)
+                fail(pc, `${instr.op} ${instr.combo} ${instr.target}: register not below current TOS (${tos}) — never established by a PUSH`)
+
+            // CONST, IMM_ACC combos, unary ops: no register operand at all,
+            // nothing further to check; PEEK_PEEK/POP_ACC's own TOS-underflow
+            // check already ran above (isStackComboInstr).
             pc++
         }
     }

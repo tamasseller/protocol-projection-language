@@ -79,7 +79,7 @@ function generateProcedures(
 {
     const raisedProcs: readonly RaisedProc<CodecExtInstr>[] = raiseProgram(program, {effects: CODEC_EFFECTS})
     return raisedProcs
-        .map((raised, i) => generateProcedure(i, raised, entryTypes.get(i)!, direction, projection))
+        .map((raised, i) => generateProcedure(i, raised, entryTypes.get(i), direction, projection))
         .join("\n\n")
 }
 
@@ -101,7 +101,8 @@ export interface CodecModuleOptions
 }
 
 const RUNTIME_IMPORTS = [
-    "read", "write", "hasNext", "cloneRd", "cloneWr", "seek", "writeSeq", "readSeq", "tagOf", "signExtend", "CodecTrap",
+    "read", "write", "hasNext", "cloneRd", "cloneWr", "seek", "writeSeq", "readSeq", "readSeqView", "writeSeqRaw",
+    "tagOf", "signExtend", "revBits", "CodecTrap",
 ] as const
 
 /**
@@ -141,7 +142,6 @@ export function generateCodecModule(opts: CodecModuleOptions): string
 
     return `import { ${RUNTIME_IMPORTS.join(", ")} } from "@ppl/target-js/src/runtime/codec-runtime"
 import type { Ctx } from "@ppl/target-js/src/runtime/codec-runtime"
-import { evalBinary, evalUnary } from "@ppl/machine"
 
 ${emitTSDeclarations(typeResult)}
 ${generateProcedures(encodeProgram, encodeEntryTypes, "encode", typeResult)}

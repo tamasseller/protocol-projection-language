@@ -245,6 +245,20 @@ describe("raise: if/else (BR_TABLE)", () =>
                 return 99;
         return 0;
     `, 99))
+
+    // Regression: raise.ts used to leave `acc` as `undefined` entering a
+    // BR_TABLE arm rather than seeding it, so an arm whose own first
+    // statement is a bare `return;` (nothing before it sets a fresh value)
+    // crashed with "read of acc before it was ever set" — exactly
+    // delta-leb128.ts's own `if (left == 0) { return; }`. A no-else `if`
+    // always lowers its one arm as case 0, entered exactly when acc === 0
+    // (lower.ts's inverted-test + brTable(1) convention), so this is a
+    // genuine, provably-exact differential check, not just a smoke test.
+    test("bare early return as an arm's own first statement", () => assertRaisedReturn(`
+        u32 x = 0;
+        if (x == 0) { return; }
+        return 99;
+    `, 0))
 })
 
 describe("raise: loops (LOOP)", () =>
@@ -289,6 +303,23 @@ describe("raise: loops (LOOP)", () =>
         }
         return 0;
     `, 77))
+
+    // Regression, same bug class as the BR_TABLE case above — a loop
+    // body's own first statement reading acc via a bare early return.
+    // Not a differential-value check like that one: a boolean while-test
+    // enters the body with acc === 1 (not 0), so the raiser's unknownAcc()
+    // placeholder doesn't match run()'s ground truth here — nothing in
+    // this codebase's real procedures ever reads that value, so only
+    // "raising no longer throws" is asserted.
+    test("bare early return as a loop body's own first statement doesn't crash the raiser", () =>
+    {
+        const program: RtlProgram = { procedures: [lowerProc(ir`
+            u32 x = 0;
+            while (x < 3) { return; }
+            return 99;
+        `.body, [])] }
+        assert.doesNotThrow(() => raiseProgram(program))
+    })
 })
 
 describe("raise: switch (BR_TABLE with >2 cases, fallthrough)", () =>

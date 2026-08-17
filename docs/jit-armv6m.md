@@ -61,9 +61,9 @@ phases: alloc-only until exhausted, then evict-LRU-and-compact (§9).
 
 | Reg(s) | Role |
 |---|---|
-| `r3` | `acc` |
+| `r0` | `acc` |
 | `r4–r7` | TOS window, circularly renamed (§5) |
-| `r0–r2, r12` | scratch — instruction implementation, trampoline argument passing |
+| `r1–r3, r12` | scratch — instruction implementation, trampoline argument passing |
 | `r8–r11` | table base pointers (dispatch table, arena/LRU metadata, helper vector — §11) |
 | `sp` | operand/TOS spill stack (§2) — **never** the real C call stack while compiled code runs |
 | `lr` | transient, `BLX`-scoped only |
@@ -72,6 +72,35 @@ phases: alloc-only until exhausted, then evict-LRU-and-compact (§9).
 ARMv6-M "hi register" `ADD`/`MOV`/`CMP` forms, matching hardware reality:
 those are the *only* three ops with a hi-register operand form on this
 architecture.
+
+**Why `acc` is `r0`, not (e.g.) `r3`.** AAPCS passes a native function's
+first argument and its return value in `r0`. A single-argument helper
+(§10's `CLZ`/`REVBITS`, and whatever else lands in §11's "helper vector")
+can then be reached with a bare `BLX` — `acc` is already the argument
+register going in and already the return register coming out, no `MOV` on
+either side. This only pays for arity-1 helpers: this design never holds
+more than one value "hot" in `acc`, so a hypothetical 2-argument helper
+would still need a second operand shuffled from the window/spill stack
+into `r1` regardless of which register hosts `acc`. It also only pays if
+the helper is a true leaf with a zero-byte stack frame: `sp` here is the
+operand spill stack, not a real call stack (see the `sp` row above), sized
+with no slack for a helper's own transient frame — and since `lr` is
+transient/`BLX`-scoped, a helper that itself calls something else has
+nowhere to preserve `lr` but the stack, so "doesn't touch the stack" and
+"is a leaf" are the same requirement here. Two ways to get there: gate the
+helper's translation unit with `-Wstack-usage=0` promoted to a hard error
+(`-Werror=stack-usage=`) — since GCC's only way to preserve `lr` across a
+nested call is pushing it, a 0-byte report transitively proves leaf-ness
+too, not just frame size — or, for something as small as `CLZ`/`REVBITS`,
+hand-write it (`__attribute__((naked))` + inline Thumb), guaranteed by
+construction rather than checked, matching how this project already
+hand-writes its own Thumb encoder rather than trusting a compiler.
+**Naming collision to watch for:** isa-core.md's own worked examples use
+`r0`, `r1`, ... as *abstract* frame-relative slot names (`LOAD 0` reads
+frame slot 0) — a different namespace from this section's *physical* ARM
+`r0`, which now shares its name. Disambiguate explicitly ("isa-core's
+`r0`" vs. plain `r0`) anywhere both could appear near each other — the
+Appendix below is exactly such a spot.
 
 ---
 
@@ -110,11 +139,14 @@ back-edge) that reconverge at the same `tos` always agree on `phys(k)` for
 every live `k`, with no cross-path reconciliation needed.
 
 **Spill/fill.** Pushing slot `k+4` evicts slot `k`'s current value from its
-register to the SP-addressed stack (native `STR`, SP-relative, before the
-register is overwritten). Popping back down unconditionally reloads it
-(native `LDR`) — no liveness tracking, "unconditionally recovered ... to
-keep the translator simple" per the brief. Correct but leaves cheap
-dead-reload elimination on the table; deliberate trade, not an oversight.
+register to the spill stack — a real, `sp`-decrementing single-register
+`PUSH` (not a fixed-offset store to a pre-reserved region — see §6's own
+note on why `sp` has to genuinely move), before the register is
+overwritten. Popping back down unconditionally reloads it (a real
+`sp`-incrementing `POP`) — no liveness tracking, "unconditionally
+recovered ... to keep the translator simple" per the brief. Correct but
+leaves cheap dead-reload elimination on the table; deliberate trade, not
+an oversight.
 
 **Block-exit truncation is not free.** isa-core.md §8.1: at `BLOCK_END`/
 `RETURN`, TOS surplus above the enclosing entry depth is *implicitly
@@ -148,25 +180,112 @@ things the design depends on:
   reproduce the same native-code layout, which only holds if translation
   never depends on caller-side compile-time context.
 
-**The shuffle.** Before `CALL`, the caller's window is generally at some
-non-zero phase relative to what the callee expects at `k=0`. Re-phasing is
-a spill/fill round-trip: push the currently-cached contiguous run to the
-spill stack, then pop it back starting at `r4` — `POP`'s fixed ascending-
-register-to-ascending-address semantics naturally re-establishes phase 0
-for free (no cross-register `MOV`s needed, since `PUSH`/`POP` can't swap
-registers without a memory round-trip anyway, and none is required if both
-sides already keep window contents in ascending logical order — which they
-do, by construction of §5's formula).
+**The shuffle — worked derivation, resolving item 1 below.** Before `CALL`,
+the caller's window is generally at some non-zero phase relative to what
+the callee expects at `k=0`. Let `S = max(callee.arg_count − 1, 0)` (the
+stack-passed argument count, isa-core.md §4.6) and `callerTos` be the
+caller's own frame-relative `tos` right at the call. The caller's window
+currently holds `w = min(callerTos, 4)` resident slots — some suffix of
+which, `m = min(S, w)`, are exactly the *top* `m` stack args (the rest,
+`w − m`, are the caller's own older locals that happen to still be
+resident alongside them; any of the `S` args below the window's own
+bottom edge are already spilled, at their own correct address, and never
+need to move at all).
 
 The brief's claim ("a sequence of three push/pop-multiple instructions can
-implement any shuffle needed") is **plausible but not yet proven** — the
-push-then-pop-from-r4 pattern covers the common case in one or two
-instructions; a third likely covers the boundary case where the callee
-needs more resident slots than the caller had cached, requiring an
-additional fill from the explicit spill stack. **Needs a worked derivation**
-(exhaustive case enumeration over phase difference × argument count) before
-relying on "3" as a hard bound — this is the single trickiest piece of the
-whole translator and the one most worth prototyping first.
+implement any shuffle needed") **does not hold as stated, once actually
+worked through** — real hardware `PUSH`/`POP` store/load in a *fixed
+ascending-register-number* order, and that only coincides with
+ascending-*k* order (which is what a spill address keyed on `k` needs)
+when the window's own bottom already sits at phase 0 — precisely the case
+with nothing to shuffle in the first place. Concretely: if the window
+holds `k = 5,6,7,8` (wrapped once), `phys(k)` is `r5,r6,r7,r4` in that
+order — register-ascending order visits them `r4(k=8), r5(k=5), r6(k=6),
+r7(k=7)`, i.e. *k = 8,5,6,7* — not ascending in `k` at all. A single
+`PUSH {r4-r7}` would silently write the wrong value to the wrong slot
+address the moment the window has actually wrapped.
+
+**What does hold**, and is what the prototype (`window.ts`'s
+`spillForCall`/`fillCalleeArgs`/`reloadAfterCall`, exercised by
+`jit-armv6m/prototype/test/call.test.ts` on real QEMU) actually
+implements — two *different* orderings for two *different* consumers, not
+one unified batching scheme:
+
+1. **The caller's own non-argument locals** (`w − m` of them, if any are
+   resident alongside the args) are handled by a fact simpler than
+   "ordering": Thumb's `PUSH`/`POP` register-list is an arbitrary 8-bit
+   mask, not required to be contiguous. If nothing touches a set of
+   registers between a `PUSH{that set}` and a later `POP{that exact same
+   set}`, the `POP` restores exactly what was pushed — trivially, by
+   hardware's own inverse guarantee, regardless of `k`, wrap, or ordering
+   entirely. So the whole leftover set spills in **one** `PUSH` (whatever
+   mask it happens to be), and comes back in **one** mirrored `POP` of
+   that identical mask, later, in `reloadAfterCall` — no per-`k` "natural
+   order" reasoning needed at all, because it was never a reload keyed by
+   `k` in the first place, just a round-trip forced by the callee's
+   execution genuinely intervening (contrast `restoreWindow`'s block-exit
+   case, item 5 below, where nothing intervenes and the same round-trip
+   correctly reduces to *no* instructions).
+2. **The stack-passed args** (`m = min(S, w)` of them) get a genuinely
+   different treatment, because unlike the leftovers this *is* a remap:
+   rather than coming back into their own registers, they're popped
+   straight into the callee's canonical `phys(0)..phys(m-1)`. That
+   consumer — one combined ascending-register `POP` — wants "smallest arg
+   (`arg0`) closest to `sp`," which a batched `PUSH` can only deliver via
+   (at most) two instructions when the arg range wraps (push the
+   post-wrap/larger-arg run first, the pre-wrap/smaller-arg run — which
+   includes `arg0` — second, so whichever executes second, landing lower,
+   is the one `POP` will read first).
+
+Net cost: 1 (leftovers, one mirrored `PUSH`, any mask) + at most 2 (args,
+remap-batched) to spill, 1 to fill (`fillCalleeArgs`, if `S > 0`), and
+symmetrically 1 (leftovers' mirrored `POP`) + up to `WINDOW_SIZE`
+individual `POP`s for whatever's genuinely deeper than the leftover range
+(spilled long before this call, via ordinary individual natural-order
+spills, with no single `PUSH` to mirror) to restore the caller's own
+window after the callee returns. Cheaper than the brief's own guess of
+"3" in the common case (`argCount ≤ 1`, `S = 0`, costs *nothing* at all —
+nothing to spill, nothing to fill, nothing deeper than a currently-live
+window to reach into), and not fundamentally worse even at its most
+adversarial. **Not** a hard requirement to hit "3" instructions exactly —
+this was never about squeezing the count, only about whether the shuffle
+is *correct at all* (item 1 below's real concern), and with this split it
+is — verified by `call.test.ts`'s own adversarial case (phase-misaligned
+args *and* surviving leftover locals, real QEMU) down to the actual
+disassembly: the exact `PUSH{r5,r6}` / `POP{r5,r6}` pair this section
+describes, hand-verified against the emitted machine code.
+
+Two more pieces the brief's shuffle discussion doesn't mention at all,
+found only once a real, multi-procedure `CALL` existed to expose them:
+
+- A procedure whose own body contains a `CALL` clobbers its own `lr`
+  (`BL` sets it) and must save/restore it around the nested call, exactly
+  like any ordinary calling convention — a leaf procedure (no `CALL` in
+  its own body) never needs to. Nothing in §2's register table or §7's
+  return discussion calls this out; it's an unavoidable consequence of
+  `lr` being "transient, `BLX`-scoped only" (§3) applying just as much to
+  a procedure's *own* use of `BL` as to the dispatch mechanism reaching it.
+- **`sp` must genuinely track current depth — no fixed per-procedure
+  reservation.** An earlier draft of this section (and the prototype's
+  own first implementation) assumed each procedure reserves a fixed
+  `localPeak`-sized block via `SUB sp,#4·localPeak` on entry, addressing
+  every spill at a constant offset from that unmoving base — plausible-
+  looking, since it *does* keep frames from colliding (a callee's fixed
+  block still lands below whatever the caller reserved). But §8.3
+  computes the whole-program bound as a **maximum** over call sites and
+  local peaks, explicitly **tighter than summing per-procedure maxima
+  along the call chain** — and a fixed-reservation scheme's real footprint
+  *is* that sum (each nested call's block stacks additively below the
+  caller's), not the max. Only *reusing* the same storage as frames come
+  and go achieves the tight bound — i.e., `sp` has to be a real, moving
+  stack pointer: every ordinary spill a genuine `sp`-decrementing `PUSH`,
+  every fill a genuine `sp`-incrementing `POP`, with nothing reserved up
+  front. This is what makes `w − m` "natural order" and the shuffle's own
+  batched `PUSH`es (item 2 above) land in the right place automatically —
+  no separate "permanent vs. transient" storage concept needed anywhere:
+  every spill, batched or not, is a real push, and a callee's own spills
+  land strictly below whatever the caller had already pushed, purely
+  because `sp` only ever moves further down under it, never sideways.
 
 **Callee-side prologue.** The shuffle above is the *caller's* job. The
 callee has its own, smaller obligation: isa-core.md §4.6's last argument
@@ -178,7 +297,9 @@ back). Rather than an unconditionally-emitted copy instruction, this is
 folded into §10.1's state machine as its own entry state — see §10.1's
 "Callee-side prologue as a fold" — so a procedure whose first real
 instruction reads the argument straight back (a common shape for small
-procedures) pays nothing for it at all.
+procedures) pays nothing for it at all. (`acc` is `r0` — §3 — which is
+also why this dovetails with AAPCS's own first-argument register for the
+single-argument helper calls discussed there.)
 
 ---
 
@@ -283,7 +404,7 @@ instruction, never several ahead.
 **The state.** At any point in the walk, `acc`'s status is exactly one of:
 
 - **`CLEAN(reg)`** — already sitting in a committed physical register
-  (usually `r3`, sometimes an alias left by an earlier destination-fold).
+  (usually `r0`, sometimes an alias left by an earlier destination-fold).
 - **`PENDING(shape)`** — not yet emitted; `shape` is `Imm(k)` (from
   `CONST`) or `Reg(r)` (from `LOAD` *or* `POP` — the same class, since
   both just mean "the value already sits in some resident physical
@@ -296,7 +417,7 @@ instruction, never several ahead.
 |---|---|---|
 | `CLEAN` | a producer (`CONST`/`LOAD`/`POP`) | → `PENDING(shape)`; nothing emitted yet |
 | `PENDING(shape)` | a compatible consumer (table below) | emit **one** instruction folding `shape` in as the left operand; peek one more token for a following `STORE` to fold as the destination too → `CLEAN(dest)` |
-| `PENDING(shape)` | no match in the table | **flush**: emit `shape`'s trivial materialization into `r3` → `CLEAN(r3)`; reprocess the next instruction fresh |
+| `PENDING(shape)` | no match in the table | **flush**: emit `shape`'s trivial materialization into `r0` → `CLEAN(r0)`; reprocess the next instruction fresh |
 | `CLEAN(reg)` | an ordinary consumer | emit normally, reading `reg`; still peek one token for a `STORE`-fold on the destination |
 
 Worked example — `LOAD rN; ADD rM; STORE rD` (three bytecode ops) — both
@@ -401,8 +522,8 @@ sound with no lookahead beyond the one-token fold/flush decision above:
   ever supersedes it — only reachable if enough consecutive `PUSH`es land
   inside the same acc-reading run to rotate that exact slot out (§5's
   4-deep window). Cheap, mechanical, rare-to-trigger fallback bolted onto
-  rotation logic §5 already runs: emit one `MOVS r3, reg` first, then
-  proceed as if `CLEAN(r3)` had held all along.
+  rotation logic §5 already runs: emit one `MOVS r0, reg` first, then
+  proceed as if `CLEAN(r0)` had held all along.
 
 Not specific to this project's own `lower.ts` output either — it holds
 against any bytecode that honors the acc-clobbering convention discussed
@@ -417,23 +538,23 @@ arrives in `acc`, not at its frame-relative home register `phys(argidx)`
 — and `phys(argidx)` itself currently holds stale data (whatever the
 caller's shuffle left there, never overwritten, since the calling
 convention routes this one argument through `acc` instead). Rather than
-an unconditional `MOVS phys(argidx), r3` emitted before Pass 1 even
-starts, a procedure with `arg_count ≥ 1` starts Pass 1 at `CLEAN(r3)` plus
+an unconditional `MOVS phys(argidx), r0` emitted before Pass 1 even
+starts, a procedure with `arg_count ≥ 1` starts Pass 1 at `CLEAN(r0)` plus
 one standing obligation — "`phys(argidx)` isn't populated yet" — resolved
 by the same one-token machinery, plus one genuinely free case:
 
 - **`LOAD argidx`** (or any acc-destination addressing mode reading
   `argidx`) as the next instruction is a true no-op: it's asking for
-  exactly what `CLEAN(r3)` already holds, so nothing is emitted and the
+  exactly what `CLEAN(r0)` already holds, so nothing is emitted and the
   obligation is discharged for free. Common in practice — any small
   procedure that reads its last argument back near the top hits this.
 - **A register-mode operand reference to `argidx`** (mode 1/2/3) is
-  served by substituting `r3` for that one operand in the native
+  served by substituting `r0` for that one operand in the native
   encoding — but since these reads are non-consuming (the value stays
   live at that slot for later reads too, unlike `POP`), this does *not*
   discharge the obligation, only defers it past this one instruction.
 - **Any other producer** forces the flush right there (`MOVS
-  phys(argidx), r3`) before it overwrites `acc` — the same cost as the
+  phys(argidx), r0`) before it overwrites `acc` — the same cost as the
   unconditional version, just possibly delayed by one token instead of
   paid upfront regardless of whether anything ever needed it.
 - **Rotation eviction** is the same hazard as the ordinary case above,
@@ -585,7 +706,14 @@ instruction count:
 | `CONST`/`LOAD`/`STORE` | 1–2 |
 | `if`/`if-else` (`BR_TABLE` ≤2) | 2–3 (`CMP` + branch(es)) — **only with
   §10.1's fusion**; ~7 unfused |
-| `CALL` | ~5–6 (shuffle + table load + `BLX` + return handling) |
+| `CALL` | up to ~8 for the shuffle itself (§6's worked derivation: `1+≤2`
+  spilling the caller's own resident window — one mirrored `PUSH` for any
+  non-argument locals, at most two remap-`PUSH`es for the args — `+1`
+  filling the callee's args, `+≤4` reloading the caller's own window once
+  the callee returns — revised from this table's original ~2 guess, see
+  §6/§16 item 1) plus table load + `BLX` + return handling; far less for
+  the common
+  `argCount ≤ 1` case, where the shuffle costs nothing at all |
 | `RETURN` | 2 (move return value to `acc` + jump to the shared
   `dispatch_return` routine, §7) |
 
@@ -641,7 +769,9 @@ templated, keeping the emitter itself compact.
 ## Appendix — Worked Example: `leb128_len`
 
 Hand-translation of isa-core.md's own worked example (its Appendix),
-`arg_count = 1` (`r0 = v`). Frame-relative `tos` starts at 1 (isa-core.md
+`arg_count = 1` (isa-core's own abstract `r0 = v` — §3's naming-collision
+note applies: this is *not* the physical ARM `r0` the code below assigns
+to `acc`). Frame-relative `tos` starts at 1 (isa-core.md
 §2.5) and — since this bytecode contains no `PUSH`/`POP` at all — never
 moves for the whole procedure body. So per §5's formula, `phys(0) = r4`
 (`v`) and `phys(1) = r5` (`n`) are fixed for the entire body: no window
@@ -658,8 +788,8 @@ subtracting one class of the naive translation's waste, land at 21, 16,
 **Tier 0 — no fusion at all.** Not worth a full listing, but worth stating
 precisely as the honest baseline everything else is measured against:
 materializing `GE_U #0x80`'s result as a real 0/1 costs `CMP` / `BHS .t` /
-`MOVS r3,#0` / `B .d` / `.t: MOVS r3,#1` / `.d:` (5 instructions) followed
-by a *separate* `CMP r3,#0` / `BEQ L_exit` to actually branch on it (2
+`MOVS r0,#0` / `B .d` / `.t: MOVS r0,#1` / `.d:` (5 instructions) followed
+by a *separate* `CMP r0,#0` / `BEQ L_exit` to actually branch on it (2
 more) — 7 instructions where §10.1's branch-fusion takes 2, and every
 other bytecode op translates one-for-one with no folding at all. Total: 21
 instructions (42 bytes) — prologue (1) plus 20 for the 14 bytecode ops
@@ -672,30 +802,30 @@ axis):
 
 ```
                                     ; --- prologue (§6) — not in the bytecode ---
-        MOVS  r4, r3                ; v's home (r4) = incoming last arg (acc)
+        MOVS  r4, r0                ; v's home (r4) = incoming last arg (acc)
 
                                     ; CONST #1 ; STORE 1
-        MOVS  r3, #1                ; acc = 1
-        MOVS  r5, r3                ; n (r5) = acc
+        MOVS  r0, #1                ; acc = 1
+        MOVS  r5, r0                ; n (r5) = acc
 
 L_cond:                             ; LOOP condition block
-        MOVS  r3, r4                ; LOAD 0: acc = v
-        CMP   r3, #0x80             ; GE_U #0x80 — fused (§10.1) with the
+        MOVS  r0, r4                ; LOAD 0: acc = v
+        CMP   r0, #0x80             ; GE_U #0x80 — fused (§10.1) with the
         BLO   L_exit                ; BLOCK_END below: v<0x80 (GE_U false) → exit
 
 L_body:                             ; LOOP body block — falls through, no branch needed
-        MOVS  r3, r4                ; LOAD 0: acc = v
-        LSRS  r3, r3, #7            ; SHR #7: acc = v >> 7 (imm fits directly, §4.1 IMM_EXT)
-        MOVS  r4, r3                ; STORE 0: v = acc
-        MOVS  r3, #1                ; CONST #1
-        ADDS  r3, r3, r5            ; ADD 1: acc = 1 + n
-        MOVS  r5, r3                ; STORE 1: n = acc
+        MOVS  r0, r4                ; LOAD 0: acc = v
+        LSRS  r0, r0, #7            ; SHR #7: acc = v >> 7 (imm fits directly, §4.1 IMM_EXT)
+        MOVS  r4, r0                ; STORE 0: v = acc
+        MOVS  r0, #1                ; CONST #1
+        ADDS  r0, r0, r5            ; ADD 1: acc = 1 + n
+        MOVS  r5, r0                ; STORE 1: n = acc
         B     L_cond                ; BLOCK_END: back-edge
 
 L_exit:
-        MOVS  r3, r5                ; LOAD 1: acc = n (return value)
-        LDR   r0, [r9, #dispatch_return_off]  ; RETURN (§7): reserved slot,
-        BX    r0                              ; same table-base reg as CALL (§9)
+        MOVS  r0, r5                ; LOAD 1: acc = n (return value)
+        LDR   r1, [r9, #dispatch_return_off]  ; RETURN (§7): reserved slot,
+        BX    r1                              ; same table-base reg as CALL (§9)
 ```
 
 16 native instructions (32 bytes) + one 4-byte reserved-slot reference
@@ -710,33 +840,33 @@ producer's result redirected into a following `STORE` instead of a copy):
 
 ```
                                     ; --- prologue (§6) — not in the bytecode ---
-        MOVS  r4, r3                ; v's home (r4) = incoming last arg (acc)
+        MOVS  r4, r0                ; v's home (r4) = incoming last arg (acc)
 
                                     ; CONST #1 ; STORE 1 — fused
         MOVS  r5, #1                ; n (r5) = 1, directly — no acc round-trip
 
 L_cond:                             ; LOOP condition block
-        MOVS  r3, r4                ; LOAD 0: acc = v
-        CMP   r3, #0x80             ; GE_U #0x80 — fused with the
+        MOVS  r0, r4                ; LOAD 0: acc = v
+        CMP   r0, #0x80             ; GE_U #0x80 — fused with the
         BLO   L_exit                ; BLOCK_END below, as before
 
 L_body:                             ; LOOP body block
-        MOVS  r3, r4                ; LOAD 0: acc = v — stays unfused; its
+        MOVS  r0, r4                ; LOAD 0: acc = v — stays unfused; its
                                     ; own consumer (SHR) isn't a STORE
                                     ; SHR #7 ; STORE 0 — fused
-        LSRS  r4, r3, #7            ; v (r4) = v >> 7, directly
+        LSRS  r4, r0, #7            ; v (r4) = v >> 7, directly
 
-        MOVS  r3, #1                ; CONST #1 — stays unfused; its own
+        MOVS  r0, #1                ; CONST #1 — stays unfused; its own
                                     ; consumer (ADD) isn't a STORE either
                                     ; ADD 1 ; STORE 1 — fused
-        ADDS  r5, r3, r5            ; n (r5) = 1 + n, directly
+        ADDS  r5, r0, r5            ; n (r5) = 1 + n, directly
         B     L_cond                ; BLOCK_END: back-edge
 
 L_exit:
-        MOVS  r3, r5                ; LOAD 1: acc = n — stays unfused;
-                                    ; RETURN's ABI needs the value in r3
-        LDR   r0, [r9, #dispatch_return_off]  ; RETURN (§7), unchanged
-        BX    r0
+        MOVS  r0, r5                ; LOAD 1: acc = n — stays unfused;
+                                    ; RETURN's ABI needs the value in r0
+        LDR   r1, [r9, #dispatch_return_off]  ; RETURN (§7), unchanged
+        BX    r1
 ```
 
 13 native instructions (26 bytes) — already *below* the bytecode's own 14
@@ -748,11 +878,11 @@ tier 3 picks up.
 
 **Tier 3 — the full §10.1 state machine** (operand-fold joins
 destination-fold — every `LOAD`'s `PENDING(Reg(...))` now gets folded
-forward into whatever reads it, instead of being flushed into `r3` first):
+forward into whatever reads it, instead of being flushed into `r0` first):
 
 ```
                                     ; --- prologue (§6) — not in the bytecode ---
-        MOVS  r4, r3                ; v's home (r4) = incoming last arg (acc)
+        MOVS  r4, r0                ; v's home (r4) = incoming last arg (acc)
 
                                     ; CONST #1 ; STORE 1 — fused (dest-fold)
         MOVS  r5, #1                ; n (r5) = 1, directly
@@ -762,7 +892,7 @@ L_cond:                             ; LOOP condition block
                                     ; three fused: LOAD → PENDING(Reg(r4)),
                                     ; folded as CMP's left operand, then
                                     ; branch-fused as before — v never
-                                    ; touches r3 at all
+                                    ; touches r0 at all
         CMP   r4, #0x80
         BLO   L_exit
 
@@ -786,11 +916,11 @@ L_body:                             ; LOOP body block
 L_exit:
                                     ; LOAD 1 — PENDING(Reg(r5)), but
                                     ; RETURN's ABI needs the value
-                                    ; specifically in r3 (§7/§9, not a
+                                    ; specifically in r0 (§7/§9, not a
                                     ; foldable destination) — flush
-        MOVS  r3, r5
-        LDR   r0, [r9, #dispatch_return_off]  ; RETURN (§7), unchanged
-        BX    r0
+        MOVS  r0, r5
+        LDR   r1, [r9, #dispatch_return_off]  ; RETURN (§7), unchanged
+        BX    r1
 ```
 
 10 native instructions (20 bytes) — *smaller*, by both measures, than the
@@ -815,9 +945,43 @@ three is the next thing worth hand-translating.
 
 ## 16. Open questions / risks
 
-1. **§6's shuffle bound** — "three push/pop-multiple instructions cover any
-   shuffle" needs a real case-by-case derivation, not just the plausibility
-   argument given here. Worth prototyping before anything else in this doc.
+1. **§6's shuffle bound — resolved, prototyped.** Not "3 push/pop-multiple
+   instructions" as guessed, but not simply "wrong" either — real hardware
+   `PUSH`/`POP` takes an arbitrary register-list mask (not required to be
+   contiguous), and that mask means two genuinely different things for two
+   genuinely different consumers here. The caller's own non-argument
+   locals (if any) only ever need to come back into their *own* registers
+   unchanged, so a `PUSH{whatever mask}` followed, later, by a `POP{that
+   identical mask}` restores them correctly regardless of `k` or wrap —
+   hardware's own inverse guarantee, not a "natural order" argument at
+   all: **one** `PUSH` to spill them, **one** mirrored `POP` to bring them
+   back. The stack-passed args are a real remap (into the callee's own
+   canonical registers, not their own), which is where "ascending register
+   ⟺ ascending address" actually bites: at most 2 `PUSH`es (push the
+   larger-arg/post-wrap run first, the smaller-arg/pre-wrap run second, so
+   `arg0` lands closest to `sp`), one combined `POP` to fill the callee.
+   Net: `1 + ≤2` to spill, `1` to fill, `1 + ≤4` to reload the caller's own
+   window after the callee returns (the `≤4` part is whatever's genuinely
+   deeper than the leftover range — spilled long before this call, with no
+   single `PUSH` to mirror, so that part alone stays individual) —
+   correct unconditionally, and cheaper whenever fewer slots are actually
+   live or fewer args are stack-passed.
+   Also surfaced, only once a real multi-argument `CALL` existed to expose
+   them: a procedure containing its own `CALL` must save/restore its own
+   `lr` around it (§6's shuffle discussion said nothing about this); the
+   callee-side prologue's target register was `phys(0)` instead of
+   `phys(argCount-1)` (indistinguishable in every single-argument-only
+   test that existed before this); and `sp` needs to be a genuinely
+   moving stack pointer, not a fixed per-procedure reservation, to match
+   §8.3's own max-based (not sum-based) whole-program sizing — see §6's
+   own note on all three. Implemented in `jit-armv6m/prototype`
+   (`window.ts`'s `spillForCall`/`fillCalleeArgs`/`reloadAfterCall`,
+   `translateProc.ts`'s `CALL` case, `program.ts`'s whole-program linking)
+   and verified on real `qemu-system-arm` by `test/call.test.ts`, including
+   the case this item's own worry is actually about: a phase-misaligned
+   shuffle (args landing at a non-zero window phase) with non-argument
+   locals resident in the same 4-register window that must survive the
+   call untouched.
 2. **`validateProgram` max-call-depth** — not yet exposed (§2); needed to
    size the return-address stack from real data instead of a guess.
 3. **Compaction vs. fixed helper calls** (§11) — per-call-site literal-pool
@@ -829,16 +993,22 @@ three is the next thing worth hand-translating.
 4. **Thumb-bit hygiene** — every dispatch-table code pointer must have bit
    0 set (`BX`/`BLX` requirement); easy to get wrong once pointers are
    computed rather than link-time constants.
-5. **No prototype yet, and one example isn't enough** — the Appendix's
-   hand-translation of isa-core.md's `leb128_len` confirms §5's window
-   formula and §10.1's fusion state machine (all three axes — see the
-   Appendix's tier 3) plus §7's cheap `RETURN` path, but it's a leaf
-   procedure with no `CALL` and a `tos` that never moves — it validates
-   none of §6's shuffle, §8's pinning, §5's spill/fill across the
-   4-register boundary, or §10.1's rotation-eviction fallback. A second
-   worked example that actually calls another procedure and pushes past 4
-   live values is the next real signal to get, before §6's open
-   shuffle-bound question (item 1) can be settled with any confidence.
+5. **Partially resolved.** The Appendix's hand-translation of isa-core.md's
+   `leb128_len` confirms §5's window formula and §10.1's fusion state
+   machine (all three axes — see the Appendix's tier 3) plus §7's cheap
+   `RETURN` path, but it's a leaf procedure with no `CALL` and a `tos`
+   that never moves. `jit-armv6m/prototype/test/call.test.ts` is the
+   second worked example this item asked for — a real `CALL` (3
+   arguments, 2 stack-passed) with a deliberately phase-misaligned window
+   and non-argument locals resident alongside the args, verified on real
+   `qemu-system-arm` — and it's what let item 1's shuffle-bound question
+   actually get settled (see item 1). Still not covered by any prototype:
+   §8's pinning and §9's dispatch table/eviction (this prototype
+   deliberately has neither — see jit-armv6m/prototype's own scope notes,
+   `translateProc.ts`'s header), and §10.1's rotation-eviction fallback
+   specifically (the corpus so far, this `CALL` test included, has never
+   hit the "fused result's own register gets evicted by rotation before
+   its next read" case — it's still exactly as rare as §10.1 predicted).
 6. **§10.1's `CLEAN`/`PENDING` state machine is reasoned, not implemented
    or tested** — the soundness argument rests on "every op either
    overwrites `acc`, is a pure capture (`STORE`/`PUSH`), or is a

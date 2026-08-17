@@ -41,6 +41,15 @@ export const SensorReading = named("SensorReading", struct({
 /** Unit-of-measure codes (temperature scale, pressure units, etc.). */
 export const UnitCode = named("UnitCode", integer(0, 255))
 
+/** Raw signed 16-bit PCM-style acoustic sample. */
+export const AcousticSample = named("AcousticSample", integer(-32768, 32767))
+
+/** A burst of raw acoustic samples — a `List<Integer>` field, unlike
+ *  `readings` (a list of structs): this is the one shape that compiles to
+ *  bulk `WRITE_SEQ`/`READ_SEQ` wire transfer instead of a per-element
+ *  procedure call. */
+export const AcousticBurst = named("AcousticBurst", list(AcousticSample, 32))
+
 // ——————————————————————————————————————————————
 // Top-level packet
 // ——————————————————————————————————————————————
@@ -48,12 +57,14 @@ export const UnitCode = named("UnitCode", integer(0, 255))
 /**
  * Telemetry packet sent from an environmental monitor to a gateway.
  *
- * Contains device identity, a timestamp, up to 16 sensor readings,
- * and a 16-bit status bitfield for alarms / flags.
+ * Contains device identity, a timestamp, up to 16 sensor readings, a
+ * burst of raw acoustic samples, and a 16-bit status bitfield for
+ * alarms / flags.
  */
 export const TelemetryPacket = named("TelemetryPacket", struct({
     deviceId:  DeviceID,
     timestamp: Timestamp,
     readings:  list(SensorReading, 16),
+    acoustic:  AcousticBurst,
     status:    integer(0, 0xFFFF),     // u16 bitfield
 }))

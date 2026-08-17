@@ -58,11 +58,12 @@ import { createResolver } from "@ppl/core"
  *
  * `finishStruct`/`finishUnion`/`finishList` are decode-only: they convert
  * a plain, uniform, codegen-internal accumulator (`{}`/`{variant,value}`/
- * a growable array — never itself representation-specific) into whatever
- * this rule's own chosen host shape actually is, at the one point a
- * decoded value is about to cross a procedure boundary. Encode never
- * builds a value of its own type at all — it only ever reads *from* an
- * already-finished incoming one via `readField`/`activeVariantName`/
+ * a growable array — never itself representation-specific, unless a rule
+ * opts in via `beginStruct`/`setField`/`beginList`/`appendElement` below)
+ * into whatever this rule's own chosen host shape actually is, at the one
+ * point a decoded value is about to cross a procedure boundary. Encode
+ * never builds a value of its own type at all — it only ever reads *from*
+ * an already-finished incoming one via `readField`/`activeVariantName`/
  * `activeVariantPayload`/`count`/`elementAt`.
  */
 export type Accessor =
@@ -79,7 +80,19 @@ export type Accessor =
         readonly unitValue: () => string }
     | { readonly kind: "struct"
         readonly finishStruct: (plainObjExpr: string) => string
-        readonly readField: (finishedValueExpr: string, field: string) => string }
+        readonly readField: (finishedValueExpr: string, field: string) => string
+        /** Optional: how to create this struct's own in-progress decode
+         *  accumulator, and how to write one field into it. Defaults to a
+         *  bare object literal and direct property assignment if omitted
+         *  — every existing rule relies on that default. A rule
+         *  overriding one of these should almost always override the
+         *  other too (they describe the same accumulator shape). Never
+         *  itself recursive, same as the rest of `Accessor` (see this
+         *  type's own header comment) — this is what lets a rule build
+         *  its own *real* representation incrementally instead of only
+         *  ever converting a disposable plain object at `finishStruct`. */
+        readonly beginStruct?: () => string
+        readonly setField?: (accExpr: string, field: string, valueExpr: string) => string }
     | { readonly kind: "union"
         /** `variant` is always a compile-time-known literal name (`ref`
          *  resolves against the image tree's own declared variant list,
@@ -115,7 +128,14 @@ export type Accessor =
         readonly bulk?: {
             readonly writeSeq: (finishedValueExpr: string, iterExpr: string, widthExpr: string, countExpr: string) => string
             readonly readSeq: (accumulatorExpr: string, iterExpr: string, widthExpr: string, signedExpr: string, countExpr: string) => string
-        } }
+        }
+        /** Optional: how to create this list's own in-progress decode
+         *  accumulator, and how to append one element to it. Defaults to
+         *  a bare array literal and `.push` if omitted — every existing
+         *  rule relies on that default. Same rationale as `beginStruct`/
+         *  `setField` above. */
+        readonly beginList?: () => string
+        readonly appendElement?: (accExpr: string, valueExpr: string) => string }
 
 /** The capability every TS rule produces — parallels `codecRule`'s own
  *  `Procedure`, but a plain data record instead of a machine artifact. */

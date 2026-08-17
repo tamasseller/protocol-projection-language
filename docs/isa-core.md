@@ -87,7 +87,10 @@ is no indirect call.
 Because TOS indexes the register file directly, a pushed value can later
 be read by its register index once the backend allocates one, and a
 register can be pushed/popped/peeked if it sits at the current TOS. TOS is
-per-frame: every invocation gets its own entry point (§2.5).
+per-frame: every invocation gets its own entry point (§2.5). A register is
+only valid to reference by index — outside of push/pop/peek — once TOS has
+grown past it; this is a checked static guarantee (§8.6), not just a
+convention.
 
 ### 2.5 Frames
 
@@ -556,6 +559,30 @@ stack). Every `BR_TABLE` opener must have exactly `N` case-closers; every `LOOP`
 must have exactly two sub-block closers, the first always `BLOCK_END`, the
 second either `BLOCK_END` or a terminator. Every `BLOCK_END` must close
 some open block.
+
+### 8.6 Register liveness
+
+A register index is only valid to reference — via `LOAD`, `STORE`, or the
+`REG_ACC`/`REG_REG` combo's own register operand — once TOS has grown past
+it: `target < tos` at that instruction, where `tos` includes both the
+frame's `arg_count` initial slots (always valid from a procedure's own
+entry) and whatever `PUSH`es have run since. This is *not* implied by
+§8.1's TOS balance (which only bounds `PUSH`/`POP`/peek/pop-combo/`CALL`
+against a block's own entry depth, never a `LOAD`/`STORE`/register-combo's
+own operand) — it is checked independently, and violating it is a
+validation error, not merely undefined runtime behavior: a register a
+`PUSH` never established has no value to read and no reason to be
+writable.
+
+This closes a gap real backends were already relying on without it being
+checked: a physical-register-window backend (e.g. the ARMv6-M JIT,
+jit-armv6m.md §5) derives a register's *entire* physical location —
+in-window or spilled, and if spilled, at what address — purely from how
+far TOS has grown past it. A register no `PUSH` ever covered has no
+derivable location at all; before this guarantee such a program would
+still validate and run (via the reference interpreter's own defensive
+fallback for reading an unwritten slot), only to be untranslatable by that
+class of backend with no diagnostic pointing at why.
 
 ---
 

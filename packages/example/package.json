@@ -6,7 +6,8 @@
   "scripts": {
     "build": "tsc",
     "test": "ts-node --project tsconfig.test.json test/run.ts",
-    "test:types": "tsc --project tsconfig.test.json --noEmit"
+    "test:types": "tsc --project tsconfig.test.json --noEmit",
+    "generate": "ts-node --project tsconfig.test.json src/generate.ts"
   },
   "dependencies": {
     "@ppl/core": "*",

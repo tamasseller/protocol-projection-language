@@ -61,6 +61,13 @@ test("c-target: TelemetryPacket has readings as fixed array + count", () =>
     assert.ok(decl.includes("uint8_t readings_count;"), "missing readings count")
 })
 
+test("c-target: TelemetryPacket has acoustic as a fixed int16_t array + count", () =>
+{
+    const decl = result.get(g.root.id)!.decl!
+    assert.ok(decl.includes("acoustic[32];"), "missing acoustic array")
+    assert.ok(decl.includes("acoustic_count;"), "missing acoustic count")
+})
+
 test("c-target: TelemetryPacket has status as uint16_t", () =>
 {
     assert.ok(result.get(g.root.id)!.decl!.includes("uint16_t status;"))

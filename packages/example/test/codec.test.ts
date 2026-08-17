@@ -26,11 +26,13 @@ test("codec: encodes to a plausible byte count for this schema", () =>
 {
     // deviceId(4) + timestamp(secs4+nanos4=8) + readings: 1 count-prefix
     // byte + 2 elements * (1 hoisted-tag bitmap byte + value:i16(2) +
-    // unit:u8(1)) = 1+8=9 + status(2) = 23 total. The interesting part
-    // isn't the exact number so much as it being *smaller* than a naive
-    // per-field-tag-byte encoding would be (25, one extra byte per
-    // reading) — proof the hoisting optimization actually fired.
-    assert.equal(encodedSample.length, 23)
+    // unit:u8(1)) = 1+8=9 + status(2) = 23 (the interesting part isn't
+    // the exact number so much as it being *smaller* than a naive per-
+    // field-tag-byte encoding would be — 25, one extra byte per reading —
+    // proof the hoisting optimization actually fired). acoustic adds bulk
+    // WRITE_SEQ transfer on top: 1 count-prefix byte + 3 samples * 2
+    // bytes = 7. 23 + 7 = 30 total.
+    assert.equal(encodedSample.length, 30)
 })
 
 test("codec: round-trips the sample packet exactly", () =>
@@ -46,12 +48,13 @@ test("codec: round-trips an empty readings list and every SensorKind variant", (
             deviceId: 1,
             timestamp: {secs: 0, nanos: 0},
             readings: [{sensor: {variant: kind, value: undefined}, value: -1, unit: 0}],
+            acoustic: [-32768, 0, 32767],
             status: 0xFFFF,
         }
         assert.deepEqual(decodeTelemetryPacket(encodeTelemetryPacket(packet)), packet)
     }
 
-    const empty = {deviceId: 0, timestamp: {secs: 0, nanos: 0}, readings: [], status: 0}
+    const empty = {deviceId: 0, timestamp: {secs: 0, nanos: 0}, readings: [], acoustic: [], status: 0}
     assert.deepEqual(decodeTelemetryPacket(encodeTelemetryPacket(empty)), empty)
 })
 

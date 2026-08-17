@@ -185,7 +185,8 @@ function runProc<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E
         {
             case "REG_ACC":
             case "REG_REG":
-                return regs[i.target] ?? 0
+                assert.ok(i.target < tos, `${i.op} ${i.combo}: register ${i.target} not below current TOS (${tos})`)
+                return regs[i.target]!
             case "IMM_ACC":
                 return i.imm
             case "PEEK_PEEK":
@@ -206,6 +207,7 @@ function runProc<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E
             case "REG_ACC": case "IMM_ACC": case "POP_ACC":
                 acc = v; break
             case "REG_REG":
+                assert.ok(i.target < tos, `${i.op} ${i.combo}: register ${i.target} not below current TOS (${tos})`)
                 regs[i.target] = v; break
             case "PEEK_PEEK":
                 regs[tos - 1] = v; break
@@ -222,11 +224,13 @@ function runProc<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E
         switch(i.op)
         {
             case "LOAD":
-                acc = regs[i.target] ?? 0
+                assert.ok(i.target < tos, `LOAD: register ${i.target} not below current TOS (${tos})`)
+                acc = regs[i.target]!
                 pc++
                 break
 
             case "STORE":
+                assert.ok(i.target < tos, `STORE: register ${i.target} not below current TOS (${tos})`)
                 regs[i.target] = acc
                 pc++
                 break

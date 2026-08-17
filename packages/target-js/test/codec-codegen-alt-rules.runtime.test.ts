@@ -17,15 +17,15 @@ import { describe, test } from "node:test"
 import * as assert from "node:assert/strict"
 
 import type { SemanticType } from "@ppl/core"
-import { struct, union, list, u8, integer, named, pList, pStar } from "@ppl/core"
-import { buildCodec, binaryEncodeRules, binaryDecodeRules } from "@ppl/codecs"
+import { struct, union, list, u8, integer, named, pList, pStar, pStructFields, child } from "@ppl/core"
+import { buildCodec, binaryEncodeRules, binaryDecodeRules, deltaLeb128EncodeRule, deltaLeb128DecodeRule } from "@ppl/codecs"
 
 import type { TsRule } from "../src/engine/resolver"
 import { tsRule } from "../src/engine/resolver"
 import { tsTypeRules } from "../src/components/ts-emitter"
 import {
     structAsClassRule, unionAsClassHierarchyRule, byteListAsUint8ArrayRule, bigIntEscalationRules,
-    capacityOneListAsOptionalRule,
+    capacityOneListAsOptionalRule, int16ListAsInt16ArrayRule,
 } from "../src/components/ts-alternative-rules"
 import { generateCodecModule } from "../src/engine/codec-module"
 import { loadGenerated } from "./load-generated"
@@ -148,5 +148,129 @@ describe("codec-codegen — alternative representations actually round-trip thro
             () => loadCompiled(T, "Samples", [noBulkListRule, ...tsTypeRules]),
             /no bulk sequential-transfer support/,
         )
+    })
+
+    test("beginStruct/setField: decode can build its own real representation incrementally, with no separate finishStruct conversion", () =>
+    {
+        // Something the plain-accumulator default can't express: `finishStruct`
+        // here is the identity — decode's own accumulator *is* the rule's real
+        // representation the whole time, built up field by field via a real
+        // (mutating) instance rather than a disposable plain object only
+        // converted to the real shape at the very end.
+        const mutablePointRule: TsRule = tsRule(pStructFields(pStar()),
+            () => "MutablePoint",
+            (match, _node, resolve) =>
+            {
+                const fieldLines = match.fieldMatches.map(f => `  ${f.name}: ${resolve(f.type).ref} = undefined as any;`)
+                return { decl: `class MutablePoint {\n${fieldLines.join("\n")}\n}`, deps: [] }
+            },
+            () => ({
+                kind: "struct",
+                finishStruct: x => x,
+                readField: (v, f) => `${v}.${f}`,
+                beginStruct: () => "new MutablePoint()",
+                setField: (acc, f, v) => `${acc}.${f} = ${v}`,
+            }))
+
+        const T = named("Point", struct({ x: u8, y: u8 }))
+        const { encode, decode, mod } = loadCompiled(T, "Point", [mutablePointRule, ...tsTypeRules])
+
+        const decoded = decode(encode({ x: 3, y: 250 }))
+        assert.ok(decoded instanceof mod.MutablePoint, "decoded value isn't an instance of the rule's own class")
+        assert.equal(decoded.x, 3)
+        assert.equal(decoded.y, 250)
+    })
+
+    test("beginList/appendElement: decode can validate each element as it arrives, not just after the fact", () =>
+    {
+        // A plain accumulator can't express "reject this element right now" —
+        // with the default `.push()`, a bad element is only ever visible
+        // after the whole list finished decoding. `appendElement` lets a rule
+        // own that check at the exact point of construction. Element type is
+        // a struct (not an integer) so the *codec*-rule side picks the
+        // generic per-element list rule (binary-rules.ts's own
+        // `listEncodeRule`/`listDecodeRule`), which drives ENTER_NEXT/
+        // CALL_CODEC_NEXT — never WRITE_SEQ/READ_SEQ's own bulk path (only
+        // ever selected for a plain `List<Integer>`, see this file's own
+        // capacityOneListAsOptionalRule test above), which would bypass
+        // `appendElement` entirely.
+        const noDuplicatesListRule: TsRule = tsRule(pList(pStar()),
+            (match, _node, resolve) => `${resolve(match.elementType).ref}[]`,
+            (_match, node) => ({ deps: [child(node, { element: true })!.id] }),
+            () => ({
+                kind: "list",
+                finishList: x => x,
+                count: v => `${v}.length`,
+                elementAt: (v, i) => `${v}[${i}]`,
+                appendElement: (acc, v) =>
+                    `(${acc}.some((x: any) => JSON.stringify(x) === JSON.stringify(${v})) ? (() => { throw new Error("duplicate element") })() : ${acc}.push(${v}))`,
+            }))
+
+        const T = named("Bag", list(struct({ v: integer(0, 255) }), 4))
+        const { encode, decode } = loadCompiled(T, "Bag", [noDuplicatesListRule, ...tsTypeRules])
+
+        assert.deepEqual(decode(encode([{ v: 1 }, { v: 2 }, { v: 3 }])), [{ v: 1 }, { v: 2 }, { v: 3 }])
+        assert.throws(() => decode(encode([{ v: 1 }, { v: 1 }])), /duplicate element/)
+    })
+
+    test("int16ListAsInt16ArrayRule: bulk WRITE_SEQ/READ_SEQ path is genuinely zero-copy on decode", () =>
+    {
+        // A bare top-level `List<Integer>` puts its 1-byte count prefix
+        // right before the sample data, landing it at an *odd* byte
+        // offset — misaligned for Int16Array (see the next test). One
+        // leading u8 field shifts the count prefix to offset 1 and the
+        // samples to offset 2, so the zero-copy path actually succeeds
+        // here — this is the schema-layout concern int16ListAsInt16ArrayRule's
+        // own doc comment describes, not an accident of this test.
+        const T = named("Padded", struct({ pad: integer(0, 255), samples: list(integer(-32768, 32767), 4) }))
+        const { encode, decode } = loadCompiled(T, "Padded", [int16ListAsInt16ArrayRule, ...tsTypeRules])
+
+        const bytes = encode({ pad: 7, samples: Int16Array.from([1000, -1000, 32767, -32768]) })
+        const decoded = decode(bytes)
+        assert.ok(decoded.samples instanceof Int16Array, "decoded value isn't a real Int16Array")
+        assert.deepEqual(Array.from(decoded.samples), [1000, -1000, 32767, -32768])
+        assert.equal(decoded.samples.buffer, bytes.buffer, "decoded Int16Array doesn't alias the input bytes' own buffer — it was copied, not zero-copy")
+    })
+
+    test("int16ListAsInt16ArrayRule: a misaligned wire position throws rather than silently misbehaving", () =>
+    {
+        // No padding this time — the 1-byte count prefix lands the sample
+        // data at offset 1, which Int16Array's own constructor rejects.
+        const T = named("Samples", list(integer(-32768, 32767), 4))
+        const { encode, decode } = loadCompiled(T, "Samples", [int16ListAsInt16ArrayRule, ...tsTypeRules])
+
+        const bytes = encode(Int16Array.from([1000, -1000, 32767, -32768]))
+        assert.throws(() => decode(bytes), /start offset|BYTES_PER_ELEMENT|multiple/)
+    })
+
+    test("int16ListAsInt16ArrayRule: falls back to per-element access when the codec pairing can't use bulk transfer", () =>
+    {
+        // delta-leb128.ts's own SLEB128 delta coder must read every
+        // element to compute the next delta, so it never emits
+        // WRITE_SEQ/READ_SEQ either — the natural real-world codec
+        // pairing that can't use bulk transfer at all. Its own RTL body
+        // invokes a plain CALL to its synthesized leb128_encode/decode
+        // helper (a GENERIC-ABI procedure, no header) — now a real,
+        // compiled call (raise.ts's own BR_TABLE-arm acc-liveness fix,
+        // plus codec-codegen.ts's GENERIC-ABI generateProcedure branch),
+        // so this exercises both that feature and this rule's own
+        // fallback path together, in place of the hand-rolled substitute
+        // rule pair this test used before CALL support existed.
+        const T = named("Samples", list(integer(-32768, 32767), 8))
+        const encodeProgram = buildCodec(T, [deltaLeb128EncodeRule], undefined)
+        const decodeProgram = buildCodec(T, [deltaLeb128DecodeRule], undefined)
+        const source = generateCodecModule({ name: "Samples", rootType: T, encodeProgram, decodeProgram, rules: [int16ListAsInt16ArrayRule, ...tsTypeRules] })
+        const mod = loadGenerated(source)
+
+        // RUNTIME_IMPORTS always lists writeSeqRaw/readSeqView regardless
+        // of use (codec-module.ts's own fixed import list) — check for an
+        // actual call, not just the harmless unused import line.
+        assert.ok(!source.includes("writeSeqRaw(ctx") && !source.includes("readSeqView(ctx"), "this pairing should never reach the bulk path at all")
+
+        const values = [1000, -1000, 32767, -32768, 0, 1, -1, 500]
+        const bytes = mod.encodeSamples(Int16Array.from(values))
+        const decoded = mod.decodeSamples(bytes)
+        assert.ok(decoded instanceof Int16Array, "decoded value isn't a real Int16Array")
+        assert.deepEqual(Array.from(decoded), values)
     })
 })

@@ -12,7 +12,7 @@ import { describe, test } from "node:test"
 import assert from "node:assert/strict"
 
 import { list, u8, union, unit, buildTypeGraph } from "@ppl/core"
-import { bare, brTable, CONST, STORE, LOAD, opImm, validateProgram, run } from "@ppl/machine"
+import { bare, brTable, CONST, STORE, LOAD, PUSH, opImm, validateProgram, run } from "@ppl/machine"
 import { callCodecInstr, callCodecNextInstr, countInstr, loadValInstr, openListInstr, readInstr, storeValInstr, tagInstr, writeInstr } from "../src/engine/codec-ext-instr"
 import type { CodecExtInstr } from "../src/engine/codec-ext-instr"
 import type { RtlProgram, RtlInstr } from "@ppl/machine"
@@ -35,9 +35,14 @@ describe("codec extension — list of u8 (COUNT/OPEN_LIST/ENTER_NEXT/CALL_CODEC_
     // §8.6, not a general list-walk requirement).
     function listCodecBody(direction: "encode" | "decode"): RtlInstr<CodecExtInstr>[]
     {
+        // countInstr/readInstr leave their result in acc, never in a
+        // register directly — PUSH is what actually establishes register 0
+        // as a real, TOS-covered local (isa-core.md's "register only
+        // becomes live once TOS grows past it" convention); a bare STORE(0)
+        // with tos still 0 would target a register no PUSH ever created.
         const prelude: RtlInstr<CodecExtInstr>[] = direction === "encode"
-            ? [countInstr(0), STORE(0), writeInstr(0, 1)]
-            : [readInstr(0, 1), STORE(0), openListInstr(0)]
+            ? [countInstr(0), PUSH(), writeInstr(0, 1)]
+            : [readInstr(0, 1), PUSH(), openListInstr(0)]
 
         return [
             ...prelude,

@@ -388,7 +388,14 @@ class Raiser<E extends { ext: string } = ExtOpPayload>
                     const n = i.imm
                     const prev = this.acc
                     if(!prev) throw new Error(`raise: BR_TABLE with no acc value at pc ${this.pc}`)
-                    this.acc = undefined
+                    // unknownAcc(), not undefined: an arm's own body may
+                    // open with a bare RETURN/TRAP reading whatever's "in
+                    // acc" with nothing else setting it first (e.g.
+                    // delta-leb128.ts's `if (left == 0) { return; }`) — the
+                    // same "can't track across a branch, but known
+                    // meaningless" case unknownAcc()'s own doc comment
+                    // describes, not a real crash-worthy state.
+                    this.acc = this.unknownAcc()
                     this.pc++
 
                     const cases: Stmt<E>[][] = []
@@ -414,7 +421,9 @@ class Raiser<E extends { ext: string } = ExtOpPayload>
 
                     const {stmts: condStmts, trailing} = this.withBlock(() => this.blockBody())
                     if(!trailing) throw new Error(`raise: LOOP condition block left no test value at pc ${this.pc}`)
-                    this.acc = undefined
+                    // Same reasoning as BR_TABLE's own case above: the loop
+                    // body may open with a bare RETURN/TRAP.
+                    this.acc = this.unknownAcc()
 
                     const body = this.withBlock(() => this.closedBlock())
 
