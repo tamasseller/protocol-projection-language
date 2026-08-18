@@ -392,6 +392,13 @@ evicted from the arena while the callee was running. The call stack
 therefore stores `(proc_idx, offset)`, not a raw code address — `offset`
 is a native-code offset relative to the caller's compiled procedure start.
 
+That record is pushed by the caller's own `CALL`-site code, unconditionally,
+before the table-slot `BLX` (§9) — not something installed only once it's
+known whether the callee needed compiling. `BLX` also sets the hardware
+`lr` as an unrelated side effect, but that register is transient/`BLX`-
+scoped only (§3) and plays no part in this — the real return path is this
+software stack, start to finish.
+
 This is only stable across eviction+recompile because of §6's
 canonical-phase invariant: translation is a pure function of `(proc_idx,
 bytecode)` alone, so recompiling the same procedure reproduces the same
@@ -443,6 +450,24 @@ that compiles the procedure on demand, updates the slot, and falls through
 into the freshly compiled code. Standard lazy-compilation pattern (same
 shape as a JIT's "compile on first call" stub, or a classic overlay
 linker's load-on-demand stub).
+
+**This has one implication for `CALL`'s own compiled sequence that §7
+relies on but doesn't state there: the return-address-stack push (§7's
+`(proc_idx, offset)` record) has to be part of `CALL`'s own inline code,
+executed unconditionally before the table-slot load and `BLX` above — not
+something deferred to whichever path turns out to run.** The call site has
+no way to know in advance which of the two branches (already-compiled vs.
+trampoline-compiled, possibly with an eviction+compaction cycle nested
+inside it — §2, §16 item 7) it's about to take, since that's decided
+entirely by whatever the table slot currently holds, not by anything the
+caller's own code inspects. By the time either path is actually running,
+control has already left the caller; there's no later point at which the
+bookkeeping needed for a correct eventual return could still be installed.
+Both values pushed are compile-time constants at the point the translator
+emits this `CALL` — the caller's own `proc_idx` and the native offset of
+the instruction right after this `BLX`, within the caller's own
+about-to-be-fully-emitted code — so the push costs a couple of
+immediate-loads, not a computation.
 
 ---
 
@@ -1255,3 +1280,14 @@ than by hand-translation — see §16 items 5/6.
    unchanged (exactly one procedure — the current call chain's top — is
    ever unevictable, so the true floor is that pinned caller's code plus
    whatever the one in-progress callee needs, not literally nothing else).
+8. **`CALL`'s return-stack push must be unconditional — resolved by
+   derivation, not yet built.** Reasoned through, not yet exercised in
+   `jit-armv6m/prototype` (which has neither a dispatch table nor eviction
+   — program.ts's own scope note): since `CALL`'s compiled form is one
+   fixed sequence regardless of whether the table slot holds real code or
+   triggers the trampoline (§9), and the caller's own code never branches
+   on which, the `(proc_idx, offset)` return record (§7) has to be pushed
+   unconditionally as part of that same fixed sequence, strictly before
+   the table-slot `BLX` — there's no later point, once control has left
+   the caller, at which it could still be installed only on the slow path.
+   §7/§9 now cross-reference this explicitly.
