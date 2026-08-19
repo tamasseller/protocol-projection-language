@@ -55,27 +55,69 @@ constant, needs that field added first.
 The arena is a pure bump allocator (single high-water pointer) between two
 phases: alloc-only until exhausted, then evict-LRU-and-compact (§9).
 
-**The block-nesting stack — one record per currently-open `BR_TABLE`/`LOOP`
-in whichever procedure is presently being translated (§10, §16 item 7) — is
-not one of the fixed regions above; it shares the arena itself, growing
-from the opposite end.** Compiled code bump-allocates upward from the
-arena's low address (as above); block-nesting records bump-allocate
-downward from its high address. Neither gets an independent worst-case
-reservation — the two meet wherever they meet, bounded only by how much of
-each the procedure actually being translated needs, strictly tighter than
-sizing either side from a fixed constant. When they meet, that's the same
-trigger §9's evict-LRU-and-compact phase already exists for, just measuring
-a different sum (code so far + open block records, not code alone) — see
-§11 for what compaction additionally has to cover here, and §12 for the
-failure path once nothing more is evictable.
+**Revised, more generally than first framed (§16 item 9): every region
+above except the arena is really one shared region with it, not a separate
+reservation.** ARMv6-M's stack descends while executing code advances
+upward — the geometry that makes this work at all. `enter_program`, the C
+entry point the host calls to run a program (never returning until it
+terminates), computes a hard ceiling for compiled code once, at entry:
+`codeLimit = SP(at entry) − (worst-case operand stack + control stack +
+dispatch table + worst-case helper-call stack depth)`. Every term on the
+right is a static figure (§8.3's `totalDepth`, `proc_count`/max-call-depth,
+and whatever bound §3 requires of every helper) — so ordinary code growth
+needs no runtime check against the stack side at all; the reservation
+already makes a collision impossible by construction. Hitting `codeLimit`
+is the same evict-LRU-and-compact trigger §9 already has, just anchored to
+a precomputed line instead of a detected collision.
 
-Only sound because nothing a block record holds can be an absolute arena
-address — every offset inside one (a jump-table base, a pending branch
-fixup) has to be relative to the current procedure's own start, the same
-position-independence §11 already requires of every emitted instruction.
-Given that, compaction sliding the code region never invalidates anything a
-still-open block record points at; the records themselves never move and
-never need to.
+The one thing that doesn't fit that static picture is the translator's own
+block-nesting bookkeeping — no static bound on `BR_TABLE`/`LOOP` nesting
+depth exists anywhere in `@ppl/machine` (originally flagged right here, with
+its own dedicated arena-sharing scheme; superseded by this fuller account).
+Rather than reserve anything for it, it's ordinary dynamic stack usage —
+genuine C recursion, or an explicit `alloca`-grown array, coexisting with
+the translator's own C call stack — checked *live* against however much of
+`codeLimit`'s margin remains, since different procedures nest arbitrarily
+differently and there's no single program-wide worst case for it the way
+there is for `totalDepth`. The translator is the one place in this design
+allowed to encroach on `codeLimit` itself, provided it tracks that
+encroachment and fails into `RESOURCE_ERROR` (§12) once there's no room
+left for both the code still to emit and the nesting depth this procedure
+demands. Its own fixed prologue footprint — paid on every entry, before it
+gets a chance to check anything — belongs in the *static* helper-stack term
+above, not this live check; only the depth beyond that floor is
+live-policed.
+
+Only sound because nothing any of this holds — a block-nesting record's
+jump-table base, a pending branch fixup — can be an absolute arena address;
+every offset has to be relative to the current procedure's own start, the
+same position-independence §11 already requires of every emitted
+instruction. Given that, compaction sliding the code region never
+invalidates anything a still-open record points at.
+
+**Interrupt isolation.** Checked against the ARMv6-M exception-entry
+pseudocode directly (ARM DDI 0419E, `PushStack()`/`ExceptionTaken()`), not
+just recalled: the 8-word exception frame (`R0–R3`, `R12`, `LR`, return
+address, `xPSR` — 32 bytes) lands on `SP_process` only if
+`CONTROL.SPSEL=='1' && CurrentMode==Thread` at the instant of the exception;
+entering Handler mode unconditionally clears `SPSEL` to 0. A second,
+higher-priority interrupt preempting an already-running handler necessarily
+fires with `CurrentMode==Handler`, so its own dump always goes to
+`SP_main` regardless of `SPSEL` — nested/tail-chained interrupts can never
+stack more than one frame onto whichever stack Thread-mode code was using.
+So: run in Thread mode on PSP (an explicit `MSR`/`ISB` switch at entry —
+the reset default is MSP), reserve MSP exclusively for Handler mode
+pointed at separate memory, and budget exactly one 32-byte frame into
+`enter_program`'s subtraction — regardless of interrupt priority count or
+nesting depth, only the first Thread→Handler transition can ever touch
+PSP. Register isolation comes for free from AAPCS's own callee-saved
+convention for `r4–r8`/`r10`/`r11` (an interrupt handler is just an
+ordinary AAPCS function); `r9` specifically is AAPCS's *platform*
+register, whose saved-ness is a convention choice rather than a blanket
+guarantee, so whichever design ends up relying on it surviving an
+interrupt (§3's `r8–r11` table base pointers are still generic at this
+point) needs to confirm the build actually treats it as callee-saved, not
+assume it.
 
 ---
 
@@ -87,7 +129,7 @@ never need to.
 | `r4–r7` | TOS window, circularly renamed (§5) |
 | `r1–r3, r12` | scratch — instruction implementation, trampoline argument passing |
 | `r8–r11` | table base pointers (dispatch table, arena/LRU metadata, helper vector — §11) |
-| `sp` | operand/TOS spill stack (§2) — **never** the real C call stack while compiled code runs |
+| `sp` | operand/TOS spill stack (§2) — genuinely the same stack the host used to call into the JIT, not a second one (§2's `enter_program`/`codeLimit` account) |
 | `lr` | transient, `BLX`-scoped only |
 
 `r8–r11` are addressed only via the
@@ -103,20 +145,25 @@ register going in and already the return register coming out, no `MOV` on
 either side. This only pays for arity-1 helpers: this design never holds
 more than one value "hot" in `acc`, so a hypothetical 2-argument helper
 would still need a second operand shuffled from the window/spill stack
-into `r1` regardless of which register hosts `acc`. It also only pays if
-the helper is a true leaf with a zero-byte stack frame: `sp` here is the
-operand spill stack, not a real call stack (see the `sp` row above), sized
-with no slack for a helper's own transient frame — and since `lr` is
-transient/`BLX`-scoped, a helper that itself calls something else has
-nowhere to preserve `lr` but the stack, so "doesn't touch the stack" and
-"is a leaf" are the same requirement here. Two ways to get there: gate the
-helper's translation unit with `-Wstack-usage=0` promoted to a hard error
-(`-Werror=stack-usage=`) — since GCC's only way to preserve `lr` across a
-nested call is pushing it, a 0-byte report transitively proves leaf-ness
-too, not just frame size — or, for something as small as `CLZ`/`REVBITS`,
-hand-write it (`__attribute__((naked))` + inline Thumb), guaranteed by
+into `r1` regardless of which register hosts `acc`. It doesn't require the helper to be a strict leaf, either — an earlier
+version of this section argued it did, on the premise that `sp` (the
+operand spill stack) had no slack for a helper's own transient frame; §2's
+`enter_program`/`codeLimit` account revises that premise, since `sp`
+genuinely is the host's own C stack, with real (if bounded) room below it.
+What's actually required is a *documented, statically-provable* worst-case
+stack cost for the helper — 0 is the simplest, tightest case, and still
+the right target for something as small as `CLZ`/`REVBITS`, via
+`-Wstack-usage=0` promoted to a hard error (`-Werror=stack-usage=`) — since
+GCC's only way to preserve `lr` across a nested call is pushing it, a
+0-byte report transitively proves leaf-ness too, not just frame size — or
+by hand-writing it (`__attribute__((naked))` + inline Thumb), guaranteed by
 construction rather than checked, matching how this project already
-hand-writes its own Thumb encoder rather than trusting a compiler.
+hand-writes its own Thumb encoder rather than trusting a compiler. Any
+other helper only needs its own known bound folded into §2's static
+reservation, not zero specifically; `lr` staying transient/`BLX`-scoped is
+still what a true leaf buys for free (nowhere else to preserve it across a
+nested call otherwise), just no longer a hard requirement for every helper
+this design will ever have.
 **Naming collision to watch for:** isa-core.md's own worked examples use
 `r0`, `r1`, ... as *abstract* frame-relative slot names (`LOAD 0` reads
 frame slot 0) — a different namespace from this section's *physical* ARM
@@ -1280,6 +1327,11 @@ than by hand-translation — see §16 items 5/6.
    unchanged (exactly one procedure — the current call chain's top — is
    ever unevictable, so the true floor is that pinned caller's code plus
    whatever the one in-progress callee needs, not literally nothing else).
+   **Generalized since (item 9):** the same trick — sharing one region
+   with code instead of a separate reservation — turns out to apply to
+   the *whole* stack (operand stack, control stack, dispatch table too),
+   not just this one structure, via a single `enter_program`-computed
+   ceiling rather than a live collision check. See §2's revised account.
 8. **`CALL`'s return-stack push must be unconditional — resolved by
    derivation, not yet built.** Reasoned through, not yet exercised in
    `jit-armv6m/prototype` (which has neither a dispatch table nor eviction
@@ -1291,3 +1343,33 @@ than by hand-translation — see §16 items 5/6.
    the table-slot `BLX` — there's no later point, once control has left
    the caller, at which it could still be installed only on the slow path.
    §7/§9 now cross-reference this explicitly.
+9. **Stack layout unified, and interrupt isolation resolved.** §2's
+   `enter_program`/`codeLimit` account generalizes item 7's arena-sharing
+   trick to the whole work area: every static region (operand stack,
+   control stack, dispatch table) plus the compiled-code arena live in one
+   contiguous, descending-stack region, with a single ceiling computed
+   once at entry rather than any runtime collision check for ordinary
+   code growth. The one exception — the translator's own block-nesting
+   bookkeeping, which item 7 originally gave its own dedicated
+   arena-sharing scheme — turns out not to need one at all: ordinary
+   dynamic stack usage (recursion or `alloca`), checked live against the
+   same ceiling, subsumes it. §3's helper leaf-ness requirement is
+   correspondingly loosened from "must be a true leaf" to "must have a
+   documented, statically-provable stack-usage bound," now that `sp`
+   genuinely has slack rather than none.
+
+   Interrupt handling — flagged nowhere before this — is resolved the same
+   way: checked directly against ARM DDI 0419E's exception-entry
+   pseudocode (not just recalled), a second/nested interrupt can never
+   stack more than one 32-byte frame onto whichever stack Thread-mode
+   code was using, because entering Handler mode unconditionally forces
+   `CONTROL.SPSEL` to select MSP regardless of what it was before.
+   Running the JIT in Thread mode on PSP, with MSP reserved for Handler
+   mode pointed at separate memory, means interrupts of any priority or
+   nesting depth cost exactly one fixed 32-byte line in `enter_program`'s
+   budget — never more. Register isolation is free via AAPCS's
+   callee-saved convention for `r4–r8`/`r10`/`r11`, with one exception
+   worth tracking once register roles are finalized: `r9` is AAPCS's
+   *platform* register, whose saved-ness is a build convention to
+   confirm, not something AAPCS guarantees unconditionally the way it
+   does for the others.
