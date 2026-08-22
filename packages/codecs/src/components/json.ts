@@ -32,7 +32,7 @@
  * `GENERIC`-ABI helper that converts by repeated subtract-largest-
  * fitting-power-of-ten — bounded (≤9 subtractions per digit, 10 digits
  * for a u32) and needs no `DIV`, matching the ISA's deliberate lack of one
- * (ir-engine.md, "No DIV/MOD"). A signed type's negative values are
+ * (isa-rationale.md, "No DIV/MOD"). A signed type's negative values are
  * detected by their sign-extended top bit (`load_val`'s `>>> 0` already
  * sign-extends any negative JS number to the full 32-bit pattern, so this
  * check is uniform regardless of the field's declared width) and negated

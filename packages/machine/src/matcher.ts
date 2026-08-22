@@ -244,7 +244,7 @@ type MatchOfTuple<T extends readonly EastPattern[], E extends { ext: string } = 
 // trigger tiling. A naive "fully tile children, then match the parent
 // against the finished result" scheme would have already collapsed an
 // intermediate node before the parent's pattern ever got to see its raw
-// shape — see docs/ir-engine.md for why this matters.
+// shape — see docs/isa-rationale.md for why this matters.
 export function matchAllEast<P extends EastPattern, E extends { ext: string } = ExtOpPayload>(
     N: EastExpression<E>,
     P: P,

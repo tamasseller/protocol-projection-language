@@ -7,7 +7,7 @@
  * block structure from the flat instruction stream itself. Total over any
  * validated program, for the same reason lower.ts's own output is
  * well-formed to begin with: the ISA forbids goto/arbitrary jumps
- * (ir-engine.md), so every BR_TABLE/LOOP shape corresponds to exactly one
+ * (isa-rationale.md), so every BR_TABLE/LOOP shape corresponds to exactly one
  * dispatch/loop shape here, never an ambiguous one.
  *
  * What a target backend still owns, that this module has no notion of:
@@ -17,7 +17,7 @@
  *
  * Every stack write (a PUSH, or the write side of a register combo) is
  * materialized into its slot immediately rather than forwarded/inlined at
- * its eventual use — see ir-engine.md-adjacent reasoning: a deferred textual
+ * its eventual use — see isa-rationale.md-adjacent reasoning: a deferred textual
  * substitution is only sound if nothing between the write and its use
  * mutates a slot the deferred expression reads, and proving that is a real
  * interference analysis this module doesn't attempt. Materializing every
@@ -89,7 +89,7 @@ export const enum StmtKind
     /** One BR_TABLE, raised whole: `cases.length` arms, selected by
      *  `test === i`; `test >= cases.length` falls through with none taken —
      *  if/if-else/switch are all this same shape at the RTL level
-     *  (ir-engine.md), and nothing here recovers which DSL surface form
+     *  (isa-rationale.md), and nothing here recovers which DSL surface form
      *  produced it (nor does a target backend need to know). A trailing
      *  `default:` clause isn't part of this node: it's un-gated fallthrough
      *  code that already falls out of the enclosing statement list as

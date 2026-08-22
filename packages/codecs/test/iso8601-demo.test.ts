@@ -53,7 +53,7 @@ const iso8601EncodeRule = codecRule(TIMESTAMP_SHAPE, (match, _ctx: void) =>
 
     // Fixed 2-digit zero-padded decimal (0-59) — simpler than
     // json.ts's `emit_decimal` (no variable width, no leading-zero
-    // suppression), still no DIV/MOD (ir-engine.md).
+    // suppression), still no DIV/MOD (isa-rationale.md).
     const emit2 = declareProc(["value"])
     defineProc(emit2, ir`
         u32 tens = 0;

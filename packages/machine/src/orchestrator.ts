@@ -1,7 +1,7 @@
 /**
  * @ppl/machine — Expression tiling orchestrator (bottom-up memoized)
  *
- * Bottom-up rewrite search — see docs/ir-engine.md for why pattern-rewrite
+ * Bottom-up rewrite search — see docs/isa-rationale.md for why pattern-rewrite
  * search is used instead of Sethi-Ullman. `tileNode` recursively computes
  * every viable tiling of an EAST subtree, memoized by node identity so a
  * subtree is only ever tiled once no matter how many rules or ancestors end
@@ -94,7 +94,7 @@ function dominates<E extends { ext: string } = ExtOpPayload>(b: RtlNode<E>, a: R
  * inside a larger tiling can only match or beat the original, never lose
  * to it — the same monotonicity argument optimal bottom-up tree-pattern
  * selection (BURS-style instruction selection) relies on. See
- * docs/ir-engine.md.
+ * docs/isa-rationale.md.
  */
 /**
  * `candidates` may now mix real `RtlNode` tilings with `fold:*`-produced

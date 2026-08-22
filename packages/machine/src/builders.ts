@@ -110,7 +110,7 @@ export function nodeInvariants<E extends { ext: string } = ExtOpPayload>(args: {
     // maxStack: SU weight across the children, then any extra beyond the
     // combo itself. The combo's own tosDelta is never positive (every
     // binary-class combo either writes back in place or pops — see
-    // ir-engine.md, "Every stack-read combo also reclaims its operand"),
+    // isa-rationale.md, "Every stack-read combo also reclaims its operand"),
     // so it can only ever draw down from a peak the children already
     // established, never raise one — no separate term needed for it here.
     let running = 0

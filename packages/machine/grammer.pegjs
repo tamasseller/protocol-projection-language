@@ -41,7 +41,7 @@ Statement
 // another block, or at the top level of a procedure body). Every `Block`
 // reached via `ControlBody` is the immediate body of a branch or loop, so it
 // always has a real RTL block construct (a `BR_TABLE` case or a `LOOP` body
-// block) backing it — see docs/isa-core.md §20.2 and §15.1. A `Block` with
+// block) backing it — see docs/isa-core.md §10.2/§10.3 and §8.1. A `Block` with
 // no such construct behind it would have no `BLOCK_END` to reclaim its
 // locals' TOS depth at, silently corrupting register allocation for any
 // declaration that follows it.

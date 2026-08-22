@@ -46,7 +46,7 @@ export type ImmCombo = "IMM_ACC"
  * Stack-operand combos — no extra field. Only the two that reclaim what
  * they read: peek-and-write-back-in-place, and pop. There is deliberately
  * no peek-without-reclaiming and no push-on-top-of-peek combo — see
- * ir-engine.md, "Every stack-read combo also reclaims its operand".
+ * isa-rationale.md, "Every stack-read combo also reclaims its operand".
  */
 export type StackCombo = "PEEK_PEEK" | "POP_ACC"
 

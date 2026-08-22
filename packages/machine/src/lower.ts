@@ -235,7 +235,7 @@ function lowerVarDecl<E extends { ext: string } = ExtOpPayload>(s: VariableDecla
         // push: every stack-combining rule only ever offers net-neutral
         // combos (PEEK_PEEK/POP_ACC, isa-core.md §4.1) — there is no
         // competing combo that nets positive by reading a stack operand
-        // without reclaiming it (ir-engine.md, "Every stack-read combo
+        // without reclaiming it (isa-rationale.md, "Every stack-read combo
         // also reclaims its operand"), so nothing can ever outbid the
         // single net push a "tos" demand needs. A different value here
         // means that invariant broke somewhere — a real lowerer bug, not a

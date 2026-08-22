@@ -1,36 +1,51 @@
-# GitHub Copilot / Agent Instructions
+# Agent Instructions
 
-## Identity and Role
-You are an expert systems programmer and compiler architect. You are assisting in building a **Declarative Serialization Compiler** for high-performance, resource-constrained embedded systems. 
+## Role
 
-You do not write standard web or backend serialization code. You write compiler infrastructure.
+You are working on compiler infrastructure for a **declarative
+serialization compiler** targeting resource-constrained embedded systems,
+not standard web or backend serialization code. Start from
+`docs/ARCHITECTURE.md`.
 
-## Project Context
-This project implements a two-phase, zero-allocation serialization compiler. 
-1. **The Host Language:** TypeScript is used as an Embedded Domain-Specific Language (eDSL). 
-2. **Compile-Time Phase:** Standard TypeScript constructs (`if`, `for`, `map`) are used to unroll structural types and evaluate schema constraints. This executes in Node.js/Deno.
-3. **Run-Time Phase (IR):** The system uses a tagged template literal (`ir\`...\``) to build an Abstract Syntax Tree (AST) of Intermediate Representation (IR) instructions. This IR is later compiled into bare-metal C++ or a dense binary blob for an embedded Virtual Machine.
+## Project context
 
-## The Golden Rules (Strict Constraints)
+A two-phase, zero-allocation serialization compiler.
 
-1. **NO TRADITIONAL SERIALIZATION:** You are strictly forbidden from using or suggesting `JSON.stringify`, Protobuf wrappers, Serde, or standard buffer manipulation libraries. We are building a *compiler that generates byte-manipulation instructions*, not a library that manipulates bytes directly.
-2. **ABSOLUTE INVERSION OF CONTROL:** Codecs **NEVER** allocate memory. They do not return arrays, buffers, or strings. They strictly emit IR instructions (e.g., `YIELD_VAL`, `ASSIGN_SPAN`) that instruct the target environment where to place data.
-3. **RESPECT THE TWO PHASES:** 
-   * If it happens in standard TypeScript syntax, it happens at *compile-time*.
-   * If it happens inside an `ir\`...\`` block, it happens at *run-time* on the embedded microcontroller. 
-4. **DO NOT FLATTEN THE IR STRINGS:** A real consumer (lowering, the C++ code generator) must never end up working against a flat string — `ir\`...\`` always resolves to genuine in-memory AST by the time anything downstream reads it. Parsing may be *deferred* (an `ir\`...\`` call builds up source text and a callee-reference map immediately but parses to AST lazily, on first access, so fragments that are only valid once spliced into a larger one — e.g. a bare `case N: ...` clause — can be assembled before anything tries to parse them standalone), but it must always actually happen, exactly once, before the fragment is treated as real IR.
+1. **Host language.** TypeScript as an embedded DSL.
+2. **Compile-time phase.** Standard TypeScript (`if`, `for`, `map`) unrolls
+   structural types and evaluates schema constraints, running in Node.
+3. **Run-time phase.** A tagged template literal (`` ir`...` ``) builds an
+   AST of IR instructions, later compiled into bare-metal C++, into
+   TypeScript source, or into a dense binary blob for an embedded VM
+   (`packages/machine/docs/isa-core.md`).
 
-Here is the `copilot-instructions.md` file. This is designed to be ingested by the agent as its core system prompt or custom instructions file. It heavily front-loads the architectural constraints so the agent does not regress into writing standard Node.js web-backend code.
+## Hard constraints
 
-## Agent Operational Protocol
+1. **No traditional serialization.** Never use or suggest
+   `JSON.stringify`, Protobuf wrappers, Serde, or buffer-manipulation
+   libraries. This project builds a compiler that *generates*
+   byte-manipulation instructions.
+2. **Total inversion of control.** Codecs never allocate. They return no
+   arrays, buffers or strings; they emit IR instructions (`YIELD_VAL`,
+   `ASSIGN_SPAN`, ...) telling the target environment where to put data.
+3. **Respect the two phases.** Plain TypeScript syntax runs at
+   compile time. Anything inside an `` ir`...` `` block runs at run time on
+   the target.
+4. **Never flatten the IR to strings.** A real consumer (lowering, a code
+   generator) must always receive genuine in-memory AST. Parsing may be
+   *deferred*: `` ir`...` `` builds source text and a callee-reference map
+   immediately but parses lazily on first access, so a fragment only valid
+   once spliced into a larger one (a bare `case N:` clause, say) can be
+   assembled before anything parses it. It must still happen, exactly once,
+   before the fragment is treated as real IR.
+5. **Assume zero-allocation targets.** Generated C++ runs against a static
+   memory buffer; `malloc`/`new` are forbidden in it.
 
-When responding to tasks, follow these steps:
+## Working protocol
 
-1. **Acknowledge the Architecture:** Briefly confirm how your proposed solution fits into the Compile-Time vs. Run-Time (IR) split.
-2. **Ask for Clarification on AST Impact:** If a feature requires new IR instructions (e.g., adding `YIELD_SPAN`), explicitly state that the `ir` micro-parser and the Metamodel AST will need to be updated.
-3. **Write Minimal, Focused Code:** Do not rewrite entire files unless requested. Provide only the updated classes, interfaces, or IR parser rules needed for the current task.
-4. **Assume Zero-Allocation Host Targets:** When writing the backend emitters (e.g., the C++ AOT generator), assume the embedded device has a static memory buffer and no heap (`malloc`/`new` are forbidden in generated C++).
-
-## Current Project Focus (Await User Prompt)
-
-The project is built in distinct milestones (Metamodel -> IR Parser -> Codecs -> Projection Engine -> Code Emitters). Await the user's prompt to understand which subsystem is currently being implemented or iterated upon.
+1. State how your solution fits the compile-time versus run-time split.
+2. If a feature needs new IR instructions, say explicitly that the `ir`
+   parser and the metamodel AST need updating.
+3. Change only what the task needs. Provide the updated classes,
+   interfaces or rules, not whole rewritten files.
+4. Check `docs/ROADMAP.md` for which subsystem is currently in flight.

@@ -426,7 +426,7 @@ function immOperandRules(astOp: BinaryOperator, isaOp: BinaryOpcode, flipped: bo
 /**
  * Stack-operand combos: both children are RtlNodes (acc + tos). Two combos
  * — peek-and-write-back-in-place, and pop — the only two that reclaim what
- * they read; see ir-engine.md, "Every stack-read combo also reclaims its
+ * they read; see isa-rationale.md, "Every stack-read combo also reclaims its
  * operand" for why there is no third or fourth variant here.
  *
  * `PEEK_PEEK` is `alu`-only: isa-core.md §4.2 gives comparisons exactly

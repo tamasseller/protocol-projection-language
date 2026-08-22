@@ -347,7 +347,7 @@ describe("Unary operators", () =>
     // Multi-level rule (rules.ts, "unary:~~:cancel"/"unary:--:cancel"):
     // matches straight through the inner UnaryExpression's raw shape rather
     // than its one-level-reduced RtlNode, so double negation/double bitwise-
-    // not costs nothing beyond the operand itself — see ir-engine.md.
+    // not costs nothing beyond the operand itself — see isa-rationale.md.
     test("double negation cancels", () =>
     {
         assertReturn(`
@@ -522,7 +522,7 @@ describe("Stack-bridging compound expressions", () =>
     // combine's top-level `(tos, acc)` site tied on bytes/length/maxStack
     // between PEEK_PEEK (net-neutral) and the now-removed PEEK_PUSH
     // (net-positive), and the tie broke on worklist order rather than
-    // preference (see ir-engine.md, "Why these choices"). Removing PEEK_PUSH
+    // preference (see isa-rationale.md, "Why these choices"). Removing PEEK_PUSH
     // entirely (isa-core.md §4.1 keeps only 5 combos) makes PEEK_PEEK the
     // sole tos-output combo at that site, so the tie can no longer arise.
     // This declaration would have thrown lowerVarDecl's `tosDelta === 1`

@@ -31,7 +31,7 @@ export type Statement =
  * `{ ... }` cannot appear as a standalone statement. Every `BlockStatement`
  * reached through a `ControlBody` position is the immediate body of a branch
  * or loop, so it always has a real RTL block construct backing it (see
- * grammer.pegjs's `ControlBody` rule and docs/isa-core.md §20.2, §15.1).
+ * grammer.pegjs's `ControlBody` rule and docs/isa-core.md §10.2/§10.3, §8.1).
  */
 export type ControlBody = BlockStatement | Statement
 

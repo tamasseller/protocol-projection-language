@@ -1,140 +1,274 @@
-# Declarative Serialization Architecture Specification
+# Declarative Serialization Architecture
 
-Data serialization and supporting rich communications on embedded microcontrollers (MCUs) poses several serious challenges:
+## The problem
 
-1. **Strict hardware constraints:** bare-metal firmware operates under unforgiving SRAM limits (often <32 KB), real-time scheduling guarantees and many other forms of architectural pressure from hardware details like bus-architecture performance factors and DMA implementation details. Complex dynamic memory allocation (`malloc`/`new`) is also impractical due to catastrophic heap fragmentation risks and the general lack of memory space.
+Serialization and rich communication on embedded microcontrollers face
+three pressures at once.
 
-2. **The Failure of Existing Serialization Standards:**
-   * **Text/Self-describing formats (JSON, YAML, CBOR):** Force heavy string parsing, demand intermediate dynamic memory buffers, and are redundant by nature and waste precious network bandwidth.
-   * **Schema-driven binary generators (Protobuf, FlatBuffers):** Generate bloated code footprints that rapidly exhaust MCU flash, often require dynamic memory allocation for nested/variable-length structures, and force host applications to interact with awkward, non-idiomatic getters instead of native constructs. They still require serious schema handling discipline in order to deliver on the extensability claims.
-   * **Raw C struct dumps:** Fast and zero-allocation, but non-portable (alignment, padding, endianness bugs), structurally fragile, and impossible to decode without manually keeping the low level packet parser/formatter code of all involved parties in sync.
+**Hardware constraints.** Bare-metal firmware runs under SRAM limits often
+below 32 KB, real-time scheduling guarantees, and architectural pressure
+from bus performance and DMA layout. Dynamic allocation
+(`malloc`/`new`) is impractical: heap fragmentation is catastrophic and
+there is rarely address space to spare.
 
-3. **The Schema Coupling Paradox:** Modern edge architectures require cloud gateways, mobile apps, and local bridges to parse telemetry dynamically without re-deploying bridge code for every firmware update or addition of a new device type. However, existing "self-describing" formats are too heavy for MCUs, while lightweight binary formats lock both ends of the wire into rigid, identical compile-time dependencies.
+**Existing formats each fail differently.**
 
-## Key Architectural Decisions
+- Text and self-describing formats (JSON, YAML, CBOR) force string
+  parsing, demand intermediate dynamic buffers, and spend bandwidth
+  re-transmitting field names on every message.
+- Schema-driven binary generators (Protobuf, FlatBuffers) emit code
+  footprints that exhaust MCU flash, often allocate for nested or
+  variable-length structures, and hand the host application awkward getters
+  instead of native constructs. Their extensibility claims still rest on
+  schema discipline nothing enforces.
+- Raw C struct dumps are fast and zero-allocation, but carry alignment,
+  padding and endianness bugs, break structurally on any change, and are
+  undecodable unless every party's low-level packet code is kept in sync by
+  hand.
+
+**The schema coupling paradox.** Cloud gateways, mobile apps and local
+bridges need to parse telemetry dynamically, without redeploying bridge
+code for every firmware update or new device type. Self-describing formats
+are too heavy for the MCU; lightweight binary formats lock both ends of the
+wire into identical compile-time dependencies.
 
 ```text
 
       +--------------+      +------------------+      +-----------------+
-    ..|   Embedded   |......|     Contract     |......| Proper Platform |...............  
+    ..|   Embedded   |......|     Contract     |......| Proper Platform |...............
    '  |              |      |                  |      |                 |               '
    '  |              |      |                  |      |                 |               '
    '  |    C/C++  <-----------  Semantic  --------------->  JS/TS       |     Types     '
    '  |              |      |                  |      |                 |               '
    '  |      ^       |      |   |              |      |       ^         |               '
-   '..|      |       |......|   |              |......|       |         |...............' 
+   '..|      |       |......|   |              |......|       |         |...............'
       |      |       |      |   |  projection  |      |       |         |
-    ..|      |       |......|   |              |......|       |         |...............  
+    ..|      |       |......|   |              |......|       |         |...............
    '  |      V       |      |   V              |      |       V         |               '
    '  |              |      |                  |      |                 |               '
    '  |     S11N  <-----------  CODECS  ---------------->  IR EVAL      |  Wire format  '
    '  |     CODE     |      |                  |      |    JIT/AOT      |               '
-   '..|              |......|                  |......|                 |...............' 
+   '..|              |......|                  |......|                 |...............'
       +--------------+      +------------------+      +-----------------+
 
 ```
 
-### The tripartite separation (information vs data vs signal)
+## Key architectural decisions
 
-The most foundational principle of this architecture is the strict, structural decoupling of three distinct domains:
-*   **The Semantic Model** (information): The mathematical, abstract intent of the data (e.g., `Integer(0, 255)`, `Struct`, `Union`, `List`). It contains no hardware specifics like bit-width or endianness and acts as the pure structural routing layer linking host memory to network bytes.
-*   **The Target Model** (data): How the host application natively stores and interacts with the data (e.g., an idiomatic C++ `struct`, a zero-copy DMA ring buffer, or a proper JS object, Buffer or a DataView). 
-*   **The Wire Format** (signal): The physical representation of bytes transmitted over the communication medium (e.g., bit-packed headers, LEB128 varints, or UTF-8 JSON text, TLV).
+### Tripartite separation: information, data, signal
 
-This decoupling allows for these distinct aspects of a protocol to change and evolve separately. 
+The foundational principle is a strict structural decoupling of three
+domains:
+
+- **The Semantic Model** (information): the abstract intent of the data
+  (`Integer(0, 255)`, `Struct`, `Union`, `List`). No hardware specifics,
+  no bit-width, no endianness. It is the routing layer linking host memory
+  to network bytes.
+- **The Target Model** (data): how the host application natively stores and
+  works with the data (an idiomatic C++ `struct`, a zero-copy DMA ring
+  buffer, a JS object, a `Buffer`, a `DataView`).
+- **The Wire Format** (signal): the physical bytes on the medium
+  (bit-packed headers, LEB128 varints, UTF-8 JSON text, TLV).
+
+Each of the three evolves on its own schedule.
 
 ### Dual generation via composable projections
 
-Because memory layout and wire representation are completely decoupled from the semantic intent, they are bridged using a **Projection**. 
+Memory layout and wire representation are both decoupled from semantic
+intent, so a **Projection** bridges them by applying composable mapping
+rules to the semantic tree. From that single source of truth the compiler
+generates both sides of the serialization boundary:
 
-A Projection applies composable mapping rules to the Semantic tree. From this single source of truth, the compiler generates *both* sides of the serialization boundary:
-1.  _Target_ data model generation: it emits the idiomatic, native memory structures for the host application based on the **semantic type model** only and driven by target mapping rules (e.g., generating highly optimized C++ `.h` files with specific alignment requirements).
-2.  _Parser/Formatter_ generation: it emits the execution logic (the generated Codec IR) responsible for seamlessly translating between the wire format and those generated host structures. It can be used in multiple ways:
-    - _Build-time_: it can be used for generating platform native code during a build process for maximal performance and minimal code size by incorporating (and thus locking in) **all current knowledge** about all aspects of the protocol
-    - _Runtime_: it can be fetched during the execution of the application (e.g. from the other party) and evaluated directly or transformed into some platform specific code (like a scripting language for ) that yields better performance, while not requiring any knowledge of the wire format. This method only incorporates **limited knowledge** about the protocol at build time. 
+1. **Target data model.** Idiomatic native memory structures for the host
+   application, derived from the semantic type model alone and driven by
+   target mapping rules (a C++ header with specific alignment
+   requirements, say).
+2. **Parser/formatter.** The execution logic (generated codec IR) that
+   translates between the wire format and those generated host structures.
+   Two ways to consume it:
+   - *Build time*: generate platform-native code during the build, for
+     maximum speed and minimum code size, locking in all current knowledge
+     of every aspect of the protocol.
+   - *Runtime*: fetch it during execution (from the other party, for
+     instance) and either evaluate it directly or transform it into
+     something faster for the platform. This locks in only limited
+     knowledge of the protocol at build time.
 
-### Wire format indepentence
+### Wire format independence
 
-This allows arbitrary wire formats to be employed without affecting the application logic. A dense binary RF protocol can be swapped for a human-readable JSON logging format by simply changing to the composable codec components in the projection, without touching the semantic model or rewriting the host application's data structures. This enables massive code reuse and eliminates boilerplate. 
+Arbitrary wire formats work without touching application logic. Swapping a
+dense binary RF protocol for a human-readable JSON logging format means
+changing the composable codec components in the projection, leaving the
+semantic model and the host application's data structures alone.
 
-The abstract IR based runtime codec generation even allows for dynamically negotiating or discovering the wire protocol even if one of the parties is working with very limited resources, because a native, build-time codegen based endpoint (embedded profile) can still serve up its IR as an opaque blob. This scheme can even be stretched further, if the compact codec IR is still too heavy for an endpoint to carry, it can still provide an adequate hash of the _contents_ of the ir, which then can be fetched from a well known location. This achieves far greater guarantees then using a semantic version for this purpose, for example. There is no human factor in this process, the wire mapping code is exact, no judgement needs to be made on the backwards compatibility of the encoding.
+Runtime codec generation from abstract IR also allows negotiating or
+discovering the wire protocol when one party has very limited resources: a
+native, build-time-codegen endpoint (the embedded profile) can still serve
+its IR as an opaque blob. If even the compact codec IR is too heavy for an
+endpoint to carry, it can publish a hash of the IR *contents* instead, and
+the peer fetches the IR from a well-known location. Hashing content gives
+far stronger guarantees than a semantic version string: the wire mapping
+code is exact, and no human judgement about backwards compatibility enters
+the process.
 
-### Platform type mapping indepentence
+### Platform type mapping independence
 
-The target data model being independently generated for each platform from the same semantic type tree, guided by per-platform mappings also means that each language/application/use-case is able to tailor its way of accessing the encoded information to its needs independently of the other instances.
+The target data model is generated independently per platform from the same
+semantic type tree, guided by per-platform mappings, so each
+language/application/use-case tailors its own access to the encoded
+information without regard for the others.
 
-#### Inversion of Control (Zero-Allocation Parsers)
-To guarantee total flexibility over data representation and memory management, the generated parser/formatter layer **never allocates or owns memory**. Codecs operate purely as procedural bridges. They read from a stream and emit procedural instructions to a proxy. The proxy handles routing that data into the generated target data model, keeping the wire logic agnostic to the host's memory constraints.
+#### Inversion of control (zero-allocation parsers)
 
-## Imlementation
+The generated parser/formatter layer never allocates or owns memory.
+Codecs are procedural bridges: they read from a stream and emit procedural
+instructions to a proxy, which routes data into the generated target data
+model. The wire logic stays agnostic to the host's memory constraints.
 
-Building a custom lexer, parser, type checker, and IDE extension for a custom DSL adds massive complexity and maintenance overhead. By using **TypeScript as the eDSL**, Node.js acts as the compile-time engine. Standard TS syntax handles compile-time type unrolling and constraint validation for free. By using tagged template literals, we maintain C-like procedural readability for runtime logic. 
+### TypeScript as the eDSL
 
-## The Semantic Type System (The Metamodel)
+A custom DSL would need its own lexer, parser, type checker and IDE
+extension. Using TypeScript as an embedded DSL makes Node.js the
+compile-time engine and gets compile-time type unrolling and constraint
+validation from standard TS syntax. Tagged template literals keep C-like
+procedural readability for runtime logic (`packages/machine`, whose
+`ir` template is specified in `packages/machine/docs/isa-core.md` §10).
 
-The semantic type system acts as the absolute source of truth for the **logical intent** of the data. It is mathematically pure and strictly decoupled from physical constraints—meaning concepts like "bit-width," "endianness," "memory alignment," or "null-termination" do not exist here. 
+## The semantic type system (the metamodel)
 
-The metamodel is composed of a minimal set of irreducible structural roots. High-level constructs are aggressively normalized into the core structural types. Dictionaries / Maps are structurally modeled as a list of key value pairs. Raw binary blob are represented semantically as a list of non-negative integers that are less than 256. Strings are represented as list of characters.
+`packages/core/src/metamodel.ts`. The source of truth for the *logical
+intent* of the data, strictly decoupled from physical constraints:
+bit-width, endianness, memory alignment and null-termination do not exist
+here.
 
-### The Primitives
+The metamodel is a minimal set of irreducible structural roots, and
+high-level constructs normalize aggressively into them. A dictionary or map
+is a list of key-value pairs. A raw binary blob is a list of non-negative
+integers below 256. A string is a list of characters.
 
-This is the lowest practical level, going even more primitive than this would introduce implementation problems that outweigh architectureal benefits. There are the three primitive types:
+**Primitives.** `Integer(min, max)` is a bounded mathematical range: you
+do not define a `uint16_t`, you define `Integer(0, 65535)`, and the
+projection layer later decides whether it packs into 14 bits, ships as a
+LEB128 varint, or widens to 32 bits for alignment. `Unit` carries no data.
+Abstract IEEE-754 `Float` (real numbers, ±∞, NaN) and `Char` (a single
+Unicode scalar value, giving host adapters the context to generate native
+string types) are part of the intended design and not yet in the
+metamodel; `Integer` and `Unit` are what exists today. Going more
+primitive than this level would create implementation problems outweighing
+the architectural benefit.
 
-* `Integer`: A bounded mathematical range. You do not define a `uint16_t`; you define an `Integer(0, 65535)`. The projection layer later decides if this is packed into 14 bits, sent as a LEB128 varint, or expanded to 32 bits for memory alignment.
-* `Float`: Abstract IEEE-754 semantics supporting real numbers, $\pm\infty$, and $\text{NaN}$.
-* `Char`: A single Unicode Scalar Value. This provides the semantic context needed for host adapters to generate native string types.
+**List.** Homogeneous sequential items of unknown length, with an element
+type and an optional capacity bound known at compile time. All items share
+the exact same type. The capacity bound captures abstract behavioral
+knowledge and guides representation choice on both the wire and the host
+side.
 
-### List
+**Struct.** Heterogeneous static dictionaries (Π-types) mapping fixed,
+compile-time keys to types. Each field has a unique name and a type. All
+fields are always present.
 
-Lists are homogenous sequential items of unknown length. Lists have:
-
-* An element type and
-* An optional capacity bound
-
-known about them at compile time. All items in the list share the same exact type. The capacity bound captures abstract behavioral knowledge about the type, but it also serves as guide for selecting the right representation for the data on both the wire format and the host type representation side.
-
-### Struct
-
-Heterogeneous static dictionaries ($\Pi$-types) mapping fixed, compile-time keys to specific types. Each field has a name, a type. Field names must be unique. All fields are always present.
-
-### Union
-
-Unions are tagged/discriminated sum types ($\Sigma$-types) representing mutually exclusive semantic variants. Each variant has a tag and a type. Variant tags must be unique. Exactly one variant is present at all times.
+**Union.** Tagged sum types (Σ-types) of mutually exclusive semantic
+variants. Each variant has a unique tag and a type. Exactly one variant is
+present at all times.
 
 ## Mappings
 
-A **Mapping** is a rule-driven walk over the semantic type tree: an ordered list of `(structural predicate, producer)` pairs, tried in order, first match wins. Every generated artifact this project produces — a target language's native type, a wire-format codec, a JSON pretty-printer — is one instance of this same mechanism aimed at a different producer. This uniformity is what lets three unrelated artifacts (a C header, a TS declaration file, an encode/decode program) regenerate consistently from one schema change, and what lets any one of them be swapped for an alternative without touching the other two.
+A **Mapping** is a rule-driven walk over the semantic type tree: an ordered
+list of `(structural predicate, producer)` pairs, tried in order, first
+match wins. Every generated artifact in this project is one instance of
+that mechanism aimed at a different producer: a target language's native
+type, a wire-format codec, a JSON pretty-printer. That uniformity is what
+lets a C header, a TS declaration file and an encode/decode program
+regenerate consistently from one schema change, and lets any one of them be
+swapped without touching the other two.
 
-### Structural Predicates
+### Structural predicates
 
-Codecs do not bind to specific, named types. Instead, they act as **declarative predicates** that filter based on topological location and structural constraints. 
-
-Because the metamodel tracks exact integer bounds, a codec signature can express logic like: *"I can encode any integer, as long as its maximum value fits in a byte."*
+Codecs bind to topological location and structural constraints, not to
+named types. Because the metamodel tracks exact integer bounds, a codec
+signature can express "I encode any integer whose maximum fits in a byte."
 
 ### Three layers, three lifecycles
 
-Because a Mapping is just "dispatch + producer," the same three-way split applies to every kind of Mapping this project has, and it's worth naming explicitly since the layers evolve at very different rates and shouldn't be mixed in one module:
+A Mapping is dispatch plus producer, so the same three-way split applies to
+every kind of Mapping here. The layers evolve at very different rates and
+belong in separate modules.
 
-1. **Core / platform.** The facilities that let semantic types and Mappings be *defined* at all — nothing here knows about any specific type shape or wire format. This is `@ppl/core` (the metamodel; `TypePattern`/`matchType`, the structural predicate vocabulary; `runRuleset`, the rule-based dispatch engine) and `@ppl/machine` (the generic, protocol-agnostic IR/lowering/VM, and the `Extension` hook that lets a domain — codecs, eventually others — add its own opcodes without `@ppl/machine` ever having to know what a codec is). Changes here are rare and load-bearing: everything downstream depends on this layer's shape staying stable.
-2. **Components.** The actual, reusable Mappings built on top of layer 1: a target's type-mapping rules (`@ppl/target-cpp`, `@ppl/target-js`), a wire format's codec rules (`@ppl/codecs`'s default binary rules, plus opt-in alternatives like delta-LEB128 lists or a JSON pretty-printer). These are libraries, plural — an application picks one, several, or writes its own alongside them. None of them is "the" codec or "the" type mapping; they're swappable by construction, and nothing in layer 1 privileges one over another.
-3. **Application.** A semantic schema (the project's one real asset) plus the specific choice of which layer-2 components to run over it, producing the actual generated artifacts. This layer should own no generic machinery of its own — see `packages/example/compose.ts`, which composes layer-1 engines and layer-2 libraries over one schema and nothing else.
+1. **Core / platform.** The facilities that let semantic types and Mappings
+   be *defined* at all, with no knowledge of any specific type shape or
+   wire format. `@ppl/core` holds the metamodel, `TypePattern`/`matchType`
+   and the structural predicate vocabulary, `runRuleset`'s rule dispatch,
+   `createResolver`'s on-demand cycle-safe resolution, and `reconcile`.
+   `@ppl/machine` holds the protocol-agnostic IR, lowering and VM, plus the
+   `Extension` hook that lets a domain add opcodes without `@ppl/machine`
+   knowing what a codec is. Changes here are rare and load-bearing.
+2. **Components.** The reusable Mappings built on layer 1: a target's
+   type-mapping rules (`@ppl/target-cpp`, `@ppl/target-js`), a wire
+   format's codec rules (`@ppl/codecs`'s default binary rules, plus opt-in
+   alternatives such as delta-LEB128 lists or a JSON pretty-printer). These
+   are libraries, plural. An application picks one, several, or writes its
+   own alongside them, and nothing in layer 1 privileges any of them.
+3. **Application.** A semantic schema (the project's one real asset) plus
+   the choice of which layer-2 components to run over it. This layer owns
+   no generic machinery: see `packages/example/src/compose.ts`.
 
-A useful test for "which layer does this belong in": if it can be swapped out for an alternative without the application even noticing, it's a component (layer 2). If swapping it out would mean rewriting the mechanism everything else rides on, it's core (layer 1). Machinery invented to solve one component's problem should still be judged as layer 1 or layer 2 on its own merits — a generic dispatch engine doesn't become a "component detail" just because a components package happened to be where the need first showed up.
+The test for which layer something belongs in: if it can be swapped for an
+alternative without the application noticing, it is a component; if
+swapping it would mean rewriting the mechanism everything else rides on, it
+is core. Machinery invented to solve one component's problem is still
+judged on its own merits, regardless of which package the need first
+surfaced in.
 
 ### Type mapping
 
-A target's type mapping is a `Rule<C>[]` (`@ppl/core/projection.ts`) run via `runRuleset` against the semantic `TypeGraph` — one rule set per target, living in that target's own package (`@ppl/target-cpp`, `@ppl/target-js`), never in `@ppl/core` itself. `@ppl/core` provides the dispatch engine and the predicate vocabulary (layer 1); each target package is a component library (layer 2) built on it.
+A target's type mapping is a `Rule<C>[]` (`@ppl/core/projection.ts`) run
+via `runRuleset` against the semantic `TypeGraph`: one rule set per target,
+living in that target's own package, never in `@ppl/core`. `@ppl/core`
+supplies the dispatch engine and the predicate vocabulary; each target
+package is a component library built on it.
 
 ### Codecs
 
-A wire-format codec is the same shape aimed at a different producer: instead of a target type declaration, each matched semantic type produces an `ir` fragment — a `Procedure` body for `@ppl/machine`'s VM. `@ppl/codecs` supplies two things codecs need beyond what a type mapping gets for free from `@ppl/core` alone, both layer 1 despite living in this package:
+A wire-format codec is the same shape aimed at a different producer: each
+matched semantic type produces an `ir` fragment, a `Procedure` body for
+`@ppl/machine`'s VM. `@ppl/codecs` supplies two things beyond what a type
+mapping gets from `@ppl/core`, both core-layer despite living in this
+package:
 
-- **The codec `Extension`** (`engine/codec-extension.ts`) — the opcode vocabulary (`ENTER`, `CALL_CODEC`, `READ`/`WRITE`, ...) that lets a codec body be authored as real `ir` text at all. This is domain infrastructure, not a component: it doesn't encode anything by itself, it's what makes encoding *expressible*. It lives in `@ppl/codecs` rather than `@ppl/machine` only because `@ppl/machine` must stay protocol-agnostic (`docs/ROADMAP.md` item 7) — conceptually it's still core.
-- **The on-demand resolver.** The actual mint-then-recurse/memoized/cycle-safe *execution* (a struct can reference itself through a union arm; `runRuleset`'s one eager top-down pass has no way to hand a not-yet-finished child a reserved slot before a sibling embeds it into its own instruction stream) is `@ppl/core/projection.ts`'s `createResolver` — a shared layer-1 primitive alongside `runRuleset`, not a codec-only mechanism. It got there exactly the way the paragraph above once said it would: once a second consumer needed the same on-demand/cycle-safe resolution (`target-js/engine/resolver.ts`'s own `createTsResolver`, resolving `SemanticType -> TSTypeDecl` instead of `SemanticType -> Procedure`), the shared execution promoted out and both became thin adapters over it. `@ppl/codecs/engine/resolver.ts`'s `createCodecResolver` is that adapter for codecs specifically — it still can't move any further than this, since it depends on `@ppl/machine`'s `Procedure`/`declareProc`/`lowerProgram`, and `@ppl/core` stays `@ppl/machine`-free on purpose. A rule's `produce` sees only its own match witness and a `resolve` callback keyed on a child's `SemanticType` identity directly — no `TypeNode`, no graph.
-- **Reconciliation** (`@ppl/core/reconcile.ts`, `reconcile`/`resolve` — docs/codec-image.md §2/§3) started life in `@ppl/codecs` (born out of the codec-image problem) but moved once it was clear neither function touches anything beyond `TypeNode`/`defaultValueOf`: matching two independently-evolved semantic type trees by name, and deciding what a divergence means, is exactly as codec-agnostic as `matchType` itself. `@ppl/codecs/engine/codec-extension.ts` re-exports its `Direction` type for existing consumers that still reach it that way.
+- **The codec `Extension`** (`engine/codec-extension.ts`): the opcode
+  vocabulary (`ENTER`, `CALL_CODEC`, `READ`/`WRITE`, and the rest) that
+  makes a codec body authorable as real `ir` text. It encodes nothing by
+  itself; it makes encoding expressible. It lives here rather than in
+  `@ppl/machine` only because `@ppl/machine` must stay protocol-agnostic.
+- **The on-demand resolver.** A struct can reference itself through a union
+  arm, and `runRuleset`'s single eager top-down pass cannot hand a
+  not-yet-finished child a reserved slot before a sibling embeds it into
+  its own instruction stream. The mint-then-recurse, memoized, cycle-safe
+  execution is `@ppl/core/projection.ts`'s `createResolver`, shared with
+  `target-js/engine/resolver.ts`'s `createTsResolver` (resolving
+  `SemanticType -> TSTypeDecl` instead of `SemanticType -> Procedure`).
+  `@ppl/codecs/engine/resolver.ts`'s `createCodecResolver` is the codec
+  adapter over it, and can move no further out because it depends on
+  `@ppl/machine`'s `Procedure`/`declareProc`/`lowerProgram`. A rule's
+  `produce` sees only its own match witness and a `resolve` callback keyed
+  on a child's `SemanticType` identity: no `TypeNode`, no graph.
 
-The actual codec rule sets are layer 2, plain and simple: `components/binary-rules.ts`'s default length-prefixed/tag-hoisted binary encoding, and the opt-in alternatives (`components/delta-leb128.ts`, `components/json.ts`) that compose alongside or instead of it. None of them is privileged by `buildCodec` (bottom of `engine/resolver.ts`) itself — it takes the rule set to run as a plain required argument, exactly the way `runRuleset` takes one for a type mapping, so an application is never stuck with an implicit default it can't fully replace. Direction, for the binary rules, is which of two flat rule lists (`binaryEncodeRules`/`binaryDecodeRules`) you pass in, not a value threaded through every rule — a resolver run already commits to one direction for its whole walk, so nothing inside a single `produce` call ever needs to branch on it.
+The actual codec rule sets are components: `components/binary-rules.ts`'s
+default length-prefixed, tag-hoisted binary encoding, plus the opt-in
+alternatives (`components/delta-leb128.ts`, `components/json.ts`) that
+compose alongside or instead of it. `buildCodec` (`engine/resolver.ts`)
+privileges none of them: it takes the rule set as a plain required
+argument, exactly as `runRuleset` does for a type mapping, so an
+application is never stuck with an implicit default it cannot replace. For
+the binary rules, direction is which of two flat rule lists
+(`binaryEncodeRules`/`binaryDecodeRules`) gets passed in, not a value
+threaded through every rule: a resolver run commits to one direction for
+its whole walk, so no `produce` call ever branches on it.
 
 ### Projections
 
-A **Projection** is the application-layer act of running chosen layer-2 components — a type mapping, a codec, or both — over one shared semantic schema to produce the artifacts a real system needs (see the tripartite diagram above). `packages/example/compose.ts` is the reference shape: it builds the `TypeGraph` once, then applies each package's Mapping to it, and owns nothing generic itself.
+A **Projection** is the application-layer act of running chosen components,
+a type mapping or a codec or both, over one shared semantic schema to
+produce the artifacts a real system needs. `packages/example/src/compose.ts` is
+the reference shape: build the `TypeGraph` once, apply each package's
+Mapping to it, own nothing generic.

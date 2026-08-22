@@ -162,7 +162,7 @@ describe("Binary — register operand", () =>
 
 describe("Binary — immediate operand", () =>
 {
-    // Arithmetic's immediate combo has no small form (ir-engine.md), so it
+    // Arithmetic's immediate combo has no small form (isa-rationale.md), so it
     // always costs LOAD(2) + op-imm-extended(2) = 4 bytes. But reformulating
     // commutatively as `1 + x` and tiling the literal via CONST's small
     // 0–15 range costs CONST(1) + op-register(2) = 3 bytes instead — cheaper

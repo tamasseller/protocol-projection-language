@@ -3,7 +3,7 @@
  *
  * Not part of `npm test` (not imported by run.ts) — measures `tileExpr`'s
  * wall-clock cost on wide balanced-sum expression trees, the shape that
- * previously blew up under the worklist-based search (see docs/ir-engine.md,
+ * previously blew up under the worklist-based search (see docs/isa-rationale.md,
  * "Why these choices" — the Pareto-pruning rationale). Run directly:
  * `npx ts-node --project tsconfig.test.json test/bench.ts`.
  *
@@ -15,7 +15,7 @@
  * anything in machine/) is a separate, pre-existing bottleneck that this
  * file's default range deliberately stays under — its cost grows sharply
  * past n≈64 (parsing alone, not tiling) and isn't something this session's
- * work touched or fixed; see docs/ir-engine.md.
+ * work touched or fixed; see docs/isa-rationale.md.
  */
 
 import { ir } from "../src/ir"
