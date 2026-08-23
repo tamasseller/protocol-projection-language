@@ -575,10 +575,10 @@ Three sections concatenated in fixed order with no framing between them,
 because each already knows its own length as it is produced:
 
 1. **Type tree** (§6), self-framing via `END` (§6.5).
-2. **Encoder program**, isa-core.md §5.5's format: a procedure count then a
-   header row per procedure (`argCount`, `bodyLength`) up front, so decode
-   knows exactly how many bytes the whole program occupies before reading
-   a body byte.
+2. **Encoder program**, isa-core.md §5.5's format: a procedure count, then
+   each procedure's own `argCount` immediately followed by its own body —
+   no stored body length; decode finds where one ends by walking it (a
+   body is self-delimiting, §8.4).
 3. **Decoder program**, same format.
 
 Decode reads the three in order, each consuming exactly its own bytes and

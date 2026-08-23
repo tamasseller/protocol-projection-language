@@ -150,9 +150,20 @@ function runProc<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E
     const regs: number[] = [...args]
     let tos = args.length
     let acc = 0
+    // Poisoned by a write-back-in-place combo (REG_REG/PEEK_PEEK) — matches
+    // raise.ts's own `this.acc = undefined` (docs/design.md §10.1's
+    // acc-clobbering convention). `acc` itself stays a plain `number`
+    // (whatever it last held) so reading it while poisoned still throws
+    // instead of silently returning a stale, bit-accurate-by-luck value.
+    let accLive = true
     let pc = 0
     let steps = 0
     const ctrl: BlockFrame[] = []
+
+    function requireAccLive(context: string): void
+    {
+        assert.ok(accLive, `${context}: read of acc after a write-back-in-place combo clobbered it (docs/design.md §10.1's acc-clobbering convention)`)
+    }
 
     // The state surface an extension's `exec` is allowed to touch — no pc,
     // no control stack, since a generic extension op is straight-line by
@@ -201,16 +212,16 @@ function runProc<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E
     function writeResult(i: RtlInstr<E>, value: number): void
     {
         const v = value >>> 0
-        if(!("combo" in i)) { acc = v; return }
+        if(!("combo" in i)) { acc = v; accLive = true; return }
         switch(i.combo)
         {
             case "REG_ACC": case "IMM_ACC": case "POP_ACC":
-                acc = v; break
+                acc = v; accLive = true; break
             case "REG_REG":
                 assert.ok(i.target < tos, `${i.op} ${i.combo}: register ${i.target} not below current TOS (${tos})`)
-                regs[i.target] = v; break
+                regs[i.target] = v; accLive = false; break
             case "PEEK_PEEK":
-                regs[tos - 1] = v; break
+                regs[tos - 1] = v; accLive = false; break
         }
     }
 
@@ -226,16 +237,19 @@ function runProc<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E
             case "LOAD":
                 assert.ok(i.target < tos, `LOAD: register ${i.target} not below current TOS (${tos})`)
                 acc = regs[i.target]!
+                accLive = true
                 pc++
                 break
 
             case "STORE":
                 assert.ok(i.target < tos, `STORE: register ${i.target} not below current TOS (${tos})`)
+                requireAccLive("STORE")
                 regs[i.target] = acc
                 pc++
                 break
 
             case "PUSH":
+                requireAccLive("PUSH")
                 regs[tos++] = acc
                 pc++
                 break
@@ -243,11 +257,13 @@ function runProc<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E
             case "POP":
                 assert.ok(tos > 0, `POP with empty stack`)
                 acc = regs[--tos] ?? 0
+                accLive = true
                 pc++
                 break
 
             case "CONST":
                 acc = i.imm >>> 0
+                accLive = true
                 pc++
                 break
 
@@ -256,22 +272,26 @@ function runProc<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E
             case "EQ": case "NE":
             case "LT_S": case "LE_S": case "GT_S": case "GE_S":
             case "LT_U": case "LE_U": case "GT_U": case "GE_U":
+                requireAccLive(`${i.op} ${"combo" in i ? i.combo : ""}`)
                 writeResult(i, evalBinary(acc, operand(i), i.op))
                 pc++
                 break
 
             case "NEG": case "NOT": case "CLZ": case "REVBITS":
+                requireAccLive(i.op)
                 acc = evalUnary(acc, i.op)
                 pc++
                 break
 
             case "RETURN":
+                requireAccLive("RETURN")
                 return {acc, steps}
 
             case "TRAP":
                 throw new Trap(i.imm, steps)
 
             case "BR_TABLE": {
+                requireAccLive("BR_TABLE")
                 const N = i.imm
                 if(acc >= N) { pc = skipBlocks(body, pc + 1, N); break } // implicit default
                 pc = skipBlocks(body, pc + 1, acc) // skip cases before the selected one
@@ -302,6 +322,7 @@ function runProc<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E
                 }
                 if(top.kind === "loopCond")
                 {
+                    requireAccLive("LOOP condition")
                     if(acc === 0) { pc = skipBlocks(body, pc + 1, 1); break } // exit: skip the body block
                     ctrl.push({kind: "loopBody", loopPc: top.loopPc, entryTos: top.entryTos})
                     pc++
@@ -325,11 +346,13 @@ function runProc<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E
                 const stackArgs = Math.max(callee.argCount - 1, 0)
                 assert.ok(tos >= stackArgs,
                     `CALL ${i.calleeIndex}: only ${tos} value(s) on the stack, need ${stackArgs}`)
+                if(callee.argCount > 0) requireAccLive(`CALL ${i.calleeIndex}`)
                 tos -= stackArgs
                 const callArgs = callee.argCount === 0 ? [] : [...regs.slice(tos, tos + stackArgs), acc]
 
                 const result = runProc(program, callee, callArgs, extension)
                 acc = result.acc
+                accLive = true
                 steps += result.steps
                 pc++
                 break

@@ -6,11 +6,17 @@
  * procedure's flat instruction stream, no header, no length prefix — the
  * caller already knows where that buffer ends. `encodeProgram`/
  * `decodeProgram` (isa-core.md §5.5, ROADMAP.md item 8) are the layer
- * above: a whole program's procedure table, framed by a header row per
- * procedure (`arg_count` + that procedure's own body byte length) up
- * front, then every body concatenated in table order — deliberately *not*
- * wire-encoding a procedure's extension header fields (§2.3/§11.4); see
- * §5.5 for why nothing has ever needed that to survive serialization.
+ * above: a whole program's procedure table, each procedure's own
+ * `arg_count` immediately followed by its own body, no stored body length
+ * — a body is self-delimiting (§8.4: nothing follows a terminator within
+ * the same block), so `decodeProgram` derives each one's own end by
+ * tracking open `LOOP`/`BR_TABLE` nesting the same way any consumer of the
+ * bytecode already has to, stopping at the first terminator back at depth
+ * zero (§7.2's bare-terminator loop-body closer means that's frame-*kind*
+ * aware, not just a nesting count — see `decodeProcBody` below).
+ * Deliberately *not* wire-encoding a procedure's extension header fields
+ * (§2.3/§11.4); see §5.5 for why nothing has ever needed that to survive
+ * serialization.
  * `encoding.ts` is unrelated: a relative cost estimate for the lowerer's
  * own candidate comparison, not a real serializer.
  *
@@ -255,30 +261,84 @@ export function decodeBody<E extends { ext: string } = ExtOpPayload>(bytes: Uint
 
 // ── Program framing (isa-core.md §5.5) ─────────────────────────────────────
 
-/** Encode a whole program: procedure count, then one `(arg_count,
- *  body_length)` header row per procedure, then every body concatenated in
- *  table order. Deliberately drops each `RtlProc.header` — see this file's
- *  header comment and §5.5 for why extension header fields never need to
- *  cross the wire (nothing has ever needed them to survive
- *  serialization). */
+/** Encode a whole program: procedure count, then each procedure's own
+ *  `arg_count` immediately followed by its own body — no header table, no
+ *  stored body length (§5.5: a body is self-delimiting). Deliberately
+ *  drops each `RtlProc.header` — see this file's header comment and §5.5
+ *  for why extension header fields never need to cross the wire (nothing
+ *  has ever needed them to survive serialization). */
 export function encodeProgram<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E>, extension?: Extension<E>): Uint8Array
 {
-    const bodies = program.procedures.map(proc => encodeBody(proc.body, extension))
-    const table = program.procedures.flatMap((proc, i) =>
-        [...encodeLeb128(proc.argCount), ...encodeLeb128(bodies[i]!.length)])
     return Uint8Array.from([
         ...encodeLeb128(program.procedures.length),
-        ...table,
-        ...bodies.flatMap(b => [...b]),
+        ...program.procedures.flatMap(proc =>
+            [...encodeLeb128(proc.argCount), ...encodeBody(proc.body, extension)]),
     ])
 }
 
-/** Decode a whole program starting at `offset` (§5.5) — reads the header
- *  table once, up front, so every procedure's body is sliced out by exact
- *  byte length (`Uint8Array.subarray`, a view, not a copy) rather than
- *  relying on `decodeBody` to self-detect where one procedure ends and the
- *  next begins. Decoded procedures always come back with `header:
- *  undefined` — nothing wire-level to restore it from (§5.5).
+/** One frame of `decodeProcBody`'s own open-block tracking — mirrors
+ *  `blocks.ts`'s `Frame` union in shape (case / loopCond / loopBody),
+ *  repurposed here for boundary-finding instead of ARM backpatch
+ *  bookkeeping: this decoder doesn't need to record more than which kind
+ *  of block is open and, for a `case`, how many closers remain. */
+type ScanFrame = { kind: "case"; remaining: number } | { kind: "loopCond" } | { kind: "loopBody" }
+
+/** Decode one procedure body starting at `offset`, stopping at the first
+ *  terminator reached with *no* open block at all (§8.4 guarantees nothing
+ *  wire-level follows it that still belongs to this procedure) — no
+ *  separate length to bound the walk, unlike `decodeBody` above. Tracks
+ *  open `LOOP`/`BR_TABLE` nesting by frame *kind*, not just a count,
+ *  because §7.2 lets a `LOOP`'s own body block close via a bare
+ *  `RETURN`/`TRAP` instead of `BLOCK_END`: that terminator pops its
+ *  enclosing `loopBody` frame, same as a real closer would, but doesn't by
+ *  itself end the body — the outer scope's own bytes (its cond-false exit
+ *  path, say) may still follow. Only a terminator seen with the stack
+ *  *already* empty — nothing open, nothing to pop — is the real end. */
+function decodeProcBody<E extends { ext: string } = ExtOpPayload>(bytes: Uint8Array, offset: number, extension?: Extension<E>): { body: RtlInstr<E>[]; next: number }
+{
+    const body: RtlInstr<E>[] = []
+    const stack: ScanFrame[] = []
+    let pos = offset
+
+    for (;;)
+    {
+        const { instr, next } = decodeInstr(bytes, pos, extension)
+        body.push(instr)
+        pos = next
+
+        if (instr.op === "BR_TABLE") { stack.push({ kind: "case", remaining: instr.imm }); continue }
+        if (instr.op === "LOOP") { stack.push({ kind: "loopCond" }); continue }
+
+        if (instr.op === "BLOCK_END")
+        {
+            const top = stack[stack.length - 1]
+            if (!top) throw new Error(`decodeProcBody: BLOCK_END with no open block at offset ${pos}`)
+            if (top.kind === "case") { top.remaining -= 1; if (top.remaining === 0) stack.pop() }
+            else if (top.kind === "loopCond") stack[stack.length - 1] = { kind: "loopBody" }
+            else stack.pop() // loopBody's own ordinary (BLOCK_END) closer
+            continue
+        }
+
+        if (instr.op === "RETURN" || instr.op === "TRAP")
+        {
+            // Empty stack *before* considering this terminator at all is
+            // the real end — no open block means nothing was waiting on
+            // it as a closer. A `loopBody` frame popping down to empty
+            // (§7.2's own allowance) is a different thing: it ends that
+            // loop, not necessarily the procedure — the outer scope's own
+            // bytes (its cond-false exit path, say) may still follow.
+            if (stack.length === 0) return { body, next: pos }
+            const top = stack[stack.length - 1]!
+            if (top.kind === "loopBody") stack.pop()
+        }
+    }
+}
+
+/** Decode a whole program starting at `offset` (§5.5) — no header table to
+ *  read up front; each procedure's body is walked, self-delimited
+ *  (`decodeProcBody`), immediately after its own `arg_count`. Decoded
+ *  procedures always come back with `header: undefined` — nothing
+ *  wire-level to restore it from (§5.5).
  *
  *  Returns `next` (the offset immediately past the last body byte), not
  *  just the program — a container holding more than one encoded program
@@ -291,21 +351,14 @@ export function decodeProgram<E extends { ext: string } = ExtOpPayload>(bytes: U
     const count = countR.value
     let pos = countR.next
 
-    const headers: { argCount: number; bodyLength: number }[] = []
+    const procedures: RtlProc<E>[] = []
     for (let i = 0; i < count; i++)
     {
         const argCountR = decodeLeb128(bytes, pos)
-        const bodyLengthR = decodeLeb128(bytes, argCountR.next)
-        headers.push({ argCount: argCountR.value, bodyLength: bodyLengthR.value })
-        pos = bodyLengthR.next
+        const { body, next } = decodeProcBody(bytes, argCountR.next, extension)
+        procedures.push({ argCount: argCountR.value, body })
+        pos = next
     }
-
-    const procedures: RtlProc<E>[] = headers.map(({ argCount, bodyLength }) =>
-    {
-        const body = decodeBody(bytes.subarray(pos, pos + bodyLength), extension)
-        pos += bodyLength
-        return { argCount, body }
-    })
 
     return { program: { procedures }, next: pos }
 }

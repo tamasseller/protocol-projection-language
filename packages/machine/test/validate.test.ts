@@ -14,7 +14,7 @@ import assert from "node:assert/strict"
 import { ir, proc } from "../src/ir"
 import { lowerProgram } from "../src/lower"
 import { validateProgram } from "../src/validate"
-import { bare, call, brTable, trap, PUSH, POP, CONST, opStack } from "../src/rtl"
+import { bare, call, brTable, trap, PUSH, POP, CONST, opStack, opRegWriteback } from "../src/rtl"
 import type { RtlProgram, RtlProc } from "../src/rtl"
 
 describe("validateProgram — happy path (real pipeline)", () =>
@@ -102,6 +102,28 @@ describe("validateProgram — §8.3 stack-depth bound is the tight one, not the 
         }
         const stats = validateProgram({ procedures: [callerCallingDeep, callee] })
         assert.equal(stats.totalDepth, 10 - 1 + 5)
+    })
+
+    test("maxCallDepth is independent of totalDepth: 1 nested call here, same as always", () =>
+    {
+        const stats = validateProgram(program)
+        assert.equal(stats.maxCallDepth, 1)
+        assert.equal(stats.totalDepth, 10) // unchanged from above — the two figures don't move together
+    })
+
+    test("a long, shallow call chain has a small totalDepth but a large maxCallDepth", () =>
+    {
+        // Five procedures, each a trivial pass-through calling the next —
+        // the mirror image of caller/callee above: negligible register
+        // pressure (nothing ever pushed) but five simultaneously active
+        // frames on the one path through them all.
+        const chain: RtlProc[] = Array.from({ length: 5 }, (_, i) => ({
+            argCount: 0,
+            body: i < 4 ? [call(i + 1), bare("RETURN")] : [bare("RETURN")],
+        }))
+        const stats = validateProgram({ procedures: chain })
+        assert.equal(stats.maxCallDepth, 4)
+        assert.equal(stats.totalDepth, 0)
     })
 })
 
@@ -237,6 +259,61 @@ describe("validateProgram — §8.5 header/block well-formedness", () =>
     test("TRAP is a valid terminator on its own", () =>
     {
         const program: RtlProgram = { procedures: [{ argCount: 0, body: [trap(0)] }] }
+        assert.doesNotThrow(() => validateProgram(program))
+    })
+})
+
+describe("validateProgram — §16 item 2: acc-clobbering convention enforcement", () =>
+{
+    test("RETURN reading acc right after a write-back-in-place (REG_REG) combo is rejected", () =>
+    {
+        const program: RtlProgram = {
+            procedures: [{ argCount: 0, body: [CONST(5), PUSH(), opRegWriteback("ADD", 0), bare("RETURN")] }],
+        }
+        assert.throws(() => validateProgram(program), /read of acc/)
+    })
+
+    test("a stack-combo op (PEEK_PEEK) reading acc right after a REG_REG combo is rejected", () =>
+    {
+        const program: RtlProgram = {
+            procedures: [{ argCount: 0, body: [CONST(5), PUSH(), opRegWriteback("ADD", 0), opStack("ADD", "PEEK_PEEK"), bare("RETURN")] }],
+        }
+        assert.throws(() => validateProgram(program), /read of acc/)
+    })
+
+    test("a fresh producer between a write-back-in-place combo and its next read is accepted", () =>
+    {
+        const program: RtlProgram = {
+            procedures: [{ argCount: 0, body: [CONST(5), PUSH(), opRegWriteback("ADD", 0), CONST(1), bare("RETURN")] }],
+        }
+        assert.doesNotThrow(() => validateProgram(program))
+    })
+
+    test("BR_TABLE reading acc right after a REG_REG combo is rejected", () =>
+    {
+        const program: RtlProgram = {
+            procedures: [{
+                argCount: 0,
+                body: [CONST(5), PUSH(), opRegWriteback("ADD", 0), brTable(2), CONST(1), bare("RETURN"), CONST(2), bare("RETURN")],
+            }],
+        }
+        assert.throws(() => validateProgram(program), /read of acc/)
+    })
+
+    test("a case that clobbers acc merges safely with a sibling that doesn't, since the whole construct is treated as poisoned afterward", () =>
+    {
+        const program: RtlProgram = {
+            procedures: [{
+                argCount: 0,
+                body: [
+                    CONST(5), PUSH(),
+                    brTable(2),
+                    opRegWriteback("ADD", 0), bare("BLOCK_END"), // case 0: leaves acc poisoned
+                    CONST(1), bare("BLOCK_END"),                  // case 1: leaves acc live
+                    CONST(9), bare("RETURN"),                      // merge point: never reads the pre-merge acc, so this is fine either way
+                ],
+            }],
+        }
         assert.doesNotThrow(() => validateProgram(program))
     })
 })

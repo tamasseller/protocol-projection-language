@@ -286,16 +286,12 @@ describe("Bytecode codec — program framing (isa-core.md §5.5)", () =>
         assert.equal(second.next, combined.length)
     })
 
-    test("header rows come before any body byte — a decoder never touches body N's bytes to size body 0", () =>
+    test("no header table — each procedure's own arg_count sits directly before its own body", () =>
     {
-        // Two procedures whose bodies are deliberately different lengths;
-        // if the header table were interleaved with (or after) body bytes
-        // instead of preceding all of them, slicing body 0 by its declared
-        // length would still work by construction — so this instead directly
-        // checks the byte layout itself: the header table's own encoded
-        // length must exactly equal (1 count byte) + 2 * (1 argCount byte +
-        // 1 bodyLength byte) for two single-byte-argCount, sub-128-byte
-        // bodies, before any RETURN/CALL opcode byte appears.
+        // §5.5: no stored body length, no separate header block — decode
+        // finds each body's own end by walking it (`decodeProcBody`), so
+        // the wire bytes interleave arg_count with that same procedure's
+        // body instead of grouping every arg_count up front.
         const program: RtlProgram = {
             procedures: [
                 { argCount: 0, body: [bare("RETURN")] },                    // 1 byte body
@@ -303,8 +299,33 @@ describe("Bytecode codec — program framing (isa-core.md §5.5)", () =>
             ],
         }
         const bytes = encodeProgram(program)
-        // count(1) + [argCount(1) bodyLength(1)] * 2 = 5 header bytes, then
-        // body 0's single RETURN byte (100), then body 1's CONST/RETURN.
-        assert.deepEqual([...bytes], [2, 0, 1, 0, 2, 100, 108 + 1, 100])
+        // count(2), argCount_0(0), body_0's RETURN(100), argCount_1(0),
+        // body_1's CONST(108+1)/RETURN(100) — no bodyLength byte anywhere.
+        assert.deepEqual([...bytes], [2, 0, 100, 0, 108 + 1, 100])
+    })
+
+    test("a LOOP body block closed by a bare terminator (isa-core.md §7.2) still self-delimits correctly", () =>
+    {
+        // The one shape decodeProcBody's frame-*kind* tracking exists for:
+        // a terminator that closes an inner loop must not be mistaken for
+        // the end of the whole procedure when an outer scope's own bytes
+        // still follow it.
+        const program: RtlProgram = {
+            procedures: [
+                {
+                    argCount: 0,
+                    body: [
+                        CONST(1), bare("LOOP"), bare("BLOCK_END"),
+                        CONST(42), bare("RETURN"), // bare terminator closes the loop body — not the procedure
+                        CONST(0), bare("RETURN"),  // the outer scope's own tail, reached via the cond-false exit
+                    ],
+                },
+                { argCount: 0, body: [bare("RETURN")] }, // proves decode didn't run past proc 0 into this one
+            ],
+        }
+        const bytes = encodeProgram(program)
+        const decoded = decodeProgram(bytes)
+        assert.deepEqual(decoded.program, program)
+        assert.equal(decoded.next, bytes.length)
     })
 })

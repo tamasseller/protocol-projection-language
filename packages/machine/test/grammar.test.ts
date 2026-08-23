@@ -346,7 +346,7 @@ describe("Rejection", () =>
     // Block is only reachable as the direct body of if/else/while/for
     // (ControlBody in grammer.pegjs), because only those positions have a
     // real RTL block construct to reclaim the block's locals at BLOCK_END
-    // (see docs/isa-core.md §20.2, §15.1).
+    // (see isa-core.md §20.2, §15.1).
     test("rejects bare block statement at top level", () =>
     {
         assert.throws(() => parse("u32 x = 1; { u32 y = 2; } return x;"), SyntaxError)

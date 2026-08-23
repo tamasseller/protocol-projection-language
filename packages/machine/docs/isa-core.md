@@ -349,20 +349,26 @@ small natural ceiling.
 ### 5.5 Program framing
 
 A whole program (§2.3: a procedure table, entry at index 0) serializes as
-one procedure count, one fixed-shape header row per procedure, then every
-body concatenated in table order:
+one procedure count, then each procedure's own `arg_count` immediately
+followed by its own body — no separate header table, no stored body
+length:
 
 ```
-program := proc_count:LEB128
-           (arg_count:LEB128  body_length:LEB128){proc_count}
-           (body_bytes){proc_count}
+program   := proc_count:LEB128  procedure{proc_count}
+procedure := arg_count:LEB128  body_bytes
 ```
 
-Header rows come first as one block, so a decoder computes every
-procedure's exact byte range from `body_length` alone without touching a
-body byte. Lengths rather than absolute offsets: an offset is the prefix
-sum of preceding lengths, and lengths are what a decoder needs to size a
-buffer or skip a body.
+A body needs no length prefix because it is self-delimiting: §8.4 forbids
+anything following a terminator within the same block, so the first
+terminator seen back at nesting depth zero is guaranteed to be the body's
+own last byte — a decoder derives that boundary by tracking open
+`LOOP`/`BR_TABLE` nesting the same way any consumer already has to
+(§7.1/§7.2), never from a stored length. §7.2's own allowance — a `LOOP`
+body block closed by a bare terminator instead of `BLOCK_END` — is the one
+wrinkle: that terminator closes its enclosing `loopBody` frame too, so a
+decoder tracks frame *kind*, not just a nesting count, to tell "this ends
+the procedure" apart from "this closes an inner loop; the outer scope's
+own bytes continue right after it."
 
 `arg_count` is the only core-mandated wire-level header field. A
 procedure header's extension fields (§2.3, §11.4) are not wire-encoded:

@@ -20,12 +20,12 @@
  * each call site's *actual* TOS depth (which is usually less than the
  * caller's own overall peak — that peak may be reached at some other,
  * unrelated point in the caller) rather than the caller's whole-procedure
- * maximum. See `totalDepthOf` below and validate.test.ts's dedicated test
+ * maximum. See `depthsOf` below and validate.test.ts's dedicated test
  * for a worked example of the two bounds actually differing.
  */
 
 import type { RtlProc, RtlProgram, RtlInstr, ExtOpPayload } from "./rtl"
-import { isExtInstr, isStackComboInstr, isRegComboInstr } from "./rtl"
+import { isExtInstr, isStackComboInstr, isRegComboInstr, isImmComboInstr } from "./rtl"
 import type { Extension, ExtOpEffect } from "./extension"
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -42,6 +42,16 @@ export interface ProgramStats
 {
     /** One entry per procedure, in procedure-table order. */
     procedures: readonly ProcedureStats[]
+    /** The largest number of simultaneously active frames on any path from
+     *  procedure 0 (isa-core.md §8.3's second DFS figure) — each call
+     *  site's own contribution is `1 + ` the callee's own worst case.
+     *  Independent of `totalDepth`: a long shallow chain has a small
+     *  `totalDepth` and a large `maxCallDepth`, an operand-heavy single
+     *  frame the reverse. Sizes whatever a backend remembers "resume here"
+     *  across a call with — free for one implementing `CALL`/`RETURN` by
+     *  native recursion, load-bearing for one threading invocation through
+     *  an explicit loop with a pre-sized array of return records. */
+    maxCallDepth: number
     /** Worst-case total TOS depth reachable from procedure 0 (the
      *  convention `lowerProgram` and `vm.ts`'s `run` both already use for
      *  "the entry procedure"), computed via each call site's actual depth
@@ -57,7 +67,7 @@ export interface ProgramStats
 /** How many of a call-shaped op's `argCount` logical arguments are actually
  *  popped off the stack — all but the last, which arrives in `acc` instead
  *  (rtl.ts's `call` doc comment). Shared by `CALL`'s own bookkeeping, an
- *  extension's call-shaped `effect.calleeOf`, and `totalDepthOf`'s frame-base
+ *  extension's call-shaped `effect.calleeOf`, and `depthsOf`'s frame-base
  *  computation, so the three stay in agreement about the convention. */
 function stackArgsOf(argCount: number): number
 {
@@ -113,11 +123,35 @@ function walkProcedure<E extends { ext: string } = ExtOpPayload>(
     }
 
     /** Walk one block (the top-level body, one `BR_TABLE` case, or one
-     *  `LOOP` sub-block) from `pc`, starting at `entryTos`. Returns where
-     *  its own close is and whether that close was a terminator. */
-    function walk(pc: number, entryTos: number): { nextPc: number; terminated: boolean }
+     *  `LOOP` sub-block) from `pc`, starting at `entryTos`/`entryAccLive`.
+     *  Returns where its own close is, whether that close was a
+     *  terminator, and what `acc`'s liveness is by the time it closes.
+     *
+     *  `accLive` mirrors rtl.ts's own acc-clobbering convention
+     *  (docs/design.md §10.1, §16 item 2): every op either reads acc,
+     *  produces a fresh value into it, or (a write-back-in-place combo,
+     *  REG_REG/PEEK_PEEK) clobbers it — matching `raise.ts`'s own
+     *  `this.acc = undefined` and `vm.ts`'s own dynamic tracking. `LOOP`'s
+     *  condition sub-block is walked using whatever `accLive` was
+     *  immediately before `LOOP` opened, then the body inherits the
+     *  condition's own exit — a *forward*, single-pass account, same as
+     *  `tos`; it does not also re-verify the condition sub-block against
+     *  whatever the body's own back-edge would leave pending, the way
+     *  `BR_TABLE`'s sibling cases get reconciled below. A hand-crafted
+     *  program that's only unsafe on that specific back-edge is a known,
+     *  accepted gap here — `vm.ts`'s own dynamic check (§16 item 2) still
+     *  catches it the moment that path actually executes — matching this
+     *  file's existing tolerance for similar static-analysis gaps (see
+     *  this function's own doc comment on dead-code detection). */
+    function walk(pc: number, entryTos: number, entryAccLive: boolean): { nextPc: number; terminated: boolean; exitAccLive: boolean }
     {
         let tos = entryTos
+        let accLive = entryAccLive
+
+        function requireAcc(context: string): void
+        {
+            if(!accLive) fail(pc, `${context}: read of acc after a write-back-in-place combo clobbered it (docs/design.md §10.1's acc-clobbering convention)`)
+        }
 
         for(;;)
         {
@@ -130,21 +164,24 @@ function walkProcedure<E extends { ext: string } = ExtOpPayload>(
             const instr: RtlInstr<E> = body[pc]!
             peak = Math.max(peak, tos)
 
-            if(instr.op === "BLOCK_END") return { nextPc: pc + 1, terminated: false }
-            if(instr.op === "RETURN" || instr.op === "TRAP") return { nextPc: pc + 1, terminated: true }
+            if(instr.op === "BLOCK_END") return { nextPc: pc + 1, terminated: false, exitAccLive: accLive }
+            if(instr.op === "RETURN") { requireAcc("RETURN"); return { nextPc: pc + 1, terminated: true, exitAccLive: accLive } }
+            if(instr.op === "TRAP") return { nextPc: pc + 1, terminated: true, exitAccLive: accLive }
 
-            if(instr.op === "PUSH") { tos++; pc++; continue }
+            if(instr.op === "PUSH") { requireAcc("PUSH"); tos++; pc++; continue }
 
             if(instr.op === "POP")
             {
                 if(tos <= entryTos) fail(pc, `POP would underflow below this block's entry depth (${entryTos})`)
-                tos--; pc++; continue
+                tos--; accLive = true; pc++; continue
             }
 
             if(isStackComboInstr(instr))
             {
                 if(tos <= entryTos)
                     fail(pc, `${instr.op} ${instr.combo} would read below this block's entry depth (${entryTos})`)
+                requireAcc(`${instr.op} ${instr.combo}`)
+                accLive = instr.combo === "POP_ACC" // POP_ACC produces a fresh value; PEEK_PEEK clobbers (write-back-in-place)
                 if(instr.combo === "POP_ACC") tos--
                 pc++; continue
             }
@@ -156,8 +193,10 @@ function walkProcedure<E extends { ext: string } = ExtOpPayload>(
                 const stackArgs = stackArgsOf(callee.argCount)
                 if(tos - stackArgs < entryTos)
                     fail(pc, `CALL ${instr.calleeIndex}: only ${tos - entryTos} value(s) pushed, needs ${stackArgs}`)
+                if(callee.argCount > 0) requireAcc(`CALL ${instr.calleeIndex}`)
                 callSites.push({ calleeIndex: instr.calleeIndex, tos })
                 tos -= stackArgs
+                accLive = true // the callee's return value
                 pc++; continue
             }
 
@@ -190,24 +229,48 @@ function walkProcedure<E extends { ext: string } = ExtOpPayload>(
                 tos += effect.tosDelta
                 if(tos < entryTos) fail(pc, `EXT ${instr.ext}: net effect would underflow below this block's entry depth (${entryTos})`)
 
-                if(effect.terminates) return { nextPc: pc + 1, terminated: true }
+                // Extension ops are opaque to the core's own acc-clobbering
+                // convention (their effect on acc, if any, is entirely
+                // their own business — vm.ts's EXT case doesn't model
+                // accLive either) — accLive passes through unchanged.
+                if(effect.terminates) return { nextPc: pc + 1, terminated: true, exitAccLive: accLive }
                 pc++; continue
             }
 
             if(instr.op === "BR_TABLE")
             {
+                requireAcc("BR_TABLE")
                 let p = pc + 1
+                let combinedAccLive = true
                 for(let k = 0; k < instr.imm; k++)
-                    ({ nextPc: p } = walk(p, tos))
-                pc = p; continue
+                {
+                    const caseResult = walk(p, tos, accLive)
+                    p = caseResult.nextPc
+                    combinedAccLive = combinedAccLive && caseResult.exitAccLive
+                }
+                pc = p
+                // Safe regardless of which sibling case actually ran at
+                // runtime only if *every* case agrees acc is live — one
+                // case leaving it pending/poisoned while another leaves it
+                // live would let the merged code's own belief depend on
+                // which case happened to run (this file's own bottom-row
+                // acc-fold hazard, one level up).
+                accLive = combinedAccLive
+                continue
             }
 
             if(instr.op === "LOOP")
             {
-                const cond = walk(pc + 1, tos)
+                const cond = walk(pc + 1, tos, accLive)
                 if(cond.terminated) fail(pc, `LOOP's condition sub-block must close with BLOCK_END, not a terminator`)
-                const body_ = walk(cond.nextPc, tos)
-                pc = body_.nextPc; continue
+                const body_ = walk(cond.nextPc, tos, cond.exitAccLive)
+                pc = body_.nextPc
+                // Code after the whole LOOP is reached only via the
+                // condition sub-block's own exit path (isa-core.md §7.2) —
+                // never via the body, which either loops back or
+                // terminates on its own.
+                accLive = cond.exitAccLive
+                continue
             }
 
             // A register only becomes live once TOS has grown past it (via
@@ -220,14 +283,22 @@ function walkProcedure<E extends { ext: string } = ExtOpPayload>(
             if(isRegComboInstr(instr) && instr.target >= tos)
                 fail(pc, `${instr.op} ${instr.combo} ${instr.target}: register not below current TOS (${tos}) — never established by a PUSH`)
 
-            // CONST, IMM_ACC combos, unary ops: no register operand at all,
-            // nothing further to check; PEEK_PEEK/POP_ACC's own TOS-underflow
-            // check already ran above (isStackComboInstr).
+            if(instr.op === "STORE") requireAcc("STORE")
+            else if(isRegComboInstr(instr)) requireAcc(`${instr.op} ${instr.combo} ${instr.target}`)
+            else if(isImmComboInstr(instr)) requireAcc(`${instr.op} #${instr.imm}`)
+            else if(instr.op === "NEG" || instr.op === "NOT" || instr.op === "CLZ" || instr.op === "REVBITS") requireAcc(instr.op)
+
+            if(instr.op === "LOAD" || instr.op === "CONST") accLive = true
+            else if(isRegComboInstr(instr)) accLive = instr.combo === "REG_ACC" // REG_REG clobbers (write-back-in-place)
+            else if(isImmComboInstr(instr)) accLive = true
+            else if(instr.op === "NEG" || instr.op === "NOT" || instr.op === "CLZ" || instr.op === "REVBITS") accLive = true
+            // STORE: acc keeps whatever it already held.
+
             pc++
         }
     }
 
-    const { nextPc, terminated } = walk(0, proc.argCount)
+    const { nextPc, terminated } = walk(0, proc.argCount, true)
     if(!terminated) fail(nextPc, `BLOCK_END with no open block (procedure bodies close only via RETURN/TRAP)`)
     if(nextPc !== body.length) fail(nextPc, `unreachable instruction(s) after the procedure's terminator`)
 
@@ -248,30 +319,42 @@ function walkProcedure<E extends { ext: string } = ExtOpPayload>(
  * graph has a cycle (§8.2) — acyclicity and the tight depth fall out of the
  * same walk.
  */
-function totalDepthOf<E extends { ext: string } = ExtOpPayload>(
+interface Depths { totalDepth: number; maxCallDepth: number }
+
+/** One memoized DFS yields both isa-core.md §8.3 figures at once — same
+ *  recursion, same cycle guard, so `maxCallDepth` never needed a second
+ *  walk of its own. `totalDepth`: `max(localPeak, max over call sites of
+ *  calleeFrameBase + the callee's own totalDepth)`. `maxCallDepth`: `max(0,
+ *  max over call sites of 1 + the callee's own maxCallDepth)` — the largest
+ *  number of simultaneously active frames on any path, independent of how
+ *  deep any one of those frames' own operand stack goes. */
+function depthsOf<E extends { ext: string } = ExtOpPayload>(
     index: number,
     program: RtlProgram<E>,
     perProcedure: readonly WalkOutcome[],
-    memo: Map<number, number>,
+    memo: Map<number, Depths>,
     visiting: Set<number>,
-): number
+): Depths
 {
     const cached = memo.get(index)
     if(cached !== undefined) return cached
     if(visiting.has(index)) throw new Error(`call-graph cycle detected: procedure ${index} calls itself, directly or transitively`)
 
     visiting.add(index)
-    let best = perProcedure[index]!.localPeak
+    let totalDepth = perProcedure[index]!.localPeak
+    let maxCallDepth = 0
     for(const { calleeIndex, tos } of perProcedure[index]!.callSites)
     {
         const calleeFrameBase = tos - stackArgsOf(program.procedures[calleeIndex]!.argCount)
-        const contribution = calleeFrameBase + totalDepthOf(calleeIndex, program, perProcedure, memo, visiting)
-        best = Math.max(best, contribution)
+        const callee = depthsOf(calleeIndex, program, perProcedure, memo, visiting)
+        totalDepth = Math.max(totalDepth, calleeFrameBase + callee.totalDepth)
+        maxCallDepth = Math.max(maxCallDepth, 1 + callee.maxCallDepth)
     }
     visiting.delete(index)
 
-    memo.set(index, best)
-    return best
+    const result: Depths = { totalDepth, maxCallDepth }
+    memo.set(index, result)
+    return result
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -283,12 +366,14 @@ export function validateProgram<E extends { ext: string } = ExtOpPayload>(progra
     const effects = extension?.effects
     const perProcedure = program.procedures.map((proc, i) => walkProcedure(proc, program, i, effects))
 
-    const memo = new Map<number, number>()
+    const memo = new Map<number, Depths>()
     for(let i = 0; i < program.procedures.length; i++)
-        totalDepthOf(i, program, perProcedure, memo, new Set())
+        depthsOf(i, program, perProcedure, memo, new Set())
 
+    const { totalDepth, maxCallDepth } = memo.get(0)!
     return {
         procedures: perProcedure.map(p => ({ localPeak: p.localPeak })),
-        totalDepth: memo.get(0)!,
+        totalDepth,
+        maxCallDepth,
     }
 }
