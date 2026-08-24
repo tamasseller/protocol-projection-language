@@ -328,7 +328,7 @@ static table is equally normative, and on a target without a hardware
 divider it is the only sane choice: `jit-armv6m` decodes through a
 108-entry table precisely because `code / 5` and `code % 5` otherwise
 compile to two libgcc `__udivsi3` calls per instruction decoded. A decoder
-is free to pick either; `jit-armv6m/compiler/test/host/test_decode_encode.cpp`
+is free to pick either; `jit-armv6m/test/host/test_decode_encode.cpp`
 checks its table against these formulas for every assigned opcode.
 
 ### 5.3 Reserved codes
