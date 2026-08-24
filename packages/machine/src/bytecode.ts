@@ -29,6 +29,7 @@
 
 import type { RtlInstr, RtlProc, RtlProgram, BinaryOpcode, UnaryOpcode, ExtOpPayload } from "./rtl"
 import type { Extension } from "./extension"
+import { validateProgram } from "./validate"
 
 // ── LEB128 ───────────────────────────────────────────────────────────────
 //
@@ -323,13 +324,43 @@ function decodeProcBody<E extends { ext: string } = ExtOpPayload>(bytes: Uint8Ar
         {
             // Empty stack *before* considering this terminator at all is
             // the real end — no open block means nothing was waiting on
-            // it as a closer. A `loopBody` frame popping down to empty
-            // (§7.2's own allowance) is a different thing: it ends that
-            // loop, not necessarily the procedure — the outer scope's own
-            // bytes (its cond-false exit path, say) may still follow.
+            // it as a closer. A frame popping down to empty right here
+            // (a loop's body, or a BR_TABLE's own last case) is a
+            // different thing: it closes *that* construct, not
+            // necessarily the procedure — the enclosing scope's own bytes
+            // (a loop's cond-false exit path, a BR_TABLE's own shared-end
+            // tail after its last case) may still follow, exactly as they
+            // would after an ordinary BLOCK_END close. A LOOP/BR_TABLE
+            // with nothing at all following it is validator-rejected
+            // (§8.4: falling off the end is invalid) regardless of how its
+            // last sub-block closes, so this function never has to tell
+            // "really done" apart from "just closed one level" by itself —
+            // the *next* terminator reached with the stack genuinely empty
+            // always settles it.
             if (stack.length === 0) return { body, next: pos }
             const top = stack[stack.length - 1]!
-            if (top.kind === "loopBody") stack.pop()
+            if (top.kind === "loopBody")
+            {
+                stack.pop()
+            }
+            else if (top.kind === "case")
+            {
+                // §8.5/blocks.cpp's resolveCaseClose: a bare terminator
+                // closes a case exactly like a BLOCK_END would, counting
+                // against the same N case-closers — not just the loopBody
+                // wrinkle this function's own header comment used to call
+                // out alone (found via a cross-check of this decoder
+                // against the real translator's own closeCaseViaTerminator,
+                // which does this same decrement — TDD: a BR_TABLE whose
+                // non-last case closes this way corrupted the next
+                // procedure's own boundary before this fix).
+                top.remaining -= 1
+                if (top.remaining === 0) stack.pop()
+            }
+            // top.kind === "loopCond": a bare terminator cannot legally
+            // close a LOOP's own condition sub-block (§8.5 requires
+            // BLOCK_END there) — leave it; malformed input surfaces as a
+            // later decode error instead of silently accepting it here.
         }
     }
 }
@@ -361,4 +392,44 @@ export function decodeProgram<E extends { ext: string } = ExtOpPayload>(bytes: U
     }
 
     return { program: { procedures }, next: pos }
+}
+
+// ── jit-armv6m's own wire envelope ──────────────────────────────────────
+//
+// A bare-metal JIT target needs two whole-program stats — `max_call_depth`,
+// `total_depth` — before it can compile a single instruction, to size its
+// static stack reservation (jit-armv6m/docs/design.md §2): unlike anything
+// else the core spec covers, it can't discover a stack-overflow risk at
+// runtime and recover from it, so the bound has to be known up front. This
+// is exactly the extension point §5.5/§11.4 already describe for a
+// procedure header's own fields ("added when a real need appears") — except
+// whole-program, not per-procedure, so it prepends the plain `encodeProgram`
+// blob rather than threading through each procedure's own header.
+// `validateProgram` already computes both numbers; nothing else about the
+// wire shape changes.
+
+/** Prepend `max_call_depth`/`total_depth` (`validateProgram`) to an
+ *  ordinary `encodeProgram` blob — the one real production path for a
+ *  flashable jit-armv6m image. */
+export function encodeJitProgram<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E>, extension?: Extension<E>): Uint8Array
+{
+    const { maxCallDepth, totalDepth } = validateProgram(program, extension)
+    return Uint8Array.from([
+        ...encodeLeb128(maxCallDepth),
+        ...encodeLeb128(totalDepth),
+        ...encodeProgram(program, extension),
+    ])
+}
+
+/** Inverse of `encodeJitProgram` — the two prepended stats, then an
+ *  ordinary `decodeProgram`. jit-armv6m's own C++ side has its own decoder
+ *  for this (it never runs TS); this exists for round-tripping on this
+ *  side, mirroring `decodeProgram`'s own `next`-reporting convention. */
+export function decodeJitProgram<E extends { ext: string } = ExtOpPayload>(bytes: Uint8Array, offset: number = 0, extension?: Extension<E>):
+    { maxCallDepth: number; totalDepth: number; program: RtlProgram<E>; next: number }
+{
+    const maxCallDepthR = decodeLeb128(bytes, offset)
+    const totalDepthR = decodeLeb128(bytes, maxCallDepthR.next)
+    const { program, next } = decodeProgram(bytes, totalDepthR.next, extension)
+    return { maxCallDepth: maxCallDepthR.value, totalDepth: totalDepthR.value, program, next }
 }
