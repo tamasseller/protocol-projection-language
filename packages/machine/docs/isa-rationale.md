@@ -48,6 +48,23 @@ semantics: the host owns all stream cleanup and handle teardown and decides
 the response. Every real ISA made the same call: x86 `INT`, ARM
 `BKPT`/`SVC`, RISC-V `EBREAK`, Wasm `unreachable`, eBPF exit-with-nonzero.
 
+**A split clobbers acc unconditionally (§8.7), stricter than it needs to be
+for any program this toolchain actually produces.** `lower.ts` never
+carries acc across a `BR_TABLE`/`LOOP` boundary — `lowerReturn` always
+freshly re-lowers its own argument, `lowerBlock` is a flat concatenation of
+independently-lowered fragments, and no statement-level construct threads
+a value through a branch boundary — so no real compiled program is made
+illegal by this rule. It exists to close a JIT-backend bug (jit-armv6m's
+comparison-fusion optimization defers a comparison's boolean to a CPU
+condition code and never materializes it on the edge that skips the branch
+body) by construction: rather than teach every backend to correctly
+compile a pattern nothing legitimate uses, the pattern is simply not valid
+input. This also sets up the general discipline a future value-producing
+branch construct (a ternary — parsed today but not yet lowered) would need:
+"split clobbers, join requires an explicit flush on every incoming edge" is
+standard SSA/phi-node discipline, so nothing here forecloses a real value
+legitimately crossing a branch later.
+
 **Bare block statements are excluded from the DSL.** A `{ ... }` is only
 reachable as the direct body of `if`/`else`/`while`/`for`. `BLOCK_END` is
 what resets TOS to a block's entry depth (isa-core.md §8.1), and a

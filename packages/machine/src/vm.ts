@@ -150,11 +150,12 @@ function runProc<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E
     const regs: number[] = [...args]
     let tos = args.length
     let acc = 0
-    // Poisoned by a write-back-in-place combo (REG_REG/PEEK_PEEK) — matches
-    // raise.ts's own `this.acc = undefined` (docs/design.md §10.1's
-    // acc-clobbering convention). `acc` itself stays a plain `number`
-    // (whatever it last held) so reading it while poisoned still throws
-    // instead of silently returning a stale, bit-accurate-by-luck value.
+    // Poisoned by a write-back-in-place combo (REG_REG/PEEK_PEEK) or by
+    // entering a BR_TABLE/LOOP split successor (isa-core.md §8.7) — matches
+    // raise.ts's own `this.acc = undefined`. `acc` itself stays a plain
+    // `number` (whatever it last held) so reading it while poisoned still
+    // throws instead of silently returning a stale, bit-accurate-by-luck
+    // value.
     let accLive = true
     let pc = 0
     let steps = 0
@@ -162,7 +163,7 @@ function runProc<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E
 
     function requireAccLive(context: string): void
     {
-        assert.ok(accLive, `${context}: read of acc after a write-back-in-place combo clobbered it (docs/design.md §10.1's acc-clobbering convention)`)
+        assert.ok(accLive, `${context}: read of acc after a write-back-in-place combo or a CFG split clobbered it (isa-core.md §8.7's acc-clobbering convention)`)
     }
 
     // The state surface an extension's `exec` is allowed to touch — no pc,
@@ -293,6 +294,11 @@ function runProc<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E
             case "BR_TABLE": {
                 requireAccLive("BR_TABLE")
                 const N = i.imm
+                // isa-core.md §8.7: a split clobbers acc unconditionally —
+                // every successor (a selected case, or the implicit
+                // default that skips all of them) starts dead, regardless
+                // of what was live going into the dispatch.
+                accLive = false
                 if(acc >= N) { pc = skipBlocks(body, pc + 1, N); break } // implicit default
                 pc = skipBlocks(body, pc + 1, acc) // skip cases before the selected one
                 ctrl.push({kind: "case", remaining: N - acc - 1, entryTos: tos})
@@ -323,6 +329,10 @@ function runProc<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E
                 if(top.kind === "loopCond")
                 {
                     requireAccLive("LOOP condition")
+                    // isa-core.md §8.7: both successors of this split — the
+                    // exit and the body — start dead, regardless of what
+                    // the condition itself left behind.
+                    accLive = false
                     if(acc === 0) { pc = skipBlocks(body, pc + 1, 1); break } // exit: skip the body block
                     ctrl.push({kind: "loopBody", loopPc: top.loopPc, entryTos: top.entryTos})
                     pc++

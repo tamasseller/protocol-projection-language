@@ -22,7 +22,7 @@ import type {
     ForStatement, SwitchStatement, VariableDeclaration, ReturnStatement,
     ExpressionStatement, Expression,
 } from "./ast"
-import {RtlProc, RtlProgram, RtlInstr, bare, brTable} from "./rtl"
+import {RtlProc, RtlProgram, RtlInstr, bare, brTable, CONST} from "./rtl"
 import type {ExtOpPayload} from "./rtl"
 import type {Procedure} from "./ir"
 import assert from "assert"
@@ -258,7 +258,16 @@ function lowerReturn<E extends { ext: string } = ExtOpPayload>(s: ReturnStatemen
         return [...node.fragment, bare("RETURN")]
     }
 
-    return [bare("RETURN")]
+    // A bare `return;` has no source-level value, but the bytecode-level
+    // RETURN opcode always reads acc regardless (isa-core.md §8.7 requires
+    // it live, and the calling convention has no void variant). Previously
+    // this relied on whatever residual value happened to precede it —
+    // harmless under the old permissive spec, but exactly the pattern
+    // §8.7 now rejects when the preceding code was a branch's own split
+    // (e.g. `if (x == 0) { return; }`'s no-else-if lowering). An explicit
+    // producer makes this correct regardless of what's live going in; the
+    // value itself is never observed by any caller of a void return.
+    return [CONST(0), bare("RETURN")]
 }
 
 function logicInvertRoot(expr: EastExpression): EastExpression
@@ -353,7 +362,11 @@ function lowerIf<E extends { ext: string } = ExtOpPayload>(s: IfStatement, alloc
 
     if(s.alternate)
     {
-        const test = lowerExpr(s.test as EastExpression<E>, alloc.rules(), "acc")
+        // BR_TABLE 2 is index-exact (isa-core.md §4.5), not lenient like a
+        // raw truthy test, so `acc` must be forced to exactly 0/1 first —
+        // same normalization as the no-else path below, and the same reason.
+        // Arm order then matches §7.1: case[0] = then, case[1] = else.
+        const test = lowerExpr(logicInvertRoot(s.test as EastExpression) as EastExpression<E>, alloc.rules(), "acc")
         assert.ok(test, `Failed to lower if test expression`)
 
         const elseTerm = lowerControlBody(s.alternate, new RegAlloc<E>(alloc))
@@ -362,8 +375,8 @@ function lowerIf<E extends { ext: string } = ExtOpPayload>(s: IfStatement, alloc
         return [
             ...test.fragment,
             brTable(2),
-            ...closeControlBody(s.alternate, elseTerm),
             ...closeControlBody(s.consequent, thenTerm),
+            ...closeControlBody(s.alternate, elseTerm),
         ]
     }
     else

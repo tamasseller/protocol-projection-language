@@ -14,7 +14,7 @@ import assert from "node:assert/strict"
 import { ir, proc } from "../src/ir"
 import { lowerProgram } from "../src/lower"
 import { validateProgram } from "../src/validate"
-import { bare, call, brTable, trap, PUSH, POP, CONST, opStack, opRegWriteback } from "../src/rtl"
+import { bare, call, brTable, trap, PUSH, POP, CONST, LOAD, STORE, opStack, opImm, opRegWriteback } from "../src/rtl"
 import type { RtlProgram, RtlProc } from "../src/rtl"
 
 describe("validateProgram — happy path (real pipeline)", () =>
@@ -218,7 +218,8 @@ describe("validateProgram — §8.5 header/block well-formedness", () =>
         // isa-core.md §7.2: a legitimate, non-cyclic use of LOOP purely to
         // host a pre-test. The condition's own exit path (acc=0) falls
         // through past the *whole* construct, so there must be something
-        // reachable there too — not just inside the body.
+        // reachable there too — not just inside the body. §8.7: that exit
+        // edge starts acc-dead, so the reachable code needs its own producer.
         const program: RtlProgram = {
             procedures: [{
                 argCount: 0,
@@ -226,7 +227,7 @@ describe("validateProgram — §8.5 header/block well-formedness", () =>
                     bare("LOOP"),
                     CONST(0), bare("BLOCK_END"),  // condition sub-block
                     CONST(5), bare("RETURN"),     // body sub-block, closed by a terminator
-                    bare("RETURN"),               // reached via the condition's own exit path
+                    CONST(9), bare("RETURN"),     // reached via the condition's own exit path — fresh producer (§8.7)
                 ],
             }],
         }
@@ -308,9 +309,83 @@ describe("validateProgram — §16 item 2: acc-clobbering convention enforcement
                 body: [
                     CONST(5), PUSH(),
                     brTable(2),
-                    opRegWriteback("ADD", 0), bare("BLOCK_END"), // case 0: leaves acc poisoned
-                    CONST(1), bare("BLOCK_END"),                  // case 1: leaves acc live
-                    CONST(9), bare("RETURN"),                      // merge point: never reads the pre-merge acc, so this is fine either way
+                    CONST(2), opRegWriteback("ADD", 0), bare("BLOCK_END"), // case 0: fresh producer (§8.7: case starts acc-dead), then poisons it again
+                    CONST(1), bare("BLOCK_END"),                            // case 1: leaves acc live
+                    CONST(9), bare("RETURN"),                                // merge point: never reads the pre-merge acc, so this is fine either way
+                ],
+            }],
+        }
+        assert.doesNotThrow(() => validateProgram(program))
+    })
+})
+
+describe("validateProgram — §8.7 acc liveness across control flow", () =>
+{
+    test("a BR_TABLE case reading acc immediately, with no producer of its own, is rejected (used to inherit the pre-dispatch value before §8.7)", () =>
+    {
+        const program: RtlProgram = {
+            procedures: [{ argCount: 0, body: [brTable(1), bare("RETURN")] }],
+        }
+        assert.throws(() => validateProgram(program), /read of acc/)
+    })
+
+    test("a LOOP body reading acc immediately after the condition closes, with no producer of its own, is rejected", () =>
+    {
+        const program: RtlProgram = {
+            procedures: [{
+                argCount: 0,
+                body: [
+                    bare("LOOP"),
+                    CONST(1), bare("BLOCK_END"), // condition sub-block: establishes and reads acc fine
+                    bare("RETURN"),               // body: reads acc with no producer of its own
+                ],
+            }],
+        }
+        assert.throws(() => validateProgram(program), /read of acc/)
+    })
+
+    test("code immediately after a whole LOOP reading acc, with no producer of its own, is rejected (the loop-exit shape a fused comparison's un-materialized boolean used to break)", () =>
+    {
+        const program: RtlProgram = {
+            procedures: [{
+                argCount: 1,
+                body: [
+                    bare("LOOP"),
+                    LOAD(0), opImm("LT_U", 5), bare("BLOCK_END"),           // condition: r0 < 5
+                    LOAD(0), opImm("ADD", 1), STORE(0), bare("BLOCK_END"), // body: r0 = r0 + 1
+                    bare("RETURN"),                                         // exit edge: reads acc (the LT_U result) with no producer of its own
+                ],
+            }],
+        }
+        assert.throws(() => validateProgram(program), /read of acc/)
+    })
+
+    test("a BR_TABLE where every sibling case re-establishes acc before the merge is still accepted", () =>
+    {
+        const program: RtlProgram = {
+            procedures: [{
+                argCount: 0,
+                body: [
+                    brTable(2),
+                    CONST(1), bare("BLOCK_END"), // case 0: fresh producer
+                    CONST(2), bare("BLOCK_END"), // case 1: fresh producer
+                    bare("RETURN"),               // merge point: safe, since every case re-established acc
+                ],
+            }],
+        }
+        assert.doesNotThrow(() => validateProgram(program))
+    })
+
+    test("a LOOP whose exit code never reads acc at all is still accepted", () =>
+    {
+        const program: RtlProgram = {
+            procedures: [{
+                argCount: 0,
+                body: [
+                    bare("LOOP"),
+                    CONST(0), bare("BLOCK_END"), // condition: acc=0, exits every time
+                    CONST(5), bare("RETURN"),    // body (statically present, never actually taken)
+                    trap(0),                      // exit edge: TRAP never reads acc, so the exit's own liveness never matters
                 ],
             }],
         }

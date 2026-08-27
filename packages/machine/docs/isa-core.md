@@ -569,6 +569,31 @@ location, so such a program would validate and run under the reference
 interpreter's defensive fallback for an unwritten slot, only to be
 untranslatable by that class of backend with no diagnostic.
 
+### 8.7 Acc liveness across control flow
+
+Acc liveness is a derived static property, tracked forward. A
+write-back-in-place combo (`REG_REG`/`PEEK_PEEK` — §4.1) invalidates it
+without re-establishing it. Every instruction that reads acc as an implicit
+operand — an arithmetic/comparison combo, `STORE`, `PUSH`, `RETURN`,
+`NEG`/`NOT`/`CLZ`/`REVBITS`, a `CALL` whose callee takes at least one
+argument, or a `BR_TABLE`/`LOOP`-condition dispatch itself — is a
+validation error if acc is not live at that point.
+
+`BR_TABLE` and `LOOP` are this ISA's only two multi-successor-edge
+constructs. **A CFG split point clobbers acc unconditionally**: every
+successor edge — a `BR_TABLE` case, a `LOOP` body, a `LOOP` exit — starts
+with acc *not live*, regardless of what was live going into the split. A
+value is live past a merge point only if every edge into it explicitly
+re-established it:
+
+- `BR_TABLE`: acc is live after the whole construct only if every case
+  independently leaves it live by the time it closes — the logical AND
+  across siblings.
+- `LOOP`: acc's liveness after the whole construct is exactly what the
+  condition sub-block's own external-entry evaluation exits with — code
+  after a `LOOP` is reached only via the condition's own false exit
+  (§7.2), never the body or its back-edge.
+
 ---
 
 ## 9. Resource Guarantees

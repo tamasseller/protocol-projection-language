@@ -137,6 +137,22 @@ describe("If / else", () =>
                 return 200;
         `, 200)
     })
+
+    // Truthy (non-comparison) discriminant with an else arm: BR_TABLE 2 is
+    // index-exact, so acc must be normalized to {0,1} regardless of what
+    // kind of expression the test is — not just when it's a comparison.
+    for(const [x, expected] of [[0, 200], [1, 100], [2, 100], [5, 100], [0x80, 100]] as const)
+    {
+        test(`if-else, truthy discriminant, x=${x}`, () =>
+        {
+            assertReturn(`
+                u32 x = ${x};
+                u32 y = 7;
+                if (x) { y = 100; } else { y = 200; }
+                return y;
+            `, expected)
+        })
+    }
 })
 
 describe("While loop", () =>
