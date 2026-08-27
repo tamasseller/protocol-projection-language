@@ -272,8 +272,6 @@ point; choosing what to do with it is real target-codegen work.
   meta-argument to say what merges with what, since it favors some variants
   heavily over others compactness-wise.
 - Target-side transformation (unit of measurement).
-- MCU JIT compiler (Generic Core → ARMv6-M, runtime-injected fragments,
-  on-demand compile/evict/compact). See `jit-armv6m/docs/design.md`.
 
 ---
 
