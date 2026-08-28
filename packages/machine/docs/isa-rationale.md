@@ -59,11 +59,30 @@ comparison-fusion optimization defers a comparison's boolean to a CPU
 condition code and never materializes it on the edge that skips the branch
 body) by construction: rather than teach every backend to correctly
 compile a pattern nothing legitimate uses, the pattern is simply not valid
-input. This also sets up the general discipline a future value-producing
-branch construct (a ternary — parsed today but not yet lowered) would need:
-"split clobbers, join requires an explicit flush on every incoming edge" is
-standard SSA/phi-node discipline, so nothing here forecloses a real value
-legitimately crossing a branch later.
+input. The rule is total — acc is dead after the whole construct too, not
+just on entry to each case — for a structural reason rather than a
+conservative one: the standard phi discipline ("join requires an explicit
+flush on every incoming edge") cannot be honoured at a `BR_TABLE` join at
+all, because the implicit default is the one edge in this ISA that holds no
+instructions. There is nowhere to put the flush. Making the rule depend on
+whether `acc ≥ N` is reachable would be worse than useless as an interface:
+it turns the spec into "whatever range analysis this validator happens to
+implement", so a second conforming implementation could not be written from
+the spec at all.
+
+The consequence for a future value-producing branch (a ternary — parsed
+today but not yet lowered) is that its result travels in a TOS slot, not in
+acc (isa-core.md §8.7). The alternative would be a *declared* exhaustive
+dispatch — an opcode carrying "this dispatch is total, `acc ≥ N` traps" —
+so that the property is read off the instruction instead of inferred. (The
+out-of-range `trap()` §7.1 mentions already has a home without it: close
+every case with a terminator and the code after the construct *is* the
+default's, as docs/codec-extension.md §8.7's variant decoder does.) That is
+a legitimate §5.3 candidate, but a
+costly one: `BR_TABLE` already spends three of the five local-flow codes, an
+exhaustive flavour needs two more of the four reserved, and §5.3's own
+standard is one narrowly-scoped *measured* addition. A ternary that is
+parsed but not lowered is not a measurement, so the codes stay unspent.
 
 **Bare block statements are excluded from the DSL.** A `{ ... }` is only
 reachable as the direct body of `if`/`else`/`while`/`for`. `BLOCK_END` is

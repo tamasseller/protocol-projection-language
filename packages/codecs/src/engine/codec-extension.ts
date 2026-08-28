@@ -153,9 +153,16 @@ type Frame = Handle[]
  *  `exec()`'s own `Extension` object — `raiseProgram` only ever reads
  *  `.effects`, never `.exec`/`.rules`/`.codec`. */
 export const CODEC_EFFECTS: Readonly<Record<CodecOpcode, ExtOpEffect<CodecExtInstr>>> = {
+    // writesAcc marks exactly the ops whose own exec() below assigns
+    // state.acc — LOAD_VAL/COUNT/TAG/READ/HAS_NEXT and the two CALL_CODEC
+    // forms. Without it validate.ts passes acc's liveness through an EXT op
+    // unchanged, which is wrong for every one of them: a zero-argument
+    // procedure's entry acc is not live (isa-core.md §4.6), so a codec
+    // procedure opening with `READ; WRITE` had the validator reject the
+    // WRITE for reading an acc it believed nothing had established.
     ENTER:      { tosDelta: 0, maxTransient: 0 },
     ENTER_NEXT: { tosDelta: 0, maxTransient: 0 },
-    LOAD_VAL:   { tosDelta: 0, maxTransient: 0 },
+    LOAD_VAL:   { tosDelta: 0, maxTransient: 0, writesAcc: true },
     // STORE_VAL/WRITE/WRITE_SEQ/READ_SEQ's real value/count argument is
     // codecRules()'s trailing pRtl("acc") demand (each rule's own doc
     // comment) — lowered as "compute it into acc, then this op, nothing in
@@ -167,12 +174,12 @@ export const CODEC_EFFECTS: Readonly<Record<CodecOpcode, ExtOpEffect<CodecExtIns
     // reads the real acc register directly regardless of what raise.ts
     // does with it).
     STORE_VAL:  { tosDelta: 0, maxTransient: 0, readsAcc: true },
-    COUNT:      { tosDelta: 0, maxTransient: 0 },
-    TAG:        { tosDelta: 0, maxTransient: 0 },
+    COUNT:      { tosDelta: 0, maxTransient: 0, writesAcc: true },
+    TAG:        { tosDelta: 0, maxTransient: 0, writesAcc: true },
     OPEN_LIST:  { tosDelta: 0, maxTransient: 0 },
-    READ:       { tosDelta: 0, maxTransient: 0 },
+    READ:       { tosDelta: 0, maxTransient: 0, writesAcc: true },
     WRITE:      { tosDelta: 0, maxTransient: 0, readsAcc: true },
-    HAS_NEXT:   { tosDelta: 0, maxTransient: 0 },
+    HAS_NEXT:   { tosDelta: 0, maxTransient: 0, writesAcc: true },
     CLONE_RD:   { tosDelta: 0, maxTransient: 0 },
     CLONE_WR:   { tosDelta: 0, maxTransient: 0 },
     SEEK:       { tosDelta: 0, maxTransient: 0 },
@@ -181,8 +188,8 @@ export const CODEC_EFFECTS: Readonly<Record<CodecOpcode, ExtOpEffect<CodecExtIns
     // argCount header (extension.ts's `ExtOpEffect.calleeOf` doc comment),
     // so this declaration doesn't need to (and can't) know each call
     // site's codec's arity itself.
-    CALL_CODEC:      { tosDelta: 0, maxTransient: 0, calleeOf: instr => instr.ext === "CALL_CODEC" ? instr.calleeIndex : undefined },
-    CALL_CODEC_NEXT: { tosDelta: 0, maxTransient: 0, calleeOf: instr => instr.ext === "CALL_CODEC_NEXT" ? instr.calleeIndex : undefined },
+    CALL_CODEC:      { tosDelta: 0, maxTransient: 0, writesAcc: true, calleeOf: instr => instr.ext === "CALL_CODEC" ? instr.calleeIndex : undefined },
+    CALL_CODEC_NEXT: { tosDelta: 0, maxTransient: 0, writesAcc: true, calleeOf: instr => instr.ext === "CALL_CODEC_NEXT" ? instr.calleeIndex : undefined },
     // ROADMAP.md item 11: bulk transfer of `acc` (the element count) many
     // elements between a stream iterator and a list handle's own array
     // storage — the "snatch point" a target codegen can specialize into a

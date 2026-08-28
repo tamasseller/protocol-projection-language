@@ -34,10 +34,60 @@ import type {Extension} from "./extension"
 
 const MAX_STEPS = 10_000_000
 
-/** Thrown by `TRAP`, caught once at the top of `run`. */
+/** Thrown by `TRAP`, caught once at the top of `run`.
+ *
+ *  `depth` is how many frames down from the entry procedure the trap fired:
+ *  0 for the entry procedure itself, 1 for something it called, and so on.
+ *  A consumer using this VM as an oracle needs it — a bytecode trap unwinds
+ *  the whole program here, and a backend whose TRAP does not unwind
+ *  (jit-armv6m sentinel-encodes it into a normal return instead — see that
+ *  target's docs/target-profile.md) only agrees with this VM at depth 0. */
 class Trap
 {
-    constructor(readonly code: number, readonly steps: number) {}
+    constructor(readonly code: number, readonly steps: number, readonly depth: number = 0) {}
+}
+
+/** The `MAX_STEPS` watchdog tripping — its own type rather than a plain
+ *  `Error`, because it is emphatically *not* the same kind of event as the
+ *  malformed-IR throws around it. isa-core.md §9 is explicit that
+ *  termination is not guaranteed ("a `LOOP` whose condition block never
+ *  tests false runs indefinitely. The ISA promises bounded resource usage,
+ *  not termination"), so a program that trips this is legal, and a caller
+ *  using this VM as an oracle needs to tell "the interpreter gave up on a
+ *  legal non-terminating program" apart from "the interpreter disagrees
+ *  with the validator", which is a real bug. Distinguishing them by
+ *  message text is the alternative, and it silently stops working the
+ *  moment the wording changes. */
+export class StepLimitExceeded extends Error
+{
+    constructor(readonly steps: number)
+    {
+        super(`exceeded ${steps} steps — termination is not guaranteed (isa-core.md §9), so this may be a legitimately non-terminating program`)
+        this.name = "StepLimitExceeded"
+    }
+}
+
+/** A shift whose amount is outside `0..31`, where isa-core.md §4.1 leaves
+ *  the result unspecified.
+ *
+ *  Its own type, and emphatically *not* a `Trap`: a trap is a program-level
+ *  event with a code that every projection must agree on, and no projection
+ *  will ever raise this one — the ARM backend just lets the hardware shift
+ *  by `Rm[7:0]`, a JS backend lets `<<` mask to five bits. This is the
+ *  oracle refusing to invent an answer, so that a differential harness sees
+ *  "there is nothing to compare here" rather than a manufactured mismatch
+ *  against whichever value this VM happened to pick. Malformed IR still
+ *  throws a plain `Error`: an out-of-range *dynamic* amount is a legal
+ *  program, just one whose result no projection owes another. The
+ *  compile-time half of the class never reaches here at all — validate.ts
+ *  rejects an out-of-range immediate amount outright. */
+export class UnspecifiedShiftAmount extends Error
+{
+    constructor(readonly op: string, readonly amount: number)
+    {
+        super(`${op} by ${amount >>> 0}: shift amounts outside 0..31 have an unspecified result (isa-core.md §4.1) — this VM will not invent one`)
+        this.name = "UnspecifiedShiftAmount"
+    }
 }
 
 /** Exported for reuse by raise.ts's own test suite (a differential check
@@ -54,9 +104,17 @@ export function evalBinary(L: number, R: number, op: RtlInstr["op"]): number
         case "AND": return L & R
         case "OR": return L | R
         case "XOR": return L ^ R
-        case "SHL": return (L << (R & 31)) >>> 0
-        case "SHR": return L >>> (R & 31)
-        case "ASR": return (L >> (R & 31)) >>> 0
+        // The `> 31` guard makes the `& 31` beside it redundant, and both
+        // stay: the guard is the semantics (isa-core.md §4.1 defines
+        // `0..31` and nothing else), the mask is only JS's own `<<`
+        // behaviour spelled out rather than left implicit. A negative
+        // amount arrives as a large unsigned one and is rejected the same
+        // way.
+        case "SHL": case "SHR": case "ASR":
+            if((R >>> 0) > 31) throw new UnspecifiedShiftAmount(op, R)
+            return op === "SHL" ? (L << (R & 31)) >>> 0
+                 : op === "SHR" ? L >>> (R & 31)
+                 :                (L >> (R & 31)) >>> 0
         case "EQ": return (L === R) ? 1 : 0
         case "NE": return (L !== R) ? 1 : 0
         case "LT_S": return ((L | 0) < (R | 0)) ? 1 : 0
@@ -144,12 +202,20 @@ type BlockFrame =
 /** Run one procedure to completion. All VM state is local to this call —
  *  a nested CALL is just a nested call to this function, against
  *  `program`'s procedure table. */
-function runProc<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E>, proc: RtlProc<E>, args: readonly number[], extension?: Extension<E>): {acc: number; steps: number}
+function runProc<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E>, proc: RtlProc<E>, args: readonly number[], extension?: Extension<E>, maxSteps: number = MAX_STEPS, depth: number = 0): {acc: number; steps: number}
 {
     const body = proc.body
     const regs: number[] = [...args]
     let tos = args.length
-    let acc = 0
+    // isa-core.md §4.6: the callee's *last* argument arrives in acc as well
+    // as in its own frame slot r(N-1) — the caller left it sitting there
+    // rather than pushing it, which is the whole point of the convention.
+    // Seeding acc to 0 instead made every callee that reads acc before
+    // writing it compute with 0: `CALL` a one-argument procedure whose body
+    // is `MUL REG_ACC r0` and this VM returned 0 where the real emitted
+    // Thumb returned x*x. jit-armv6m's translateProc flushes the incoming
+    // acc into r(N-1) at entry precisely because it is already there.
+    let acc = args.length > 0 ? args[args.length - 1]! : 0
     // Poisoned by a write-back-in-place combo (REG_REG/PEEK_PEEK) or by
     // entering a BR_TABLE/LOOP split successor (isa-core.md §8.7) — matches
     // raise.ts's own `this.acc = undefined`. `acc` itself stays a plain
@@ -184,7 +250,7 @@ function runProc<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E
         {
             const callee = program.procedures[calleeIndex]
             if(!callee) throw new Error(`EXT callProc: no such procedure ${calleeIndex}`)
-            const result = runProc(program, callee, callArgs, extension)
+            const result = runProc(program, callee, callArgs, extension, maxSteps, depth + 1)
             steps += result.steps
             return result.acc
         },
@@ -228,7 +294,7 @@ function runProc<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E
 
     for(;;)
     {
-        if(++steps > MAX_STEPS) throw new Error(`exceeded ${MAX_STEPS} steps — likely an infinite loop`)
+        if(++steps > maxSteps) throw new StepLimitExceeded(maxSteps)
         if(pc >= body.length) throw new Error(`fell off the end of the procedure body with no RETURN`)
 
         const i = body[pc]
@@ -289,17 +355,25 @@ function runProc<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E
                 return {acc, steps}
 
             case "TRAP":
-                throw new Trap(i.imm, steps)
+                throw new Trap(i.imm, steps, depth)
 
             case "BR_TABLE": {
                 requireAccLive("BR_TABLE")
                 const N = i.imm
-                // isa-core.md §8.7: a split clobbers acc unconditionally —
-                // every successor (a selected case, or the implicit
-                // default that skips all of them) starts dead, regardless
-                // of what was live going into the dispatch.
+
+                // isa-core.md §8.7: acc is dead after the whole construct,
+                // and the implicit default (§4.5, `acc >= N` runs no case
+                // at all) is exactly why. Physically the dispatch value is
+                // still sitting in `acc` on this path — nothing below
+                // writes it — but that edge holds no instructions, so a
+                // join after the construct could never be given a value on
+                // every incoming edge. Rather than let one edge's accident
+                // define the rule, every edge out of the dispatch is dead.
+                if(acc >= N) { accLive = false; pc = skipBlocks(body, pc + 1, N); break }
+
+                // A selected case starts dead too, regardless of what was
+                // live going into the dispatch.
                 accLive = false
-                if(acc >= N) { pc = skipBlocks(body, pc + 1, N); break } // implicit default
                 pc = skipBlocks(body, pc + 1, acc) // skip cases before the selected one
                 ctrl.push({kind: "case", remaining: N - acc - 1, entryTos: tos})
                 break
@@ -323,6 +397,11 @@ function runProc<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E
 
                 if(top.kind === "case")
                 {
+                    // Falling out of a case reaches the construct's merge
+                    // point, where isa-core.md §8.7 says acc is dead
+                    // however the case ended — matching the default edge,
+                    // which has no instructions to establish one.
+                    accLive = false
                     pc = skipBlocks(body, pc + 1, top.remaining) // past any sibling cases
                     break
                 }
@@ -360,7 +439,7 @@ function runProc<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E
                 tos -= stackArgs
                 const callArgs = callee.argCount === 0 ? [] : [...regs.slice(tos, tos + stackArgs), acc]
 
-                const result = runProc(program, callee, callArgs, extension)
+                const result = runProc(program, callee, callArgs, extension, maxSteps, depth + 1)
                 acc = result.acc
                 accLive = true
                 steps += result.steps
@@ -385,21 +464,31 @@ export interface VmResult
     acc: number
     ok: boolean
     trapCode: number | null
+    /** How many frames below the entry procedure the trap fired, or null if
+     *  the program returned normally. 0 means the entry procedure trapped.
+     *  See `Trap.depth` for why a caller may care. */
+    trapDepth: number | null
     steps: number
 }
 
-export function run<E extends { ext: string } = ExtOpPayload>(prog: RtlProgram<E>, extension?: Extension<E>): VmResult
+/** `args` seeds the entry procedure's own frame, defaulting to none. It
+ *  exists because a real target's entry point does take an argument —
+ *  jit-armv6m's `enterProgram*` takes an `argIn` — so without it there is
+ *  no reference result to compare a one-argument entry procedure against,
+ *  and jit-armv6m/fuzz/qemu_exec would have to discard every program with
+ *  one. Must match the entry procedure's own argCount, same as any CALL. */
+export function run<E extends { ext: string } = ExtOpPayload>(prog: RtlProgram<E>, extension?: Extension<E>, args: readonly number[] = [], maxSteps: number = MAX_STEPS): VmResult
 {
     if(prog.procedures.length === 0) throw new Error(`empty program`)
 
     try
     {
-        const {acc, steps} = runProc(prog, prog.procedures[0], [], extension)
-        return {acc, ok: true, trapCode: null, steps}
+        const {acc, steps} = runProc(prog, prog.procedures[0], args, extension, maxSteps, 0)
+        return {acc, ok: true, trapCode: null, trapDepth: null, steps}
     }
     catch(e)
     {
-        if(e instanceof Trap) return {acc: 0, ok: false, trapCode: e.code, steps: e.steps}
+        if(e instanceof Trap) return {acc: 0, ok: false, trapCode: e.code, trapDepth: e.depth, steps: e.steps}
         throw e
     }
 }

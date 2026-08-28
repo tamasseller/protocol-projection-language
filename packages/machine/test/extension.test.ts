@@ -97,7 +97,11 @@ describe("extension hook — end to end via a toy `double(x)` opcode", () =>
 function callShapedExtension(): Extension
 {
     return {
-        effects: { EXT_CALL: { tosDelta: 0, maxTransient: 0, calleeOf: instr => instr.operands[0] } },
+        // writesAcc, because exec below really does write acc: without it the
+        // validator has no way to know, and the entry procedure's
+        // `EXT_CALL; RETURN` reads an acc it believes nothing established
+        // (a zero-argument procedure's entry doesn't — isa-core.md §4.6).
+        effects: { EXT_CALL: { tosDelta: 0, maxTransient: 0, writesAcc: true, calleeOf: instr => instr.operands[0] } },
         exec: (instr, state) => { state.acc = state.callProc(instr.operands[0]!, []) },
     }
 }

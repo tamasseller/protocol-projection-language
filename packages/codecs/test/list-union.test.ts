@@ -51,7 +51,7 @@ describe("codec extension — list of u8 (COUNT/OPEN_LIST/ENTER_NEXT/CALL_CODEC_
             callCodecNextInstr(1, 0),
             LOAD(0), opImm("SUB", 1), STORE(0),
             bare("BLOCK_END"),
-            bare("RETURN"),
+            CONST(0), bare("RETURN"),
         ]
     }
 
@@ -102,7 +102,10 @@ describe("codec extension — union (TAG + CALL_CODEC's fused ENTER/instantiate)
     const unionType = union({ a: unit, b: u8 })
     const graph = buildTypeGraph(unionType)
 
-    const unitCodecBody = (): RtlInstr<CodecExtInstr>[] => [bare("RETURN")] // nothing to read or write
+    // Nothing to read or write — but not a bare RETURN: a zero-argument
+    // procedure begins with acc not live (isa-core.md §4.6), so the
+    // trivial procedure is CONST + RETURN.
+    const unitCodecBody = (): RtlInstr<CodecExtInstr>[] => [CONST(0), bare("RETURN")]
 
     // TAG; BR_TABLE 2; case a -> CALL_CODEC unitCodec; case b -> CALL_CODEC
     // u8Codec; shared RETURN — codec-extension.md §8.2's exact shape (N=2),
@@ -121,7 +124,12 @@ describe("codec extension — union (TAG + CALL_CODEC's fused ENTER/instantiate)
             brTable(2),
             callCodecInstr(1, 0, 0), bare("BLOCK_END"), // case 0: "a"
             callCodecInstr(2, 0, 1), bare("BLOCK_END"), // case 1: "b"
-            bare("RETURN"),
+            // isa-core.md §8.7: acc is dead after a BR_TABLE however the
+            // cases ended — §4.5's implicit default reaches this merge too
+            // and holds no instructions to establish a value on. So the
+            // shared RETURN needs a producer of its own; it cannot return
+            // whichever case's CALL_CODEC result happened to run.
+            CONST(0), bare("RETURN"),
         ]
     }
 

@@ -14,7 +14,7 @@ import {test} from "node:test"
 import * as assert from "node:assert/strict"
 
 import type {BinaryOpcode, UnaryOpcode} from "@ppl/machine"
-import {evalBinary, evalUnary} from "@ppl/machine"
+import {evalBinary, evalUnary, SHIFT_OPS} from "@ppl/machine"
 import {binaryOpToJs, unaryOpToJs} from "../src/engine/codec-codegen"
 import {revBits} from "../src/runtime/codec-runtime"
 import {buildCodec, binaryEncodeRules, binaryDecodeRules} from "@ppl/codecs"
@@ -31,8 +31,16 @@ const UNARY_OPS: readonly UnaryOpcode[] = ["NEG", "NOT", "CLZ", "REVBITS"]
 // Representative matrix: zero/one/small values, the full-uint32 pattern
 // (0xFFFFFFFF), and the signed/unsigned boundary pair (0x7FFFFFFF /
 // 0x80000000) — enough to distinguish a signed comparison/wrap bug from
-// an unsigned one. Shift amounts include >= 32 to exercise the RTL's own
-// `& 31` masking (`evalBinary`'s own SHL/SHR/ASR cases).
+// an unsigned one.
+//
+// The values >= 32 still appear, and are still used as shift *amounts* —
+// but only as the left operand there. isa-core.md §4.1 leaves a shift by
+// 32 or more unspecified, so `evalBinary` refuses to produce a value for
+// one (`UnspecifiedShiftAmount`) and there is nothing for this projection
+// to match: `binaryOpToJs` renders a `<<`, JS masks it to five bits, and
+// that is one legal answer among several rather than the answer. Skipped
+// rather than deleted from VALUES, so the *left* operand still sweeps the
+// whole matrix against every shift amount that is specified.
 const VALUES: readonly number[] = [0, 1, 2, 5, 31, 32, 33, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFF, 100, 1000]
 
 function evalRendered(rendered: string, args: Record<string, number>): number
@@ -51,6 +59,10 @@ for(const op of BINARY_OPS)
         {
             for(const R of VALUES)
             {
+                // See the VALUES comment: unspecified, so not this
+                // projection's to agree on.
+                if(SHIFT_OPS.has(op) && (R >>> 0) > 31) continue
+
                 const rendered = binaryOpToJs(op, "L", "R")
                 const actual = evalRendered(rendered, {L, R})
                 const expected = evalBinary(L, R, op)

@@ -25,7 +25,7 @@
  */
 
 import type { RtlProc, RtlProgram, RtlInstr, ExtOpPayload } from "./rtl"
-import { isExtInstr, isStackComboInstr, isRegComboInstr, isImmComboInstr } from "./rtl"
+import { isExtInstr, isStackComboInstr, isRegComboInstr, isImmComboInstr, SHIFT_OPS } from "./rtl"
 import type { Extension, ExtOpEffect } from "./extension"
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -230,10 +230,14 @@ function walkProcedure<E extends { ext: string } = ExtOpPayload>(
                 tos += effect.tosDelta
                 if(tos < entryTos) fail(pc, `EXT ${instr.ext}: net effect would underflow below this block's entry depth (${entryTos})`)
 
-                // Extension ops are opaque to the core's own acc-clobbering
-                // convention (their effect on acc, if any, is entirely
-                // their own business — vm.ts's EXT case doesn't model
-                // accLive either) — accLive passes through unchanged.
+                // Extension ops are otherwise opaque to the core's own
+                // acc-clobbering convention (their effect on acc is their
+                // own business — vm.ts's EXT case doesn't model accLive
+                // either), so accLive passes through unchanged unless the
+                // effect declares one of the two directions.
+                if(effect.readsAcc) requireAcc(`EXT ${instr.ext}`)
+                if(effect.writesAcc) accLive = true
+
                 if(effect.terminates) return { nextPc: pc + 1, terminated: true, exitAccLive: accLive }
                 pc++; continue
             }
@@ -242,24 +246,26 @@ function walkProcedure<E extends { ext: string } = ExtOpPayload>(
             {
                 requireAcc("BR_TABLE")
                 let p = pc + 1
-                let combinedAccLive = true
                 for(let k = 0; k < instr.imm; k++)
                 {
                     // isa-core.md §8.7: a split clobbers acc unconditionally
                     // — each case is a split successor, so it starts dead
                     // regardless of what was live going into the dispatch.
-                    const caseResult = walk(p, tos, false, commit)
-                    p = caseResult.nextPc
-                    combinedAccLive = combinedAccLive && caseResult.exitAccLive
+                    p = walk(p, tos, false, commit).nextPc
                 }
                 pc = p
-                // Safe regardless of which sibling case actually ran at
-                // runtime only if *every* case agrees acc is live — one
-                // case leaving it pending/poisoned while another leaves it
-                // live would let the merged code's own belief depend on
-                // which case happened to run (this file's own bottom-row
-                // acc-fold hazard, one level up).
-                accLive = combinedAccLive
+                // And acc is dead *after* the whole construct too, however
+                // the cases end (isa-core.md §8.7). Carrying a value past
+                // the merge would need every incoming edge to establish it,
+                // and §4.5's implicit default (`acc >= N` runs no case at
+                // all) is the one edge in this ISA that holds no
+                // instructions — pure fall-through from the split point,
+                // with nowhere to put the value. So this is a local
+                // property of the opcode: no case's exit liveness is
+                // consulted, and nothing here ever has to reason about
+                // whether `acc >= N` can actually happen. Same treatment
+                // LOOP's exit gets below.
+                accLive = false
                 continue
             }
 
@@ -316,6 +322,19 @@ function walkProcedure<E extends { ext: string } = ExtOpPayload>(
             if(isRegComboInstr(instr) && instr.target >= tos)
                 fail(pc, `${instr.op} ${instr.combo} ${instr.target}: register not below current TOS (${tos}) — never established by a PUSH`)
 
+            // isa-core.md §4.1 defines a shift only for amounts 0..31;
+            // outside that the result is unspecified, and a projection is
+            // free to produce whatever its target's shift instruction does
+            // (ARMv6-M's register form reads Rm[7:0], a JS `<<` masks to
+            // five). The immediate combo carries the amount right here, so
+            // that whole compile-time half of the class is a load-time
+            // error instead of a divergence nobody would notice until two
+            // projections of the same program disagreed. The register,
+            // peek and pop combos cannot be checked here and stay
+            // unspecified by design.
+            if(isImmComboInstr(instr) && SHIFT_OPS.has(instr.op) && (instr.imm < 0 || instr.imm > 31))
+                fail(pc, `${instr.op} #${instr.imm}: shift amount outside 0..31, where the result is unspecified (isa-core.md §4.1) — mask it in the program if it can genuinely exceed 31`)
+
             if(instr.op === "STORE") requireAcc("STORE")
             else if(isRegComboInstr(instr)) requireAcc(`${instr.op} ${instr.combo} ${instr.target}`)
             else if(isImmComboInstr(instr)) requireAcc(`${instr.op} #${instr.imm}`)
@@ -331,7 +350,19 @@ function walkProcedure<E extends { ext: string } = ExtOpPayload>(
         }
     }
 
-    const { nextPc, terminated } = walk(0, proc.argCount, true)
+    // isa-core.md §4.6 puts a value in acc on entry only when the procedure
+    // takes at least one argument — "the *last* argument (if N >= 1) stays
+    // in acc". With none, nothing has established acc, so it starts *dead*
+    // and a body that reads it before writing it is a validation error.
+    //
+    // This used to pass `true` unconditionally, which made
+    // `{argCount: 0, body: [RETURN]}` a valid program with no defined
+    // result: vm.ts seeds such a frame's acc to 0, while jit-armv6m's
+    // translateProc emits no entry flush and so returns whatever the
+    // *caller* left in ACC_REG. Found by fuzz/qemu_exec as exactly that
+    // divergence — the reference VM returning 0 where the emitted code
+    // returned the caller's own leftover accumulator.
+    const { nextPc, terminated } = walk(0, proc.argCount, proc.argCount >= 1)
     if(!terminated) fail(nextPc, `BLOCK_END with no open block (procedure bodies close only via RETURN/TRAP)`)
     if(nextPc !== body.length) fail(nextPc, `unreachable instruction(s) after the procedure's terminator`)
 

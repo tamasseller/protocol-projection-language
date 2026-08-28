@@ -61,7 +61,12 @@ describe("validateProgram — §8.3 stack-depth bound is the tight one, not the 
     // coincides with.
     const caller: RtlProc = {
         argCount: 0,
+        // A leading CONST establishes acc, which a zero-argument procedure's
+        // entry does not (isa-core.md §4.6: an incoming value in acc is the
+        // callee's *last argument*, and there isn't one). It costs no TOS, so
+        // every depth figure below is unchanged.
         body: [
+            CONST(0),
             ...Array.from({ length: 10 }, () => PUSH()),
             ...Array.from({ length: 10 }, () => POP()),
             PUSH(),
@@ -93,6 +98,7 @@ describe("validateProgram — §8.3 stack-depth bound is the tight one, not the 
         const callerCallingDeep: RtlProc = {
             argCount: 0,
             body: [
+                CONST(0),
                 ...Array.from({ length: 9 }, () => PUSH()),
                 PUSH(), // tos now 10
                 call(1), // consumes stackArgsOf(2) = 1; tos back to 9
@@ -117,9 +123,12 @@ describe("validateProgram — §8.3 stack-depth bound is the tight one, not the 
         // the mirror image of caller/callee above: negligible register
         // pressure (nothing ever pushed) but five simultaneously active
         // frames on the one path through them all.
+        // The tail procedure needs its own CONST: a RETURN reads acc, and a
+        // zero-argument procedure's entry doesn't establish it. The others
+        // get theirs from their own CALL's return value.
         const chain: RtlProc[] = Array.from({ length: 5 }, (_, i) => ({
             argCount: 0,
-            body: i < 4 ? [call(i + 1), bare("RETURN")] : [bare("RETURN")],
+            body: i < 4 ? [call(i + 1), bare("RETURN")] : [CONST(0), bare("RETURN")],
         }))
         const stats = validateProgram({ procedures: chain })
         assert.equal(stats.maxCallDepth, 4)
@@ -145,9 +154,57 @@ describe("validateProgram — §8.1 TOS balance", () =>
 
     test("a balanced push/pop pair around a call is fine", () =>
     {
-        const callee: RtlProc = { argCount: 0, body: [bare("RETURN")] }
+        const callee: RtlProc = { argCount: 0, body: [CONST(0), bare("RETURN")] }
         const caller: RtlProc = { argCount: 0, body: [CONST(1), PUSH(), POP(), bare("RETURN")] }
         assert.doesNotThrow(() => validateProgram({ procedures: [caller, callee] }))
+    })
+})
+
+describe("validateProgram — §4.1 immediate shift amount", () =>
+{
+    // §4.1 defines a shift for amounts 0..31 and leaves everything else
+    // unspecified, so that a projection can lower it to whatever its target
+    // does natively (jit-armv6m emits a bare register-form shift, which on
+    // ARMv6-M shifts by Rm[7:0]). The immediate combo is the half where the
+    // amount is known here, so it is the half that is checked rather than
+    // left to diverge silently between projections.
+    for(const op of ["SHL", "SHR", "ASR"] as const)
+    {
+        test(`${op} with an immediate amount of 32 is rejected`, () =>
+        {
+            const program: RtlProgram = { procedures: [{ argCount: 0, body: [CONST(1), opImm(op, 32), bare("RETURN")] }] }
+            assert.throws(() => validateProgram(program), /shift amount outside 0\.\.31/)
+        })
+
+        test(`${op} with an immediate amount of 31 is accepted`, () =>
+        {
+            const program: RtlProgram = { procedures: [{ argCount: 0, body: [CONST(1), opImm(op, 31), bare("RETURN")] }] }
+            assert.doesNotThrow(() => validateProgram(program))
+        })
+    }
+
+    test("a huge immediate amount is rejected, not silently masked", () =>
+    {
+        // 466312 is the amount a fuzzed input actually carried
+        // (target-profile.md's overlong-LEB128 section). Its low five bits
+        // are 8, so a masking validator would have waved it through as a
+        // shift by 8.
+        const program: RtlProgram = { procedures: [{ argCount: 0, body: [CONST(1), opImm("SHR", 466312), bare("RETURN")] }] }
+        assert.throws(() => validateProgram(program), /shift amount outside 0\.\.31/)
+    })
+
+    test("a non-shift op with a large immediate is untouched", () =>
+    {
+        const program: RtlProgram = { procedures: [{ argCount: 0, body: [CONST(1), opImm("ADD", 466312), bare("RETURN")] }] }
+        assert.doesNotThrow(() => validateProgram(program))
+    })
+
+    test("the dynamic combos are not checked — that is the unspecified half", () =>
+    {
+        const program: RtlProgram = {
+            procedures: [{ argCount: 0, body: [CONST(40), PUSH(), CONST(1), opStack("SHL", "POP_ACC"), bare("RETURN")] }],
+        }
+        assert.doesNotThrow(() => validateProgram(program))
     })
 })
 
@@ -176,7 +233,7 @@ describe("validateProgram — §8.4 dead-code rejection", () =>
     test("an instruction after the procedure's terminator is rejected", () =>
     {
         const program: RtlProgram = {
-            procedures: [{ argCount: 0, body: [bare("RETURN"), CONST(1)] }],
+            procedures: [{ argCount: 0, body: [CONST(0), bare("RETURN"), CONST(1)] }],
         }
         assert.throws(() => validateProgram(program), /unreachable/)
     })
@@ -195,7 +252,7 @@ describe("validateProgram — §8.5 header/block well-formedness", () =>
         // argCount=3 → stackArgsOf(3) = 2 (the last argument comes from acc,
         // not the stack); pushing only 1 is one short.
         const callee: RtlProc = { argCount: 3, body: [bare("RETURN")] }
-        const caller: RtlProc = { argCount: 0, body: [PUSH(), call(1), bare("RETURN")] }
+        const caller: RtlProc = { argCount: 0, body: [CONST(0), PUSH(), call(1), bare("RETURN")] }
         assert.throws(() => validateProgram({ procedures: [caller, callee] }), /needs 2/)
     })
 
@@ -208,7 +265,7 @@ describe("validateProgram — §8.5 header/block well-formedness", () =>
     test("a LOOP whose condition sub-block closes with a terminator instead of BLOCK_END is rejected", () =>
     {
         const program: RtlProgram = {
-            procedures: [{ argCount: 0, body: [bare("LOOP"), bare("RETURN")] }],
+            procedures: [{ argCount: 0, body: [CONST(0), bare("LOOP"), bare("RETURN")] }],
         }
         assert.throws(() => validateProgram(program), /condition sub-block must close with BLOCK_END/)
     })
@@ -239,7 +296,7 @@ describe("validateProgram — §8.5 header/block well-formedness", () =>
         const program: RtlProgram = {
             procedures: [{
                 argCount: 0,
-                body: [brTable(1), CONST(1), bare("BLOCK_END"), CONST(2), bare("RETURN")],
+                body: [CONST(0), brTable(1), CONST(1), bare("BLOCK_END"), CONST(2), bare("RETURN")],
             }],
         }
         const stats = validateProgram(program)
@@ -360,20 +417,72 @@ describe("validateProgram — §8.7 acc liveness across control flow", () =>
         assert.throws(() => validateProgram(program), /read of acc/)
     })
 
-    test("a BR_TABLE where every sibling case re-establishes acc before the merge is still accepted", () =>
+    test("code after a whole BR_TABLE reading acc is rejected even when every sibling case re-establishes it", () =>
     {
+        // The AND-across-siblings model this used to accept had no edge to
+        // AND in for §4.5's implicit default, and that edge holds no
+        // instructions at all — it is pure fall-through from the dispatch,
+        // so nothing can establish a value on it. §8.7 is therefore
+        // unconditional: acc is dead after the construct however the cases
+        // ended. Making it conditional on whether `acc >= N` is reachable
+        // would put a range analysis in the interface.
         const program: RtlProgram = {
             procedures: [{
                 argCount: 0,
                 body: [
+                    CONST(0),                     // BR_TABLE's own dispatch reads acc, and a
+                                                  // zero-argument entry doesn't establish it
                     brTable(2),
                     CONST(1), bare("BLOCK_END"), // case 0: fresh producer
                     CONST(2), bare("BLOCK_END"), // case 1: fresh producer
-                    bare("RETURN"),               // merge point: safe, since every case re-established acc
+                    bare("RETURN"),               // merge point: dead anyway — the default edge reaches here too
                 ],
             }],
         }
-        assert.doesNotThrow(() => validateProgram(program))
+        assert.throws(() => validateProgram(program), /read of acc/)
+    })
+
+    test("an if-then's skip edge kills acc for the code after it (BR_TABLE 1, the shape jit-armv6m's comparison fusion cannot materialize)", () =>
+    {
+        // The minimal case, and the one fuzz/harness.cpp reported as an
+        // assert inside the translator's own acc fusion state machine: the
+        // body re-establishes acc, the skip edge cannot, so the RETURN is
+        // invalid input rather than something a backend has to compile.
+        const program: RtlProgram = {
+            procedures: [{
+                argCount: 1,
+                body: [brTable(1), CONST(0), bare("BLOCK_END"), bare("RETURN")],
+            }],
+        }
+        assert.throws(() => validateProgram(program), /read of acc/)
+    })
+
+    test("the same shape with a comparison feeding the dispatch is rejected too — booleanness is the backend's business, not validation's", () =>
+    {
+        const program: RtlProgram = {
+            procedures: [{
+                argCount: 1,
+                body: [LOAD(0), opImm("EQ", 0), brTable(1), CONST(7), bare("BLOCK_END"), bare("RETURN")],
+            }],
+        }
+        assert.throws(() => validateProgram(program), /read of acc/)
+    })
+
+    test("a switch's merge point is dead for the same reason — the default is a table slot, not a block", () =>
+    {
+        const program: RtlProgram = {
+            procedures: [{
+                argCount: 1,
+                body: [
+                    brTable(3),
+                    CONST(1), bare("BLOCK_END"),
+                    CONST(2), bare("BLOCK_END"),
+                    CONST(3), bare("BLOCK_END"),
+                    bare("RETURN"),
+                ],
+            }],
+        }
+        assert.throws(() => validateProgram(program), /read of acc/)
     })
 
     test("a LOOP whose exit code never reads acc at all is still accepted", () =>

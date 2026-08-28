@@ -94,6 +94,21 @@ export interface ExtOpEffect<E extends { ext: string } = ExtOpPayload>
      *  `raise.ts`'s own output loses it entirely. Defaults to falsy —
      *  every existing effect this doesn't apply to is unaffected. */
     readsAcc?: boolean
+
+    /** Whether this op *establishes* acc — leaves a fresh value there that
+     *  code downstream may read. `readsAcc`'s counterpart, and needed for
+     *  the same reason: `validate.ts` otherwise passes acc's liveness
+     *  through an EXT op unchanged (extension ops being opaque to the
+     *  core's own acc-clobbering convention), so an op that really does
+     *  write acc — `exec: (i, s) => { s.acc = ... }`, which is what any
+     *  call-shaped op does with its callee's result — leaves the validator
+     *  believing acc is still whatever it was before, or still dead.
+     *
+     *  Dead is the case that bites: a zero-argument procedure's entry acc
+     *  is not live (isa-core.md §4.6), so `EXT_CALL; RETURN` was rejected
+     *  outright with no way for the extension to say otherwise. Defaults to
+     *  falsy, so an effect that doesn't set it behaves exactly as before. */
+    writesAcc?: boolean
 }
 
 /** The subset of VM state one extension opcode's `exec` is allowed to

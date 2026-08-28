@@ -543,8 +543,15 @@ BLOCK_END
 BLOCK_END
   CALL_CODEC codec_c, o0, 2
 BLOCK_END
+CONST #0                  ; acc is dead after a BR_TABLE (isa-core.md §8.7)
 RETURN
 ```
+
+The shared `RETURN` needs that producer of its own: §4.5's implicit default
+reaches the merge too, and being pure fall-through it holds no instructions
+that could establish a value, so no case's `CALL_CODEC` result is readable
+past the construct. §8.7's variant-decoder shape avoids the question
+entirely by closing every case with `RETURN`.
 
 ### 8.3 LEB128 encoder: generic-core loop as a shared `CALL` target
 

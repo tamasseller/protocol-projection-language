@@ -14,8 +14,8 @@
 import { describe, test } from "node:test"
 import assert from "node:assert/strict"
 
-import { run } from "../src/vm"
-import { bare, brTable, CONST, PUSH, opRegWriteback } from "../src/rtl"
+import { run, evalBinary, UnspecifiedShiftAmount } from "../src/vm"
+import { bare, brTable, CONST, PUSH, opStack, opRegWriteback } from "../src/rtl"
 import type { RtlProgram } from "../src/rtl"
 
 describe("run — §16 item 2: acc-clobbering convention enforcement", () =>
@@ -91,5 +91,46 @@ describe("run — §8.7 acc liveness across control flow", () =>
         const result = run(program)
         assert.equal(result.ok, true)
         assert.equal(result.acc, 42)
+    })
+})
+
+describe("evalBinary — §4.1 unspecified shift amounts", () =>
+{
+    // The VM is an oracle, so the one thing it must not do here is pick a
+    // value and let a differential harness treat it as the answer. §4.1
+    // defines a shift for 0..31 only; jit-armv6m's bare register-form
+    // shift uses Rm[7:0] and a host `<<` masks to five bits, and neither
+    // is more correct than the other.
+    for(const op of ["SHL", "SHR", "ASR"] as const)
+    {
+        test(`${op} by 31 is defined`, () =>
+        {
+            assert.doesNotThrow(() => evalBinary(0xdeadbeef, 31, op))
+        })
+
+        test(`${op} by 32 throws rather than mask to a shift by 0`, () =>
+        {
+            assert.throws(() => evalBinary(0xdeadbeef, 32, op), UnspecifiedShiftAmount)
+        })
+
+        test(`${op} by 2784 throws — low five bits zero, low eight are not`, () =>
+        {
+            // The finding-5 repro: masked to five bits this is the
+            // identity, and on ARMv6-M it is a shift by 224.
+            assert.throws(() => evalBinary(0xdeadbeef, 2784, op), UnspecifiedShiftAmount)
+        })
+    }
+
+    test("a negative amount arrives as a large unsigned one and throws too", () =>
+    {
+        assert.throws(() => evalBinary(1, -1, "SHL"), UnspecifiedShiftAmount)
+    })
+
+    test("it is not a Trap — run() propagates it instead of reporting a trap code", () =>
+    {
+        const program: RtlProgram = {
+            procedures: [{ argCount: 0, body: [CONST(40), PUSH(), CONST(1), opStack("SHL", "POP_ACC"), bare("RETURN")] }],
+        }
+        assert.throws(() => run(program), UnspecifiedShiftAmount)
     })
 })

@@ -94,6 +94,13 @@ export const COMPARISON_OPS: ReadonlySet<BinaryOpcode> = new Set([
     "EQ", "NE", "LT_S", "LE_S", "GT_S", "GE_S", "LT_U", "LE_U", "GT_U", "GE_U",
 ])
 
+/** Shift opcodes — the three whose operand is a shift *amount* rather than
+ *  an ordinary value, and so the three isa-core.md §4.1 leaves unspecified
+ *  outside `0..31`. Shared by the validator (which rejects an out-of-range
+ *  immediate amount) and vm.ts (which refuses to invent a value for a
+ *  dynamic one). */
+export const SHIFT_OPS: ReadonlySet<BinaryOpcode> = new Set(["SHL", "SHR", "ASR"])
+
 /** Unary ALU opcodes — operate on acc in place, no combo (§4.3). */
 export type UnaryOpcode = "NEG" | "NOT" | "CLZ" | "REVBITS"
 
