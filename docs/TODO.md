@@ -1,13 +1,15 @@
-- find a name for the whole machine/isa/vm/jit thing, the technology as a whole (the part that is not PPL specific).
-
+Done:
+* name for the whole machine/isa/vm/jit thing, the technology as a whole (the part that is not PPL specific): **MOG** — Motor-Gerät, the powered-implement half of Unimog. A bounded core chassis with a standardized take-off, and the domain implement bolts on.**
+* refined resource error bailout diagnostics, no more RESOURCE_ERROR, more specific diagnostics to each failure.
+  
+Open:
 - JIT
-  - refine resource error bailout diagnostics, now every oopsie is a RESOURCE_ERROR, which doesn't help much if it is ever encountered in the wild, it would be better to assign more specific diagnostics to each failure.
-  - move to separate root repo, publish on github
   - add extension mechanism
-    - codegen should allow simple helper dispatch and proper  generic isns stream eneration
-    - maybe consider consolidating the dispatch table pointer hi-reg with the runtime pointer to free it up as global state usable by extensions.
+    - codegen should allow simple helper dispatch and proper generic isns stream eneration
+    - maybe consider consolidating the dispatch table pointer hi-reg with the runtime pointer to free it up as global state usable by extensions for whatever purpose
   - implement some easy extension for testing (raw memory access maybe)
-
+  - move to separate root repo, publish on github (needs to move the current @ppl/machine as well)
+  
 - @ppl/machine
   - move @ppl/machine to separate root repo publish on github
   - DSL improvements
@@ -20,6 +22,7 @@
       - object field access or array element access like syntax for them
 
 - the actual PPL itself
+  - Quantities / units of measurement — design sketch in docs/quantities.md, nothing implemented.
   - reorganize packages once the genuinely general purpose parts are moved out, consider real application usage patterns (could be developed via ).
   - codec extension 
     - DSL level upgrades (allowed by upgraded extension mechanism)

@@ -271,7 +271,9 @@ point; choosing what to do with it is real target-codegen work.
   limited-range number field in one of the variants. Needs annotation or a
   meta-argument to say what merges with what, since it favors some variants
   heavily over others compactness-wise.
-- Target-side transformation (unit of measurement).
+- Quantities / units of measurement: docs/quantities.md (design sketch,
+  unimplemented). Catches the counts-vs-millivolts class reconciliation is
+  currently blind to, and folds the conversion into codegen.
 
 ---
 

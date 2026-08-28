@@ -503,11 +503,12 @@ export interface VmResult
 }
 
 /** `args` seeds the entry procedure's own frame, defaulting to none. It
- *  exists because a real target's entry point does take an argument —
- *  jit-armv6m's `enterProgram*` takes an `argIn` — so without it there is
- *  no reference result to compare a one-argument entry procedure against,
- *  and jit-armv6m/fuzz/qemu_exec would have to discard every program with
- *  one. Must match the entry procedure's own argCount, same as any CALL. */
+ *  exists because a real target's entry point does take arguments —
+ *  jit-armv6m's `enterProgram*` takes this same vector — so without it
+ *  there is no reference result to compare an argument-taking entry
+ *  procedure against, and jit-armv6m/fuzz/qemu_exec would have to discard
+ *  every program with one. Must match the entry procedure's own argCount,
+ *  same as any CALL. */
 export function run<E extends { ext: string } = ExtOpPayload>(prog: RtlProgram<E>, extension?: Extension<E>, args: readonly number[] = [], maxSteps: number = MAX_STEPS): VmResult
 {
     if(prog.procedures.length === 0) throw new Error(`empty program`)
