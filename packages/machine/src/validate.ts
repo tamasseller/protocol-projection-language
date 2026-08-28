@@ -274,6 +274,13 @@ function walkProcedure<E extends { ext: string } = ExtOpPayload>(
                 // itself leaves behind.
                 const cond = walk(pc + 1, tos, accLive, commit)
                 if(cond.terminated) fail(pc, `LOOP's condition sub-block must close with BLOCK_END, not a terminator`)
+                // That BLOCK_END is the loop's own continue/exit dispatch
+                // (§4.5), and a dispatch reads acc (§8.7) — same
+                // requirement BR_TABLE's own requireAcc above imposes,
+                // just carried by the sub-block's exit rather than by the
+                // opener.
+                if(!cond.exitAccLive)
+                    fail(cond.nextPc - 1, `LOOP condition sub-block's BLOCK_END: read of acc after a write-back-in-place combo or a CFG split clobbered it (isa-core.md §8.7's acc-clobbering convention)`)
                 const body_ = walk(cond.nextPc, tos, false, commit)
                 if(!body_.terminated && body_.exitAccLive !== accLive)
                 {
@@ -285,7 +292,9 @@ function walkProcedure<E extends { ext: string } = ExtOpPayload>(
                     // doesn't fail under that entry either — probe-only,
                     // so nested call sites aren't double-counted. Bounded
                     // to one extra walk, never a fixed-point search.
-                    walk(pc + 1, tos, body_.exitAccLive, false)
+                    const reentry = walk(pc + 1, tos, body_.exitAccLive, false)
+                    if(!reentry.exitAccLive)
+                        fail(reentry.nextPc - 1, `LOOP condition sub-block's BLOCK_END: read of acc, dead on the back-edge's own entry (isa-core.md §8.7's acc-clobbering convention)`)
                 }
                 pc = body_.nextPc
                 // Code after the whole LOOP is reached only via the
