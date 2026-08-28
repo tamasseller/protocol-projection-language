@@ -38,10 +38,12 @@ const MAX_STEPS = 10_000_000
  *
  *  `depth` is how many frames down from the entry procedure the trap fired:
  *  0 for the entry procedure itself, 1 for something it called, and so on.
- *  A consumer using this VM as an oracle needs it — a bytecode trap unwinds
- *  the whole program here, and a backend whose TRAP does not unwind
- *  (jit-armv6m sentinel-encodes it into a normal return instead — see that
- *  target's docs/target-profile.md) only agrees with this VM at depth 0. */
+ *  Reported rather than discarded because a consumer using this VM as an
+ *  oracle may be checking a backend that only agrees with it at depth 0 —
+ *  a trap that returns instead of unwinding looks identical to a normal
+ *  return one frame up. jit-armv6m was such a backend until runtime.S grew
+ *  a trapHelper; nothing in this repo needs the distinction now, and the
+ *  value is cheap enough to keep for the next such backend. */
 class Trap
 {
     constructor(readonly code: number, readonly steps: number, readonly depth: number = 0) {}
@@ -448,10 +450,39 @@ function runProc<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E
             }
 
             case "EXT":
+            {
                 if(!extension?.exec) throw new Error(`EXT ${i.ext}: no extension registered to execute it`)
+
+                // The same two declarations validate.ts's own EXT case
+                // reads, honored here in the same order and for the same
+                // reason: an extension op is opaque to the acc-clobbering
+                // convention (isa-core.md §8.7) *except* where its effect
+                // speaks, and both halves have to believe the same thing
+                // about acc or the validator accepts programs the VM then
+                // refuses to run.
+                //
+                // Which is exactly what happened. The codec extension's
+                // TAG declares `writesAcc` and its exec() really does
+                // assign `state.acc`, so validate.ts had acc live again
+                // after it — while runProc still believed the `OR REG_REG`
+                // upstream had poisoned it, and threw on the next read. A
+                // struct with two hoistable union fields packs its bitmap
+                // with exactly that shape (`OR REG_REG; EXT ENTER; EXT
+                // TAG; SHL IMM_ACC`), which is how six tests across
+                // @ppl/codecs and @ppl/target-js found it.
+                //
+                // A missing declaration is not fatal here, unlike in
+                // validate.ts: a caller may register an exec-only
+                // extension (`effects` is optional on Extension), and this
+                // is the same pass-acc-through-unchanged that every EXT op
+                // got before either flag existed.
+                const effect = extension.effects?.[i.ext]
+                if(effect?.readsAcc) requireAccLive(`EXT ${i.ext}`)
                 extension.exec(i, extState)
+                if(effect?.writesAcc) accLive = true
                 pc++
                 break
+            }
 
             default:
                 throw new Error(`unhandled opcode ${(i as {op: string}).op} at pc ${pc}`)
@@ -466,7 +497,7 @@ export interface VmResult
     trapCode: number | null
     /** How many frames below the entry procedure the trap fired, or null if
      *  the program returned normally. 0 means the entry procedure trapped.
-     *  See `Trap.depth` for why a caller may care. */
+     *  See `Trap.depth` for who this is for. */
     trapDepth: number | null
     steps: number
 }

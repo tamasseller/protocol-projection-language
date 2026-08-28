@@ -232,9 +232,11 @@ function walkProcedure<E extends { ext: string } = ExtOpPayload>(
 
                 // Extension ops are otherwise opaque to the core's own
                 // acc-clobbering convention (their effect on acc is their
-                // own business — vm.ts's EXT case doesn't model accLive
-                // either), so accLive passes through unchanged unless the
-                // effect declares one of the two directions.
+                // own business), so accLive passes through unchanged
+                // unless the effect declares one of the two directions.
+                // vm.ts's own EXT case reads the same two flags in the
+                // same order — it has to, or this accepts programs it then
+                // refuses to run.
                 if(effect.readsAcc) requireAcc(`EXT ${instr.ext}`)
                 if(effect.writesAcc) accLive = true
 

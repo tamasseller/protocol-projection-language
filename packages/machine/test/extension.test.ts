@@ -19,7 +19,7 @@ import { run } from "../src/vm"
 import { encodeInstr, encodeBody, decodeBody, encodeLeb128, decodeLeb128 } from "../src/bytecode"
 import { rule, leafNode } from "../src/rules"
 import { pBuiltinCall, pIdentifier } from "../src/matcher"
-import { extInstr, bare } from "../src/rtl"
+import { extInstr, bare, CONST, PUSH, opRegWriteback } from "../src/rtl"
 import type { RtlProgram } from "../src/rtl"
 import type { Extension } from "../src/extension"
 
@@ -161,5 +161,78 @@ describe("Procedure/RtlProc header — opaque data, untouched by the core", () =
 
         const program = lowerProgram(entry)
         assert.equal(program.procedures[0]!.header, header)
+    })
+})
+
+/* ── validate.ts and vm.ts must agree about acc across an EXT op ────────
+ *
+ * Both halves read `readsAcc`/`writesAcc`; for a while only validate.ts
+ * did, so a program it accepted threw at run time instead. The shape below
+ * is what the codec extension's bitmap packing really emits: a write-back-
+ * in-place combo poisons acc, an EXT op that declares `writesAcc`
+ * re-establishes it, and the next instruction reads it.
+ */
+function accExtension(): Extension
+{
+    return {
+        effects: {
+            PRODUCE: { tosDelta: 0, maxTransient: 0, writesAcc: true },
+            CONSUME: { tosDelta: 0, maxTransient: 0, readsAcc: true },
+            OPAQUE:  { tosDelta: 0, maxTransient: 0 },
+        },
+        exec: (instr, state) =>
+        {
+            if(instr.ext === "PRODUCE") state.acc = 7
+            else if(instr.ext === "CONSUME") state.setReg(0, state.acc)
+        },
+    }
+}
+
+describe("extension hook — acc liveness agrees between validate.ts and vm.ts", () =>
+{
+    // PUSH needs something live to push, so every program here opens with
+    // a CONST; the poisoning is done by the REG_REG combo that follows.
+    const prelude = [CONST(1), PUSH(), CONST(2), opRegWriteback("OR", 0)] as const
+
+    test("a writesAcc op revives acc for a later read — validator and VM both", () =>
+    {
+        const program: RtlProgram = {
+            procedures: [{ argCount: 0, body: [...prelude, extInstr("PRODUCE", []), bare("RETURN")] }],
+        }
+        const ext = accExtension()
+        assert.doesNotThrow(() => validateProgram(program, ext))
+        const r = run(program, ext)
+        assert.equal(r.ok, true)
+        assert.equal(r.acc, 7)
+    })
+
+    test("an opaque op does not revive acc — both halves still reject the read", () =>
+    {
+        const program: RtlProgram = {
+            procedures: [{ argCount: 0, body: [...prelude, extInstr("OPAQUE", []), bare("RETURN")] }],
+        }
+        const ext = accExtension()
+        assert.throws(() => validateProgram(program, ext), /read of acc/)
+        assert.throws(() => run(program, ext), /read of acc/)
+    })
+
+    test("a readsAcc op on a poisoned acc is rejected by the VM, not just the validator", () =>
+    {
+        const program: RtlProgram = {
+            procedures: [{ argCount: 0, body: [...prelude, extInstr("CONSUME", []), CONST(0), bare("RETURN")] }],
+        }
+        const ext = accExtension()
+        assert.throws(() => validateProgram(program, ext), /EXT CONSUME/)
+        assert.throws(() => run(program, ext), /EXT CONSUME/)
+    })
+
+    test("readsAcc is satisfied by a writesAcc op right before it", () =>
+    {
+        const program: RtlProgram = {
+            procedures: [{ argCount: 0, body: [...prelude, extInstr("PRODUCE", []), extInstr("CONSUME", []), CONST(0), bare("RETURN")] }],
+        }
+        const ext = accExtension()
+        assert.doesNotThrow(() => validateProgram(program, ext))
+        assert.equal(run(program, ext).ok, true)
     })
 })
