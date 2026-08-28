@@ -8,6 +8,8 @@ Open:
     - codegen should allow simple helper dispatch and proper generic isns stream eneration
     - maybe consider consolidating the dispatch table pointer hi-reg with the runtime pointer to free it up as global state usable by extensions for whatever purpose
   - implement some easy extension for testing (raw memory access maybe)
+  - eliminate maxSpanBytes based speculation about branch distance, always emit short form instead, bail out with adequate error if offset is too big on fixup. We will revisit this if becomes a bottleneck in practice.
+  - clean up enter variants.
   - move to separate root repo, publish on github (needs to move the current @ppl/machine as well)
   
 - @ppl/machine
