@@ -1,13 +1,9 @@
 /**
  * @ppl/target-js — A thin, hierarchical, auto-indenting line builder.
  *
- * `codec-codegen.ts`'s statement translation used to thread an `out:
- * string[]` accumulator and an `indent: string` alongside it through every
- * function, with every push spelling out `${indent}...` by hand and every
- * nested block computing its own `indent + "    "`. That's pure formatting
- * noise with no connection to what's actually being translated — this
- * class owns indentation once, so callers push only the trimmed line text
- * and open/close nested blocks structurally instead of by string math.
+ * Owns indentation once, so callers push trimmed line text and open/close
+ * nested blocks structurally rather than threading an accumulator and an
+ * indent string through every function and doing string math at each push.
  */
 export class LineBuilder
 {

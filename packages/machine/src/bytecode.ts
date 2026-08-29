@@ -347,13 +347,10 @@ function decodeProcBody<E extends { ext: string } = ExtOpPayload>(bytes: Uint8Ar
             {
                 // §8.5/blocks.cpp's resolveCaseClose: a bare terminator
                 // closes a case exactly like a BLOCK_END would, counting
-                // against the same N case-closers — not just the loopBody
-                // wrinkle this function's own header comment used to call
-                // out alone (found via a cross-check of this decoder
-                // against the real translator's own closeCaseViaTerminator,
-                // which does this same decrement — TDD: a BR_TABLE whose
-                // non-last case closes this way corrupted the next
-                // procedure's own boundary before this fix).
+                // against the same N case-closers — not only in the loopBody
+                // case. Mirrors the translator's closeCaseViaTerminator; miss
+                // it and a BR_TABLE whose non-last case closes this way
+                // corrupts the next procedure's boundary.
                 top.remaining -= 1
                 if (top.remaining === 0) stack.pop()
             }

@@ -533,16 +533,12 @@ describe("Stack-bridging compound expressions", () =>
         `, 10)
     })
 
-    // Regression: a `"tos"`-demand initializer wide enough (8+ leaves in a
-    // balanced tree) used to net tosDelta=2 instead of 1 — the winning
-    // combine's top-level `(tos, acc)` site tied on bytes/length/maxStack
-    // between PEEK_PEEK (net-neutral) and the now-removed PEEK_PUSH
-    // (net-positive), and the tie broke on worklist order rather than
-    // preference (see isa-rationale.md, "Why these choices"). Removing PEEK_PUSH
-    // entirely (isa-core.md §4.1 keeps only 5 combos) makes PEEK_PEEK the
-    // sole tos-output combo at that site, so the tie can no longer arise.
-    // This declaration would have thrown lowerVarDecl's `tosDelta === 1`
-    // assertion before that fix; here it must lower and execute cleanly.
+    // A `"tos"`-demand initializer 8+ leaves wide must net tosDelta=1, or
+    // lowerVarDecl's `tosDelta === 1` assertion throws. PEEK_PEEK is the sole
+    // tos-output combo at the winning combine's top-level `(tos, acc)` site
+    // (isa-core.md §4.1 keeps only 5 combos), so no bytes/length/maxStack tie
+    // can break on worklist order there (isa-rationale.md, "Why these
+    // choices").
     test("add: 8-leaf balanced tree, tos demand (wide-tree regression)", () =>
     {
         assertReturn(`

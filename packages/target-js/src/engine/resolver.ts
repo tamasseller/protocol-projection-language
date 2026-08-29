@@ -1,70 +1,44 @@
 /**
  * @ppl/target-js — The one generic TS-decl resolver
  *
- * A thin adapter over `@ppl/core/projection.ts`'s shared `createResolver`
- * primitive — the same one `@ppl/codecs/src/engine/resolver.ts`
- * (`createCodecResolver`) adapts. Different artifact (`TSTypeDecl`, a
- * plain `{ref, decl?, deps, access}` record, vs. codecs' `Procedure`), so
- * this file still owns its own `TsRule`/`tsRule()`/`Accessor` surface —
- * but the on-demand/memoized/cycle-safe *execution*, and the
- * `claims`-based multi-node absorption guarantee (see `TsRule.claims`
- * below), are `createResolver`'s, not re-derived here.
+ * A thin adapter over `@ppl/core/projection.ts`'s `createResolver`, the same
+ * primitive `@ppl/codecs`'s `createCodecResolver` adapts. The artifact
+ * differs (`TSTypeDecl` vs `Procedure`), so the `TsRule`/`tsRule()`/
+ * `Accessor` surface lives here; the on-demand, memoized, cycle-safe
+ * execution and the `claims`-based absorption guarantee do not.
  *
- * The one real difference from `Procedure`'s own cycle-safety: a
- * `Procedure`'s identity (its `.name`, usable in `${proc}` interpolation)
- * is *always* a synthetic, rule-independent id — `declareProc` mints it
- * before any rule even runs. A TS type's `ref` is not always so simple: a
- * struct/union's ref is name-based (rule-independent, safe to mint before
- * recursing), but an inline rule (e.g. a future "optional as `T | null`"
- * one) needs to *compute* its own ref by resolving its value type first.
- * So `TsRule` splits `refOf` (may recurse, but is asked for and cached
- * *before* `produce` runs) from `produce` (the rest — decl text, deps;
- * always free to recurse, including into a cycle, since by the time it
- * runs, `refOf`'s result is already cached for anyone that needs it).
- * This keeps a genuinely recursive type (a struct/union field reaching
- * back to its own type) safe: the cyclic reference only ever needs the
- * ref (already known), never a fully-formed `decl` for the type it's
- * already inside. A rule whose *own* `refOf` needs to recurse (the
- * optional case) is safe too, as long as any real cycle passes through
- * at least one by-name struct/union first — true for every recursive type
- * expressible in this metamodel, since a cycle can only be created via a
- * named thunk reference (`const T = (): any => ...`), and nobody
- * meaningfully thunks a bare list/optional back onto itself (that type
- * would have no inhabitants at all). Not specifically defended against,
- * same bar the pre-existing code already held itself to. `access` is
- * computed eagerly too (`createResolver`'s own `fill` contract: populate
- * cycle-sensitive fields before recursing) — it never itself recurses
- * (see `Accessor`'s own doc comment below), so this is free.
+ * `TsRule` splits `refOf` from `produce` for cycle safety. A struct/union
+ * ref is name-based and safe to mint before recursing, but an inline rule
+ * may have to resolve its value type to compute its own ref — so `refOf` is
+ * asked for and cached *before* `produce` runs, and `produce` is then free
+ * to recurse into a cycle, since a cyclic reference only ever needs the ref,
+ * never a formed `decl` for the type it is already inside.
+ *
+ * A rule whose own `refOf` recurses is safe as long as every real cycle
+ * passes through a by-name struct/union, which holds for every recursive
+ * type expressible here: a cycle needs a named thunk, and a bare
+ * list/optional thunked onto itself has no inhabitants. Not defended
+ * against beyond that.
  */
 
 import type { SemanticType, TypeGraph, TypeNode, TypePattern, MatchOf, ResolverRule } from "@ppl/core"
 import { createResolver } from "@ppl/core"
 
 /**
- * How to construct/read a value of this `TypeNode`'s own locally-projected
- * shape — the piece `codec-codegen.ts` needs and `TSTypeDecl.ref`/`.decl`
- * alone don't provide. Keyed by `SemanticTypeKinds`, one variant per kind,
- * because a rule's own pattern always resolves to exactly one structural
- * kind (a struct rule never needs to answer "what's the active variant
- * name", a union rule never needs "read field X").
+ * How to construct/read a value of this `TypeNode`'s locally-projected
+ * shape — what `TSTypeDecl.ref`/`.decl` alone don't provide. One variant per
+ * `SemanticTypeKinds`, since a rule's pattern always resolves to exactly one
+ * structural kind.
  *
- * Deliberately never itself recursive, unlike `TsRule.refOf`/`produce`:
- * a struct's `readField` doesn't need to know how the *field's own type*
- * is represented (that's a fully separate `Accessor`, looked up
- * separately, when and if a caller ever reads through it) — only how
- * *this* struct's own value exposes one named part of itself. This is
- * exactly why `access` takes no `resolve` callback the way `refOf`/
- * `produce` do.
+ * Never recursive, unlike `refOf`/`produce`: a struct's `readField` says how
+ * *this* struct exposes one named part, not how the field's own type is
+ * represented (a separate `Accessor`, looked up separately). Hence no
+ * `resolve` callback.
  *
- * `finishStruct`/`finishUnion`/`finishList` are decode-only: they convert
- * a plain, uniform, codegen-internal accumulator (`{}`/`{variant,value}`/
- * a growable array — never itself representation-specific, unless a rule
- * opts in via `beginStruct`/`setField`/`beginList`/`appendElement` below)
- * into whatever this rule's own chosen host shape actually is, at the one
- * point a decoded value is about to cross a procedure boundary. Encode
- * never builds a value of its own type at all — it only ever reads *from*
- * an already-finished incoming one via `readField`/`activeVariantName`/
- * `activeVariantPayload`/`count`/`elementAt`.
+ * `finishStruct`/`finishUnion`/`finishList` are decode-only: they convert the
+ * uniform codegen-internal accumulator into this rule's host shape, at the
+ * one point a decoded value crosses a procedure boundary. Encode never builds
+ * a value of its own type — it only reads from an already-finished one.
  */
 export type Accessor =
     | { readonly kind: "integer"

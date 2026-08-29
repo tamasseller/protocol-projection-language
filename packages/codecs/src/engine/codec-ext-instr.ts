@@ -9,13 +9,9 @@
  * with each opcode's operands given real names instead of positional
  * indices into a flat array.
  *
- * Every consumer that used to read `instr.operands[N]` — `codec-
- * extension.ts`'s `exec()`, `validate-handles.ts`, `procedure-types.ts`,
- * `wire.ts`, and `@ppl/target-js`'s `codec-codegen.ts` — now reads a named
- * field instead, type-checked against this one declaration; a typo or a
- * reordered field is a compile error at the read site, not a silent
- * mismatch against whatever the construction site (below) happened to put
- * where.
+ * Every consumer reads a named field type-checked against this one
+ * declaration, so a typo or a reordered field is a compile error at the
+ * read site rather than a silent mismatch with the construction site.
  *
  * `READ_SEQ`'s `signed` is a real `boolean` here (the wire/DSL level still
  * only ever has a `0`/`1` literal, per `codecRules()`'s `pConst()` — the

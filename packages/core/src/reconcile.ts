@@ -149,8 +149,8 @@ function outcomeOf(imageNode: TypeNode | undefined, localNode: TypeNode | undefi
  * exactly: `byObject.set(key, node)` before `edgesOf`), so a self- or
  * mutually-recursive type on either side re-derives the same pair and
  * hits the cache instead of looping forever. Correct to share the cached
- * object across unrelated positions too — see this file's header — since
- * a `Correspondence` no longer carries anything position-dependent.
+ * object across unrelated positions too — see this file's header — since a
+ * `Correspondence` carries nothing position-dependent.
  *
  * Throws on a §2.2 kind mismatch — the one case reconciliation rejects
  * outright rather than resolving via §3.

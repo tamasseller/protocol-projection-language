@@ -357,13 +357,10 @@ function walkProcedure<E extends { ext: string } = ExtOpPayload>(
     // in acc". With none, nothing has established acc, so it starts *dead*
     // and a body that reads it before writing it is a validation error.
     //
-    // This used to pass `true` unconditionally, which made
-    // `{argCount: 0, body: [RETURN]}` a valid program with no defined
-    // result: vm.ts seeds such a frame's acc to 0, while jit-armv6m's
-    // translateProc emits no entry flush and so returns whatever the
-    // *caller* left in ACC_REG. Found by fuzz/qemu_exec as exactly that
-    // divergence — the reference VM returning 0 where the emitted code
-    // returned the caller's own leftover accumulator.
+    // Passing `true` unconditionally would make `{argCount: 0, body:
+    // [RETURN]}` valid with no defined result: vm.ts seeds such a frame's
+    // acc to 0, while jit-armv6m emits no entry flush and returns whatever
+    // the caller left in ACC_REG.
     const { nextPc, terminated } = walk(0, proc.argCount, proc.argCount >= 1)
     if(!terminated) fail(nextPc, `BLOCK_END with no open block (procedure bodies close only via RETURN/TRAP)`)
     if(nextPc !== body.length) fail(nextPc, `unreachable instruction(s) after the procedure's terminator`)

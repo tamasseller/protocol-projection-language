@@ -2,12 +2,12 @@
  * @ppl/machine/test — Manual tiling performance probe
  *
  * Not part of `npm test` (not imported by run.ts) — measures `tileExpr`'s
- * wall-clock cost on wide balanced-sum expression trees, the shape that
- * previously blew up under the worklist-based search (see docs/isa-rationale.md,
- * "Why these choices" — the Pareto-pruning rationale). Run directly:
+ * wall-clock cost on wide balanced-sum expression trees, the shape a
+ * worklist-based search blows up on (see docs/isa-rationale.md, "Why these
+ * choices" — the Pareto-pruning rationale). Run directly:
  * `npx ts-node --project tsconfig.test.json test/bench.ts`.
  *
- * Reports parse and tile time separately: `tileExpr` itself now stays flat
+ * Reports parse and tile time separately: `tileExpr` stays flat
  * (single-digit ms) out to at least n=128, since Pareto-frontier pruning
  * (orchestrator.ts's `pruneToFrontier`) collapses same-cost evaluation-order
  * ties instead of letting them multiply up the tree. The *parser*

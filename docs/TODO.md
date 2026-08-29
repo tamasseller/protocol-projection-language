@@ -3,14 +3,9 @@ Done:
 
 Open:
 - JIT
-  - move the prolog stub's remaining resume jump into the call/return helper (the LRU
-    half is done); needs the offset+1 encoding sorted out first — its high field doubles
-    as the sentinel's LANDING_* tag, and code_ptr already carries the Thumb bit, so a
-    naive `add r3, r2` in the helper double-counts the +1
-  - use start/current/end byte pointers instead of bytes/offset/length bs
   - clean up extension mechanism
   - implement some easy extension for testing (raw memory access maybe)
-  - clean up stack checking during tranlation (on stack variant dynamic threshold both ways)
+  - clean up stack checking during translation (on stack variant dynamic threshold both ways)
   - clean up enter variants.
   - move to separate root repo, publish on github (needs to move the current @ppl/machine as well)
   

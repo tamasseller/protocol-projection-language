@@ -117,17 +117,11 @@ const unionFieldsRule: TsRule = tsRule(pUnionFields(pStar()),
             return { decl: `type ${name} = ${literals};`, deps: [] }
         }
 
-        // `variant`, not `tag` — matches the one field name this shape
-        // has always had *everywhere else* in this codebase
-        // (`codec-extension.ts`'s own `UnionValue`, every hand-authored
-        // test/example fixture) — this rule's own `produce` used to say
-        // `tag` here, disagreeing with all of that, which is exactly the
-        // tag-vs-variant mismatch found reviewing the compiled codegen.
-        // Now that codec-codegen only ever goes through this rule's own
-        // `access` below (never a hard-coded assumption of its own), the
-        // declared type and the runtime shape can't disagree — but only
-        // once this rule's own declared type agrees with the convention
-        // every *other* consumer already committed to.
+        // `variant`, not `tag` — the field name this shape has everywhere
+        // else (`codec-extension.ts`'s `UnionValue`, every hand-authored
+        // fixture). codec-codegen reaches it only through `access` below,
+        // so the declared type and the runtime shape agree only as long as
+        // this name matches that convention.
         const members = match.variantMatches.map(v => `  | { variant: "${v.name}"; value: ${resolve(v.type).ref} }`)
         const deps = match.variantMatches.map(v => child(node, { variant: v.name })!.id)
         return { decl: `type ${name} =\n${members.join("\n")};`, deps }

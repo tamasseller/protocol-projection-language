@@ -155,8 +155,8 @@ function pruneToFrontier<E extends { ext: string } = ExtOpPayload>(candidates: E
  * result is pruned to a Pareto frontier before caching, so a dominated
  * candidate (e.g. a stack-bridge combo that a register combo always beats
  * when both are available) never survives to inflate a parent's search —
- * see `pruneToFrontier`. This means `tileNode`/`tileExpr` no longer return
- * *every* structurally-realizable tiling, only the cost-relevant ones.
+ * see `pruneToFrontier`. So `tileNode`/`tileExpr` return only the
+ * cost-relevant tilings, not every structurally-realizable one.
  */
 function tileNode<E extends { ext: string } = ExtOpPayload>(node: EastExpression<E>, rules: readonly Rule<E>[], memo: WeakMap<EastExpression<E>, EastExpression<E>[]>): EastExpression<E>[]
 {

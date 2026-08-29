@@ -202,16 +202,14 @@ function leafRules(resolveLocal: (name: string) => number): Rule[]
 // candidates at that same node (orchestrator.ts's `pruneToFrontier` keeps
 // the two separate) — it never removes or replaces them. But that node's
 // *parent* does see a new option once this fires: a literal-op-literal
-// subtree that previously forced a stack combo (no raw literal/identifier
-// at that exact child position for reg/imm rules to match) is now also a
-// `pConst()` match, so the parent can dispatch through `IMM_ACC` instead.
-// This genuinely broke `test/coverage-sweep.test.ts`'s old `(8 + 9)`-shaped
-// flip tie-break probes (folding made `(8 + 9)` cheap enough to stop
-// forcing the stack-combo route they meant to exercise) — fixed by
-// switching those probes to `(x + 100)`, which keeps the same acc/tos cost
-// delta but can't fold (`x` isn't a compile-time constant). Verified
-// against the full suite, not just reasoned about — see
-// test/fold-sweep.test.ts and coverage-sweep.test.ts's own comment.
+// subtree that would otherwise force a stack combo (no raw literal or
+// identifier at that child position for reg/imm rules to match) is also a
+// `pConst()` match, so the parent can dispatch through `IMM_ACC`.
+//
+// That makes any tie-break probe built from a foldable expression useless —
+// `(8 + 9)` folds cheap enough to stop forcing the stack-combo route. Probes
+// use `(x + 100)`: same acc/tos cost delta, unfoldable. See
+// test/fold-sweep.test.ts and coverage-sweep.test.ts.
 //
 // Deliberately not "~"/"+"/"!" on the unary side: nothing needs them
 // folded yet, and test/rule-coverage.test.ts's gate requires every

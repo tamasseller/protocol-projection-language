@@ -415,13 +415,9 @@ describe("Root output demand (tileExpr with demand parameter)", () =>
 
     // ── Assignment — acc demand includes reg-output (write-back) ────────────
 
-    // NOTE: a bare `"reg"` demand (no target index) is no longer expressible
-    // — OutputLocation's reg case carries a concrete index (`{reg: number}`,
-    // rtl.ts) rather than a bare string, per the more concrete register
-    // target specification in rules.ts. There used to be a test here
-    // asserting a bare `"reg"` demand yields 0 variants for `x = y`; it no
-    // longer type-checks against the current OutputLocation shape and its
-    // premise (an index-less reg demand) doesn't apply anymore.
+    // A bare `"reg"` demand (no target index) is not expressible:
+    // OutputLocation's reg case carries a concrete index (`{reg: number}`,
+    // rtl.ts), per rules.ts's register target specification.
 
     test("x = y with acc demand — assignment write-back satisfies acc", () =>
     {

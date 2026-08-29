@@ -27,9 +27,8 @@ const OPTIONS: ts.CompilerOptions = {
 
 // One host, reused across every call, with lib.d.ts's SourceFiles cached
 // by object identity across calls (never the generated file itself, which
-// changes every call — `currentSource` below). This is the actual cost
-// `tsDiagnostics` used to pay on every single call: re-parsing AND
-// re-binding the whole standard library from scratch. TS's binder skips
+// changes every call — `currentSource` below). Without this, every call
+// re-parses and re-binds the whole standard library. TS's binder skips
 // re-binding a SourceFile object it recognizes as already bound — the
 // same mechanism `ts.createLanguageService`'s document registry relies on
 // for incremental builds — so handing back the *same* lib SourceFile

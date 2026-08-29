@@ -419,12 +419,11 @@ describe("validateProgram — §8.7 acc liveness across control flow", () =>
 
     test("code after a whole BR_TABLE reading acc is rejected even when every sibling case re-establishes it", () =>
     {
-        // The AND-across-siblings model this used to accept had no edge to
-        // AND in for §4.5's implicit default, and that edge holds no
-        // instructions at all — it is pure fall-through from the dispatch,
-        // so nothing can establish a value on it. §8.7 is therefore
-        // unconditional: acc is dead after the construct however the cases
-        // ended. Making it conditional on whether `acc >= N` is reachable
+        // An AND-across-siblings model has no edge to AND in for §4.5's
+        // implicit default, and that edge holds no instructions at all — it
+        // is pure fall-through from the dispatch, so nothing can establish a
+        // value on it. §8.7 is therefore unconditional: acc is dead after
+        // the construct however the cases ended. Making it conditional on whether `acc >= N` is reachable
         // would put a range analysis in the interface.
         const program: RtlProgram = {
             procedures: [{
