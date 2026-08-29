@@ -1,10 +1,12 @@
 Done:
 * name for the whole machine/isa/vm/jit thing, the technology as a whole (the part that is not PPL specific): **MOG** — Motor-Gerät, the powered-implement half of Unimog. A bounded core chassis with a standardized take-off, and the domain implement bolts on.**
-* refined resource error bailout diagnostics, no more RESOURCE_ERROR, more specific diagnostics to each failure.
-  
+
 Open:
 - JIT
-  - move prolog stub into call/return helper
+  - move the prolog stub's remaining resume jump into the call/return helper (the LRU
+    half is done); needs the offset+1 encoding sorted out first — its high field doubles
+    as the sentinel's LANDING_* tag, and code_ptr already carries the Thumb bit, so a
+    naive `add r3, r2` in the helper double-counts the +1
   - use start/current/end byte pointers instead of bytes/offset/length bs
   - clean up extension mechanism
   - implement some easy extension for testing (raw memory access maybe)
