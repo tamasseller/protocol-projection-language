@@ -4,11 +4,12 @@ Done:
   
 Open:
 - JIT
-  - add extension mechanism
-    - codegen should allow simple helper dispatch and proper generic isns stream eneration
-    - maybe consider consolidating the dispatch table pointer hi-reg with the runtime pointer to free it up as global state usable by extensions for whatever purpose
+  - eliminate maxSpanBytes based speculation about branch distance
+  - move prolog stub into call/return helper
+  - use start/current/end byte pointers instead of bytes/offset/length bs
+  - clean up extension mechanism
   - implement some easy extension for testing (raw memory access maybe)
-  - eliminate maxSpanBytes based speculation about branch distance, always emit short form instead, bail out with adequate error if offset is too big on fixup. We will revisit this if becomes a bottleneck in practice.
+  - clean up stack checking during tranlation (on stack variant dynamic threshold both ways)
   - clean up enter variants.
   - move to separate root repo, publish on github (needs to move the current @ppl/machine as well)
   
