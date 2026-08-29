@@ -4,7 +4,6 @@ Done:
   
 Open:
 - JIT
-  - eliminate maxSpanBytes based speculation about branch distance
   - move prolog stub into call/return helper
   - use start/current/end byte pointers instead of bytes/offset/length bs
   - clean up extension mechanism
