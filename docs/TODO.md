@@ -4,12 +4,11 @@ Done:
 Open:
 - JIT
   - clean up enter variants.
-    - clean up stack checking 
-    - implement prop on-stack logic with movable limits
-    - create executor object (owns memory setup) with 
+    - double check pre-transition regime static stack checking on program entry
   - explode fixture array based single qemu unittest into separate ones that execute a single test in the same way the other, non-fixture-based qemu tests do. Get rid of the funky helper infrastructure for "fixture tests"
   - clean up extension mechanism
   - implement some easy extension for testing (raw memory access maybe)
+  - add benchmark, code and stack size stats
   - move to separate root repo, publish on github (needs to move the current @ppl/machine as well)
   
 - @ppl/machine
