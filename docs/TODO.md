@@ -3,14 +3,11 @@ Done:
 
 Open:
 - JIT
-  - clean up stack checking during translation (on stack variant dynamic threshold both ways)
-    - move translator stack check logic into runtime
-    - introduce RAII stack check limits (margin in template arg?)
-    - introduce polimorphism to deal with tests and the two memory management variants
-  - explode fixture array based single qemu unittest into separate ones that execute a single test in the same way the other, non-fixture-based qemu tests do. Get rid of the funky helper infrastructure for "fixture tests"
   - clean up enter variants.
+    - clean up stack checking 
     - implement prop on-stack logic with movable limits
     - create executor object (owns memory setup) with 
+  - explode fixture array based single qemu unittest into separate ones that execute a single test in the same way the other, non-fixture-based qemu tests do. Get rid of the funky helper infrastructure for "fixture tests"
   - clean up extension mechanism
   - implement some easy extension for testing (raw memory access maybe)
   - move to separate root repo, publish on github (needs to move the current @ppl/machine as well)
