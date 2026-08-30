@@ -124,7 +124,7 @@ syntactic property of the opcode.
 
 Every fixed finding gets both:
 - a seed in `make_seeds.ts` (so `qemu_exec.ts seeds` is a standing check), and
-- a unit test — `test/host/` for emission, `test/qemu/fixtures.cpp` for a
+- a unit test — `test/host/` for emission, `test/qemu/program_tests.cpp` for a
   real executed result, `packages/machine/test/validate.test.ts` for a
   rejection.
 

@@ -5,7 +5,6 @@ Open:
 - JIT
   - clean up enter variants.
     - double check pre-transition regime static stack checking on program entry
-  - explode fixture array based single qemu unittest into separate ones that execute a single test in the same way the other, non-fixture-based qemu tests do. Get rid of the funky helper infrastructure for "fixture tests"
   - clean up extension mechanism
   - implement some easy extension for testing (raw memory access maybe)
   - checksum?
