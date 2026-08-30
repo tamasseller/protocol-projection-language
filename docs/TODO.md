@@ -8,6 +8,7 @@ Open:
   - explode fixture array based single qemu unittest into separate ones that execute a single test in the same way the other, non-fixture-based qemu tests do. Get rid of the funky helper infrastructure for "fixture tests"
   - clean up extension mechanism
   - implement some easy extension for testing (raw memory access maybe)
+  - checksum?
   - add benchmark, code and stack size stats
   - move to separate root repo, publish on github (needs to move the current @ppl/machine as well)
   
