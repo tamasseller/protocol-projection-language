@@ -82,6 +82,12 @@ maximum compactness. `validateProgram`'s `ProgramStats` stays available to
 any caller that wants them. Same reasoning drops a procedure's own
 extension `header` from the wire (isa-core.md §5.5).
 
+The jit-armv6m target does want those stats, and takes them in a wrapper of
+its own (`jit-armv6m.ts`, the package's only target-specific module) rather
+than in the generic envelope: `max_call_depth`/`total_depth` prepended, plus
+a two-byte FNV-1a frame binding a program to the validator that produced it.
+jit-armv6m/docs/design.md §1.1.
+
 ## 9. Declared default values (`@ppl/core`) - Done
 
 `metamodel.ts`. Motivated by codec-image.md §3.1/§3.3/§4: integer gets a

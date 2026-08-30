@@ -5,6 +5,7 @@
 import "./grammar.test"
 import "./ir.test"
 import "./bytecode.test"
+import "./jit-armv6m.test"
 import "./lowering.test"
 import "./e2e.test"
 import "./validate.test"

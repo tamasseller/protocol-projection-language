@@ -3,11 +3,9 @@ Done:
 
 Open:
 - JIT
-  - clean up enter variants.
-    - double check pre-transition regime static stack checking on program entry
   - clean up extension mechanism
   - implement some easy extension for testing (raw memory access maybe)
-  - checksum?
+  
   - add benchmark, code and stack size stats
   - move to separate root repo, publish on github (needs to move the current @ppl/machine as well)
   

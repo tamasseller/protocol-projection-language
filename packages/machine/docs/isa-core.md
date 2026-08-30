@@ -419,6 +419,10 @@ serialization. Persisting extension header data would take a symmetric
 `Extension.header` codec hook mirroring `Extension.codec`, added when a
 real need appears.
 
+Nothing here is self-delimiting from the outside, and nothing here binds a
+program to the validator that produced it. Both are a target's own concern —
+see `jit-armv6m/docs/design.md` §1.1 for one target's envelope and frame.
+
 ---
 
 ## 6. Calling Convention

@@ -18,7 +18,6 @@ import assert from "node:assert/strict"
 import {
     encodeInstr, decodeInstr, encodeBody, decodeBody,
     encodeProgram, decodeProgram, encodeLeb128, decodeLeb128,
-    encodeJitProgram, decodeJitProgram,
 } from "../src/bytecode"
 import {
     opReg, opRegWriteback, opStack, opImm, bare, brTable, trap, call,
@@ -354,51 +353,5 @@ describe("Bytecode codec — program framing (isa-core.md §5.5)", () =>
         const decoded = decodeProgram(bytes)
         assert.deepEqual(decoded.program, program)
         assert.equal(decoded.next, bytes.length)
-    })
-})
-
-describe("Bytecode codec — jit-armv6m wire envelope", () =>
-{
-    // proc 0 (entry, maxCallDepth 1): CONST 5; CALL 1; RETURN.
-    // proc 1 (argCount 1, leaf): LOAD 0; ADD #10; RETURN.
-    function twoProcProgram(): RtlProgram
-    {
-        return {
-            procedures: [
-                { argCount: 0, body: [CONST(5), call(1), bare("RETURN")] },
-                { argCount: 1, body: [LOAD(0), opImm("ADD", 10), bare("RETURN")] },
-            ],
-        }
-    }
-
-    test("prepends validateProgram's own maxCallDepth/totalDepth to an ordinary encodeProgram blob", () =>
-    {
-        const program = twoProcProgram()
-        const stats = validateProgram(program)
-        const jitBytes = encodeJitProgram(program)
-        const plainBytes = encodeProgram(program)
-
-        assert.deepEqual([...jitBytes], [...encodeLeb128(stats.maxCallDepth), ...encodeLeb128(stats.totalDepth), ...plainBytes])
-    })
-
-    test("round-trips exactly, stats included", () =>
-    {
-        const program = twoProcProgram()
-        const stats = validateProgram(program)
-        const decoded = decodeJitProgram(encodeJitProgram(program))
-
-        assert.equal(decoded.maxCallDepth, stats.maxCallDepth)
-        assert.equal(decoded.totalDepth, stats.totalDepth)
-        assert.deepEqual(decoded.program, program)
-        assert.equal(decoded.next, encodeJitProgram(program).length)
-    })
-
-    test("the round-tripped program still validates and runs correctly", () =>
-    {
-        const { program: decoded } = decodeJitProgram(encodeJitProgram(twoProcProgram()))
-        validateProgram(decoded)
-        const result = run(decoded)
-        assert.equal(result.ok, true)
-        assert.equal(result.acc, 15) // 5 + 10, via a real CALL across the wire
     })
 })
