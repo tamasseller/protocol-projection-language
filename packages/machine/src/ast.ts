@@ -88,6 +88,10 @@ export interface VariableDeclaration
 export interface VariableDeclarator
 {
     type: "VariableDeclarator"
+    /** The declared type, which decides both the variable's stored
+     *  representation and the signedness of every operation reading it
+     *  (isa-core.md §4.3; the rule is in types.ts). */
+    varType: PrimType
     id: Identifier
     init: Expression | null
 }
@@ -110,7 +114,12 @@ export interface ExpressionStatement
 // 2. Expressions
 // ——————————————————————————————————————————————
 
+/** The primitive type menu. `u32` is the machine word itself; the other
+ *  five are that word constrained to a range, held already-extended. */
+export type PrimType = "u32" | "u16" | "u8" | "i32" | "i16" | "i8"
+
 export type Expression =
+    | CastExpression
     | AssignmentExpression
     | ConditionalExpression
     | LogicalExpression
@@ -165,6 +174,19 @@ export interface BinaryExpression
     operator: BinaryOperator
     left: Expression
     right: Expression
+    /** Set by types.ts for the five operators whose ISA opcode depends on
+     *  signedness (`>>`, `<`, `<=`, `>`, `>=`). Absent means unsigned, so an
+     *  un-annotated tree keeps its old lowering. */
+    signed?: boolean
+}
+
+/** `i16(x)` — an explicit narrowing, and the node types.ts also inserts for
+ *  every implicit one (assignment into a narrow variable). */
+export interface CastExpression
+{
+    type: "CastExpression"
+    varType: PrimType
+    argument: Expression
 }
 
 export type UnaryOperator = "+" | "-" | "~" | "!"

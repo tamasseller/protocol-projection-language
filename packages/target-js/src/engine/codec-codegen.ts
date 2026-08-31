@@ -145,6 +145,10 @@ export function unaryOpToJs(op: UnaryOpcode, v: string): string
         // runtime helper instead, same idea as evalUnary's own MUL/CLZ
         // leaning on Math.imul/Math.clz32 rather than hand-rolling them.
         case "REVBITS": return `revBits(${v})`
+        case "SXTB": return `((((${v}) << 24) >> 24) >>> 0)`
+        case "SXTH": return `((((${v}) << 16) >> 16) >>> 0)`
+        case "UXTB": return `((${v}) & 0xff)`
+        case "UXTH": return `((${v}) & 0xffff)`
     }
 }
 

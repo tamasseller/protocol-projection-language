@@ -11,8 +11,8 @@ Open:
   - DSL improvements
     - implement ternary
     - maybe allow extension a bit more freedom to on the dsl expression side, we could allow them to
-      - have their own declaration like statements
-      - object field access or array element access like syntax for them
+      - have their own declaration like statements for pinning compile time constants 
+      - object field access and/or array element access like syntax for them
 
 - the actual PPL itself
   - Quantities / units of measurement — design sketch in docs/quantities.md, nothing implemented.

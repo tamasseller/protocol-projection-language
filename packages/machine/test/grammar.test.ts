@@ -39,6 +39,7 @@ describe("Declarations", () =>
                 type: "VariableDeclaration",
                 declarations: [{
                     type: "VariableDeclarator",
+                    varType: "u32",
                     id: {type: "Identifier", name: "x"},
                     init: null,
                 }],
@@ -55,6 +56,7 @@ describe("Declarations", () =>
                 type: "VariableDeclaration",
                 declarations: [{
                     type: "VariableDeclarator",
+                    varType: "u32",
                     id: {type: "Identifier", name: "x"},
                     init: {type: "Literal", value: 42, raw: "42"},
                 }],

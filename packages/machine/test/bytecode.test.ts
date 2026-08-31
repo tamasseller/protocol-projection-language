@@ -52,24 +52,25 @@ for (const [i, op] of CMP.entries())
     rows.push({ byte: 50 + i * 4 + 2, instr: opImm(op, 0) })
     rows.push({ byte: 50 + i * 4 + 3, instr: opImm(op, EXT_IMM) })
 }
-for (const [i, op] of (["NEG", "NOT", "CLZ", "REVBITS"] as const).entries())
+const UNARY = ["NEG", "NOT", "CLZ", "REVBITS", "SXTB", "SXTH", "UXTB", "UXTH"] as const
+for (const [i, op] of UNARY.entries())
     rows.push({ byte: 90 + i, instr: bare(op) })
-rows.push({ byte: 94, instr: bare("BLOCK_END") })
-rows.push({ byte: 95, instr: bare("LOOP") })
-rows.push({ byte: 96, instr: brTable(1) })
-rows.push({ byte: 97, instr: brTable(2) })
-rows.push({ byte: 98, instr: brTable(3) })
-rows.push({ byte: 99, instr: call(REG) })
-rows.push({ byte: 100, instr: bare("RETURN") })
-rows.push({ byte: 101, instr: trap(0) })
-rows.push({ byte: 102, instr: trap(5) })
-rows.push({ byte: 103, instr: PUSH() })
-rows.push({ byte: 104, instr: POP() })
-rows.push({ byte: 105, instr: LOAD(REG) })
-rows.push({ byte: 106, instr: STORE(REG) })
-rows.push({ byte: 107, instr: CONST(EXT_IMM) })
+rows.push({ byte: 98, instr: bare("BLOCK_END") })
+rows.push({ byte: 99, instr: bare("LOOP") })
+rows.push({ byte: 100, instr: brTable(1) })
+rows.push({ byte: 101, instr: brTable(2) })
+rows.push({ byte: 102, instr: brTable(3) })
+rows.push({ byte: 103, instr: call(REG) })
+rows.push({ byte: 104, instr: bare("RETURN") })
+rows.push({ byte: 105, instr: trap(0) })
+rows.push({ byte: 106, instr: trap(5) })
+rows.push({ byte: 107, instr: PUSH() })
+rows.push({ byte: 108, instr: POP() })
+rows.push({ byte: 109, instr: LOAD(REG) })
+rows.push({ byte: 110, instr: STORE(REG) })
+rows.push({ byte: 111, instr: CONST(EXT_IMM) })
 for (let k = 0; k <= 15; k++)
-    rows.push({ byte: 108 + k, instr: CONST(k) })
+    rows.push({ byte: 112 + k, instr: CONST(k) })
 
 describe("Bytecode codec — 128-row opcode table (isa-core.md Appendix)", () =>
 {
@@ -94,21 +95,12 @@ describe("Bytecode codec — 128-row opcode table (isa-core.md Appendix)", () =>
         }
     })
 
-    test("all 128 byte values are accounted for (124 assigned + 4 reserved)", () =>
+    test("all 128 byte values are accounted for — no gaps, nothing reserved", () =>
     {
         const assigned = new Set(rows.map(r => r.byte))
         for (let b = 0; b < 128; b++)
-        {
-            if (b >= 124) continue // reserved, checked separately
             assert.ok(assigned.has(b), `byte ${b} has no row — a gap in the table`)
-        }
-        assert.equal(assigned.size, 124)
-    })
-
-    test("reserved bytes 124-127 are rejected on decode", () =>
-    {
-        for (let b = 124; b <= 127; b++)
-            assert.throws(() => decodeInstr(Uint8Array.of(b), 0), /reserved/)
+        assert.equal(assigned.size, 128)
     })
 
     test("extension bytes (>=128) are rejected on decode", () =>
@@ -131,8 +123,8 @@ describe("Bytecode codec — small/extended boundary cases", () =>
 {
     test("CONST: #15 stays small, #16 switches to extended", () =>
     {
-        assert.deepEqual(encodeInstr(CONST(15)), [108 + 15])
-        assert.deepEqual(encodeInstr(CONST(16)), [107, 16])
+        assert.deepEqual(encodeInstr(CONST(15)), [112 + 15])
+        assert.deepEqual(encodeInstr(CONST(16)), [111, 16])
     })
 
     test("comparison immediate: #0 stays small, #1 switches to extended", () =>
@@ -150,16 +142,16 @@ describe("Bytecode codec — small/extended boundary cases", () =>
 
     test("BR_TABLE: N=1 and N=2 stay dedicated, N=0 and N=3 switch to extended", () =>
     {
-        assert.deepEqual(encodeInstr(brTable(1)), [96])
-        assert.deepEqual(encodeInstr(brTable(2)), [97])
-        assert.deepEqual(encodeInstr(brTable(0)), [98, 0])
-        assert.deepEqual(encodeInstr(brTable(3)), [98, 3])
+        assert.deepEqual(encodeInstr(brTable(1)), [100])
+        assert.deepEqual(encodeInstr(brTable(2)), [101])
+        assert.deepEqual(encodeInstr(brTable(0)), [102, 0])
+        assert.deepEqual(encodeInstr(brTable(3)), [102, 3])
     })
 
     test("TRAP: code=0 stays dedicated, any other code switches to extended", () =>
     {
-        assert.deepEqual(encodeInstr(trap(0)), [101])
-        assert.deepEqual(encodeInstr(trap(1)), [102, 1])
+        assert.deepEqual(encodeInstr(trap(0)), [105])
+        assert.deepEqual(encodeInstr(trap(1)), [106, 1])
     })
 })
 
@@ -301,7 +293,7 @@ describe("Bytecode codec — program framing (isa-core.md §5.5)", () =>
         const bytes = encodeProgram(program)
         // count(2), argCount_0(0), body_0's RETURN(100), argCount_1(0),
         // body_1's CONST(108+1)/RETURN(100) — no bodyLength byte anywhere.
-        assert.deepEqual([...bytes], [2, 0, 100, 0, 108 + 1, 100])
+        assert.deepEqual([...bytes], [2, 0, 104, 0, 112 + 1, 104])
     })
 
     test("a LOOP body block closed by a bare terminator (isa-core.md §7.2) still self-delimits correctly", () =>

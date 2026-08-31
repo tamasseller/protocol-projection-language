@@ -155,26 +155,30 @@ single-byte form. One is a justified universal case, the other would be a
 per-operator guess.
 
 **The core opcode space is a flat range dispatch, not a bit-prefix tree.**
-Each instruction class's size is its actual op × mode count (50, 40, 4, 5,
-4, 25), not rounded up to a power of two. Those sizes don't nest under a
+Each instruction class's size is its actual op × mode count (50, 40, 8, 5,
+4, 21), not rounded up to a power of two. Those sizes don't nest under a
 cascading single-bit split the way equal halves would, so the decoder is a
 handful of numeric range checks or one 128-entry table instead of bit
-masking, and is simpler to implement and verify. Almost all of the 128-code
-budget goes to what each class needs, with four codes left unassigned
-(isa-core.md §5.3) as somewhere for one specific, later, *measured*
-addition to land without renumbering.
+masking, and is simpler to implement and verify. The 128-code budget is
+exactly consumed.
 
-**The four reserved codes are a bounded exception, not a reopened
-question.** One candidate for that pocket: a constant-synthesis op for
-low-entropy value shapes (powers of two, all-ones masks, contiguous bit
-masks), each of which today costs a 4-6 byte extended `CONST` or a
-multi-instruction composite. A single `MASK(width, offset)` move-class op
-packing both parameters into one trailing byte would subsume all three at
-2 bytes. It is not adopted: no corpus shows these shapes appearing often
-enough, which is the same unmeasured bet the per-op arithmetic literal
-table was rejected for. The difference is scope: reserving four codes
-against the chance one narrow addition is later justified is cheap;
-guessing its content without evidence is not.
+**The reserved pocket is spent.** Four codes were once held back
+(isa-core.md §5.3) for one specific, later, *measured* addition. That
+addition turned out to be §4.3's `SXTB`/`SXTH`/`UXTB`/`UXTH`, which the
+narrow integer types need: a narrow variable holds an already-extended
+word, so every write into one costs an extend, and the composites those
+ops replace (`SHL #24; ASR #24`, `AND #0xff`) are 3-4 bytes each against
+one. Rather than leaving the unary class split across two ranges, taking
+the pocket renumbered everything above byte 93 — a decoder built against
+the earlier layout is wrong from there up, not merely on four codes.
+
+The candidate this displaced was a constant-synthesis op for low-entropy
+value shapes (powers of two, all-ones masks, contiguous bit masks): a
+single `MASK(width, offset)` packing both parameters into one trailing
+byte, subsuming a 4-6 byte extended `CONST` at 2 bytes. It was never
+adopted — no corpus showed those shapes appearing often enough, the same
+unmeasured bet the per-op arithmetic literal table was rejected for — and
+it now needs a spec revision rather than a free slot.
 
 ---
 

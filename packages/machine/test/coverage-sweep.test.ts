@@ -29,26 +29,36 @@ import { lowerExpr, lowerStatementExpr, touchedRuleNames } from "../src/orchestr
 import type { EastExpression } from "../src/east"
 import type { ReturnStatement, ExpressionStatement } from "../src/ast"
 import type { OutputLocation } from "../src/rtl"
+import { annotate } from "../src/types"
+import type { TypeEnv } from "../src/types"
+
+/* Every name an `i32`, which is what makes an operation signed: C promotes
+ * everything narrower than 32 bits to `int`, so only a `u32` operand keeps
+ * an operation unsigned (types.ts). The unannotated probes below therefore
+ * drive the unsigned half and these drive the signed one. */
+const SIGNED_ENV: TypeEnv = {typeOf: () => "i32"}
 
 /** Parse a bare expression (no `return`/`;`) by wrapping it into one. */
-function exprOf(expr: string): EastExpression
+function exprOf(expr: string, signed = false): EastExpression
 {
     const frag = ir`return ${expr};`
     const stmt = frag.body[0] as ReturnStatement
-    return stmt.argument! as EastExpression
+    const e = stmt.argument!
+    return (signed ? annotate(e, SIGNED_ENV) : e) as EastExpression
 }
 
-function stmtExprOf(source: string): EastExpression
+function stmtExprOf(source: string, signed = false): EastExpression
 {
     const frag = ir`${source}`
     const stmt = frag.body[0] as ExpressionStatement
-    return stmt.expression as EastExpression
+    const e = stmt.expression
+    return (signed ? annotate(e, SIGNED_ENV) : e) as EastExpression
 }
 
 /** Lower `return <source>;` under `demand` and assert `wantRule` won. */
-function winsRule(source: string, demand: OutputLocation, wantRule: string): void
+function winsRule(source: string, demand: OutputLocation, wantRule: string, signed = false): void
 {
-    const node = lowerExpr(exprOf(source), DEFAULT_RULESET, demand)
+    const node = lowerExpr(exprOf(source, signed), DEFAULT_RULESET, demand)
     assert.ok(node, `${source} (demand=${demand}): no viable tiling`)
     assert.ok(touchedRuleNames.has(wantRule),
         `${source} (demand=${demand}): expected "${wantRule}" to win, ` +
@@ -59,16 +69,16 @@ function winsRule(source: string, demand: OutputLocation, wantRule: string): voi
  *  statement — the only context REG_REG's write-back shortcut ever wins
  *  in, since a `return`'s "acc" demand would need a reload afterward
  *  anyway (lowerStatementExpr's own doc comment, orchestrator.ts). */
-function winsRuleAsStatement(source: string, wantRule: string): void
+function winsRuleAsStatement(source: string, wantRule: string, signed = false): void
 {
-    const node = lowerStatementExpr(stmtExprOf(source), DEFAULT_RULESET)
+    const node = lowerStatementExpr(stmtExprOf(source, signed), DEFAULT_RULESET)
     assert.ok(node, `${source} (statement): no viable tiling`)
     assert.ok(touchedRuleNames.has(wantRule),
         `${source} (statement): expected "${wantRule}" to win, ` +
         `got [${node.fragment.map(i => i.op).join(", ")}]`)
 }
 
-interface OpSpec { ast: string; isa: string; swap?: string; hasFlip: boolean; writeback: boolean }
+interface OpSpec { ast: string; isa: string; swap?: string; hasFlip: boolean; writeback: boolean; signed?: true }
 
 // Mirrors rules.ts's OP_TABLE (ast/isa/class/kind) — kept here rather than
 // imported so this file documents its own probe targets explicitly.
@@ -87,11 +97,20 @@ const OPS: readonly OpSpec[] = [
     {ast: "<=", isa: "LE_U", hasFlip: false, writeback: false},
     {ast: ">", isa: "GT_U", hasFlip: false, writeback: false},
     {ast: ">=", isa: "GE_U", hasFlip: false, writeback: false},
+    // The signed halves. Same shapes, same probe reasoning — the only
+    // difference is that the expression is annotated first, which is what
+    // makes rules.ts pick the signed opcode.
+    {ast: ">>", isa: "ASR", hasFlip: false, writeback: true, signed: true},
+    {ast: "<", isa: "LT_S", hasFlip: false, writeback: false, signed: true},
+    {ast: "<=", isa: "LE_S", hasFlip: false, writeback: false, signed: true},
+    {ast: ">", isa: "GT_S", hasFlip: false, writeback: false, signed: true},
+    {ast: ">=", isa: "GE_S", hasFlip: false, writeback: false, signed: true},
 ] as const
 
-for (const {ast, isa, swap, hasFlip, writeback} of OPS)
+for (const {ast, isa, swap, hasFlip, writeback, signed} of OPS)
 {
     const flipIsa = swap ?? isa
+    const sg = signed ?? false
 
     describe(`Rule-coverage sweep: ${ast} (${isa}${swap ? "/" + swap : ""})`, () =>
     {
@@ -100,7 +119,7 @@ for (const {ast, isa, swap, hasFlip, writeback} of OPS)
         // and nothing competes (no literal, no compound side).
         test("REG_ACC (direct)", () =>
         {
-            winsRule(`w ${ast} x`, "acc", `${ast}->${isa}:REG_ACC`)
+            winsRule(`w ${ast} x`, "acc", `${ast}->${isa}:REG_ACC`, sg)
         })
 
         if (hasFlip)
@@ -112,7 +131,7 @@ for (const {ast, isa, swap, hasFlip, writeback} of OPS)
             // already-tiled-acc on the right) matches.
             test("REG_ACC (flip)", () =>
             {
-                winsRule(`x ${ast} (p + q)`, "acc", `${ast}->${flipIsa}:REG_ACC:flip`)
+                winsRule(`x ${ast} (p + q)`, "acc", `${ast}->${flipIsa}:REG_ACC:flip`, sg)
             })
         }
 
@@ -123,12 +142,12 @@ for (const {ast, isa, swap, hasFlip, writeback} of OPS)
         // immediate wins outright.
         test("IMM_ACC:acc (direct)", () =>
         {
-            winsRule(`x ${ast} 100`, "acc", `${ast}->${isa}:IMM_ACC:acc`)
+            winsRule(`x ${ast} 100`, "acc", `${ast}->${isa}:IMM_ACC:acc`, sg)
         })
 
         test("IMM_ACC:tos (direct)", () =>
         {
-            winsRule(`x ${ast} 100`, "tos", `${ast}->${isa}:IMM_ACC:tos`)
+            winsRule(`x ${ast} 100`, "tos", `${ast}->${isa}:IMM_ACC:tos`, sg)
         })
 
         if (hasFlip)
@@ -141,12 +160,12 @@ for (const {ast, isa, swap, hasFlip, writeback} of OPS)
             // already-tiled-acc on the right) matches at all.
             test("IMM_ACC:acc (flip)", () =>
             {
-                winsRule(`100 ${ast} (p + q)`, "acc", `${ast}->${flipIsa}:IMM_ACC:acc:flip`)
+                winsRule(`100 ${ast} (p + q)`, "acc", `${ast}->${flipIsa}:IMM_ACC:acc:flip`, sg)
             })
 
             test("IMM_ACC:tos (flip)", () =>
             {
-                winsRule(`100 ${ast} (p + q)`, "tos", `${ast}->${flipIsa}:IMM_ACC:tos:flip`)
+                winsRule(`100 ${ast} (p + q)`, "tos", `${ast}->${flipIsa}:IMM_ACC:tos:flip`, sg)
             })
         }
 
@@ -157,7 +176,7 @@ for (const {ast, isa, swap, hasFlip, writeback} of OPS)
         // against flip by insertion order.
         test("POP_ACC (direct)", () =>
         {
-            winsRule(`(p + q) ${ast} (r + s)`, "acc", `${ast}->${isa}:POP_ACC`)
+            winsRule(`(p + q) ${ast} (r + s)`, "acc", `${ast}->${isa}:POP_ACC`, sg)
         })
 
         // PEEK_PEEK only exists for `alu` ops (isa-core.md §4.2 gives
@@ -170,14 +189,14 @@ for (const {ast, isa, swap, hasFlip, writeback} of OPS)
         {
             test("PEEK_PEEK (direct)", () =>
             {
-                winsRule(`(p + q) ${ast} (r + s)`, "tos", `${ast}->${isa}:PEEK_PEEK`)
+                winsRule(`(p + q) ${ast} (r + s)`, "tos", `${ast}->${isa}:PEEK_PEEK`, sg)
             })
         }
         else
         {
             test("POP_ACC:tos (direct, no peek combo for comparisons)", () =>
             {
-                winsRule(`(p + q) ${ast} (r + s)`, "tos", `${ast}->${isa}:POP_ACC:tos`)
+                winsRule(`(p + q) ${ast} (r + s)`, "tos", `${ast}->${isa}:POP_ACC:tos`, sg)
             })
         }
 
@@ -210,21 +229,21 @@ for (const {ast, isa, swap, hasFlip, writeback} of OPS)
             // staying unfoldable (`x` isn't a compile-time constant).
             test("POP_ACC (flip)", () =>
             {
-                winsRule(`(x + 100) ${ast} (p + q)`, "acc", `${ast}->${flipIsa}:POP_ACC:flip`)
+                winsRule(`(x + 100) ${ast} (p + q)`, "acc", `${ast}->${flipIsa}:POP_ACC:flip`, sg)
             })
 
             if (writeback)
             {
                 test("PEEK_PEEK (flip)", () =>
                 {
-                    winsRule(`(x + 100) ${ast} (p + q)`, "tos", `${ast}->${flipIsa}:PEEK_PEEK:flip`)
+                    winsRule(`(x + 100) ${ast} (p + q)`, "tos", `${ast}->${flipIsa}:PEEK_PEEK:flip`, sg)
                 })
             }
             else
             {
                 test("POP_ACC:tos (flip, no peek combo for comparisons)", () =>
                 {
-                    winsRule(`(x + 100) ${ast} (p + q)`, "tos", `${ast}->${flipIsa}:POP_ACC:tos:flip`)
+                    winsRule(`(x + 100) ${ast} (p + q)`, "tos", `${ast}->${flipIsa}:POP_ACC:tos:flip`, sg)
                 })
             }
         }
@@ -237,7 +256,7 @@ for (const {ast, isa, swap, hasFlip, writeback} of OPS)
             // winsRuleAsStatement's doc comment.
             test("REG_REG (direct, as a statement)", () =>
             {
-                winsRuleAsStatement(`y = x ${ast} y;`, `${ast}->${isa}:REG_REG`)
+                winsRuleAsStatement(`y = x ${ast} y;`, `${ast}->${isa}:REG_REG`, sg)
             })
 
             if (hasFlip)
@@ -247,9 +266,45 @@ for (const {ast, isa, swap, hasFlip, writeback} of OPS)
                 // comment on regOperandRules).
                 test("REG_REG (flip, as a statement)", () =>
                 {
-                    winsRuleAsStatement(`x = x ${ast} y;`, `${ast}->${flipIsa}:REG_REG:flip`)
+                    winsRuleAsStatement(`x = x ${ast} y;`, `${ast}->${flipIsa}:REG_REG:flip`, sg)
                 })
             }
         }
     })
 }
+
+/* The narrowing casts (rules.ts's `builtin:u8` and friends). Nothing
+ * competes: a cast reaches the ruleset as a call node whose callee is a
+ * type name, and that shape has exactly one rule per output. */
+describe("Rule-coverage sweep: narrowing casts", () =>
+{
+    for(const name of ["i8", "i16", "u8", "u16"] as const)
+    {
+        test(`${name}(x)`, () =>
+        {
+            winsRule(`${name}(x)`, "acc", `builtin:${name}`, /*signed=*/true)
+        })
+
+        test(`${name}(x) under a tos demand`, () =>
+        {
+            winsRule(`${name}(x)`, "tos", `builtin:${name}:tos`, /*signed=*/true)
+        })
+    }
+})
+
+/* The `:tos` variants of the other unary-shaped rules — the ones a
+ * declaration initializer needs (`u32 x = clz(y);`). Their `:acc` twins are
+ * driven by lowering.test.ts; only the trailing-PUSH form needs a demand
+ * that asks for it. */
+describe("Rule-coverage sweep: unary-shaped rules under a tos demand", () =>
+{
+    for(const [source, want] of [
+        ["-x", "unary:-:tos"],
+        ["~x", "unary:~:tos"],
+        ["clz(x)", "builtin:clz:tos"],
+        ["revbits(x)", "builtin:revbits:tos"],
+    ] as const)
+    {
+        test(source, () => { winsRule(source, "tos", want) })
+    }
+})

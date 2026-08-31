@@ -44,6 +44,8 @@ export interface EastBinary<E extends { ext: string } = ExtOpPayload>
     operator: BinaryOperator
     left: EastExpression<E>
     right: EastExpression<E>
+    /** Mirrors `BinaryExpression.signed` (ast.ts) — set by types.ts. */
+    signed?: boolean
 }
 
 export interface EastUnary<E extends { ext: string } = ExtOpPayload>
