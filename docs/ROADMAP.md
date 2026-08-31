@@ -289,17 +289,7 @@ point; choosing what to do with it is real target-codegen work.
 leaves, `grammer.pegjs`'s recursive-descent parser dominates wall-clock
 time; `tileExpr` is flat in tree width. Not investigated further.
 
-**`ASR` and signed comparisons (`LT_S`/`LE_S`/`GT_S`/`GE_S`) are real,
-VM-implemented, ISA-documented opcodes with no DSL token.** `rules.ts`'s
-`OP_TABLE` wires `>>` to `SHR` (logical) only, and `<`/`<=`/`>`/`>=` to
-their unsigned counterparts only, so `v < 0` is always false in this DSL: a
-real footgun, found via `delta-leb128.ts`'s first draft, which silently
-produced wrong output rather than erroring. Bitwise top-bit tests
-(`(v & 0x80000000) != 0`) work today; wiring these up is a couple of
-`rules.ts` table entries plus grammar tokens, whenever a codec needs true
-signed arithmetic instead of a masking workaround.
-
-**`ConditionalExpression` (`?:`) parses but has no lowering rule.** Fails
-at lowering time ("Failed to lower expression statement"), not parse time.
-Lower priority than the above, since it is a clear error rather than
-silently wrong output.
+**The DSL surface has gaps the grammar does not reject.** docs/dsl-gaps.md
+lists them case by case, reproduced: four produce wrong programs that
+validate, one crashes, the rest are clean refusals. Signed types and the
+ternary, both listed here before, are done.

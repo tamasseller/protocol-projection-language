@@ -8,9 +8,8 @@ Open:
 - @ppl/machine
   - move @ppl/machine to separate root repo publish on github
   - DSL improvements
-    - maybe allow extension a bit more freedom to on the dsl expression side, we could allow them to
-      - have their own declaration like statements for pinning compile time constants 
-      - object field access and/or array element access like syntax for them
+    - process dsl-gaps.md
+    - I'm thining to maybe allow extension a bit more freedom on the DSL expression side, we could allow them to have their own declaration like statements for pinning compile time constants (like stream ids and such) and object field access and/or array element access like syntax either globally (like memory[address]) or on their declared magic object instances (iterator.read())
 
 - the actual PPL itself
   - Quantities / units of measurement — design sketch in docs/quantities.md, nothing implemented.

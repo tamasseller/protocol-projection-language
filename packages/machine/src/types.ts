@@ -25,6 +25,7 @@
 import type {
     Expression, PrimType, BinaryOperator, Identifier, CallExpression,
 } from "./ast"
+import {mapOver} from "./ast"
 
 /** What a name's declared type is, or `undefined` for one this scope never
  *  declared — a procedure argument, which is `u32` (isa-core.md §2.3). */
@@ -135,13 +136,10 @@ function walk(node: Expression, env: TypeEnv): Typed
         }
 
         case "CallExpression":
-        {
             // Procedure signatures are untyped for now, so a call's value
             // is a plain word. Arguments are still annotated: each is an
             // expression in its own right.
-            const args = node.arguments.map(a => walk(a, env).expr)
-            return {expr: {...node, arguments: args}, type: DEFAULT_TYPE}
-        }
+            return {expr: mapOver(node, a => walk(a, env).expr), type: DEFAULT_TYPE}
 
         // Reached only through `typeOfExpr`: lower.ts hoists every ternary
         // into a branch of its own before annotating what is left, so no
@@ -162,10 +160,7 @@ function walk(node: Expression, env: TypeEnv): Typed
         // ++/--). Walked so their children are still annotated if one of
         // them ever grows a lowering.
         case "LogicalExpression":
-            return {
-                expr: {...node, left: walk(node.left, env).expr, right: walk(node.right, env).expr},
-                type: "i32",
-            }
+            return {expr: mapOver(node, c => walk(c, env).expr), type: "i32"}
 
         case "UpdateExpression":
             return {expr: node, type: env.typeOf((node.argument as Identifier).name ?? "") ?? DEFAULT_TYPE}

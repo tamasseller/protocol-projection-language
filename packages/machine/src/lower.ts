@@ -22,6 +22,7 @@ import type {
     ForStatement, SwitchStatement, VariableDeclaration, ReturnStatement,
     ExpressionStatement, Expression, ConditionalExpression, Identifier,
 } from "./ast"
+import {recurseOver, mapOver} from "./ast"
 import {RtlProc, RtlProgram, RtlInstr, bare, brTable, CONST, PUSH, STORE} from "./rtl"
 import type {ExtOpPayload} from "./rtl"
 import type {Procedure} from "./ir"
@@ -344,34 +345,17 @@ function hoistTernaries<E extends { ext: string } = ExtOpPayload>(expr: Expressi
 
 function hasConditional(e: Expression): boolean
 {
-    switch(e.type)
-    {
-        case "ConditionalExpression": return true
-        case "BinaryExpression": return hasConditional(e.left) || hasConditional(e.right)
-        case "LogicalExpression": return hasConditional(e.left) || hasConditional(e.right)
-        case "AssignmentExpression": return hasConditional(e.right)
-        case "UnaryExpression": return hasConditional(e.argument)
-        case "CastExpression": return hasConditional(e.argument)
-        case "CallExpression": return e.arguments.some(hasConditional)
-        default: return false
-    }
+    return e.type === "ConditionalExpression"
+        || recurseOver(e, hasConditional, (...v) => v.includes(true), false)
 }
 
 function hoist<E extends { ext: string } = ExtOpPayload>(e: Expression, alloc: RegAlloc<E>, out: RtlInstr<E>[]): Expression
 {
     if(!hasConditional(e)) return e
 
-    switch(e.type)
-    {
-        case "ConditionalExpression": return hoistConditional(e, alloc, out)
-        case "BinaryExpression": return {...e, left: hoist(e.left, alloc, out), right: hoist(e.right, alloc, out)}
-        case "LogicalExpression": return {...e, left: hoist(e.left, alloc, out), right: hoist(e.right, alloc, out)}
-        case "AssignmentExpression": return {...e, right: hoist(e.right, alloc, out)}
-        case "UnaryExpression": return {...e, argument: hoist(e.argument, alloc, out)}
-        case "CastExpression": return {...e, argument: hoist(e.argument, alloc, out)}
-        case "CallExpression": return {...e, arguments: e.arguments.map(a => hoist(a, alloc, out))}
-        default: return e
-    }
+    return e.type === "ConditionalExpression"
+        ? hoistConditional(e, alloc, out)
+        : mapOver(e, c => hoist(c, alloc, out))
 }
 
 function hoistConditional<E extends { ext: string } = ExtOpPayload>(e: ConditionalExpression, alloc: RegAlloc<E>, out: RtlInstr<E>[]): Identifier

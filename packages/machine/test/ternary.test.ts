@@ -64,6 +64,18 @@ describe("ternary — values", () =>
     test("nested in the test", () =>
         returns("u32 a = 3; return (a > 2 ? 0 : 1) ? 10 : 20;", 20))
 
+    // The child positions a ternary can hide in are `ast.ts`'s fan-out, so
+    // each one is worth a probe: nothing else here would notice a position
+    // that stopped being visited.
+    test("under a unary operator", () =>
+        returns("u32 a = 1; return -(a ? 1 : 2);", -1))
+
+    test("inside a cast", () =>
+        returns("u32 a = 1; u8 y = u8(a ? 300 : 1); return y;", 44))
+
+    test("on the right of an assignment", () =>
+        returns("u32 a = 1; u32 x = 0; x = a ? 11 : 22; return x;", 11))
+
     test("as a call argument", () =>
     {
         const half = proc(["x"], ir`return x >> 1;`)
