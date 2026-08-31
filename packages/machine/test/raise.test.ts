@@ -408,6 +408,33 @@ describe("raise: unary operators", () =>
     `, 0xb8000000))
 })
 
+describe("raise: ternary (a dispatch whose arms assign one slot)", () =>
+{
+    test("both arms", () =>
+    {
+        assertRaisedReturn("u32 a = 7; u32 b = 9; return a < b ? a : b;", 7)
+        assertRaisedReturn("u32 a = 9; u32 b = 7; return a < b ? a : b;", 7)
+    })
+
+    test("the slot the arms wrote is read after the merge", () => assertRaisedReturn(`
+        u32 a = 7;
+        u32 b = a > 3 ? 11 : 22;
+        return b + 1;
+    `, 12))
+
+    test("nested in an arm", () =>
+        assertRaisedReturn("u32 a = 0; return a ? 1 : (a == 0 ? 42 : 7);", 42))
+
+    test("in a loop condition", () => assertRaisedReturn(`
+        u32 n = 0;
+        u32 i = 0;
+        while(i < (n ? 3 : 5)) { i = i + 1; }
+        return i;
+    `, 5))
+
+    test("a trap arm", () => assertRaisedTrap("u32 a = 5; return a > 1 ? trap(3) : 9;", 3))
+})
+
 describe("raise: trap", () =>
 {
     test("unconditional trap", () => assertRaisedTrap("trap(7);", 7))

@@ -3,13 +3,11 @@ Done:
 
 Open:
 - JIT
-  - add benchmark, code and stack size stats
   - move to separate root repo, publish on github (needs to move the current @ppl/machine as well)
   
 - @ppl/machine
   - move @ppl/machine to separate root repo publish on github
   - DSL improvements
-    - implement ternary
     - maybe allow extension a bit more freedom to on the dsl expression side, we could allow them to
       - have their own declaration like statements for pinning compile time constants 
       - object field access and/or array element access like syntax for them
@@ -21,7 +19,8 @@ Open:
     - DSL level upgrades (allowed by upgraded extension mechanism)
     - crypto extension on the remaining reserved opcodes (covers all sorts of well known, standardized coding schemes, crcs, hashes, encryption, aead, better not attempted in DSL and would be golden code under any normal circumstances anyway)
   - target codegen
-    - js codegen total stream and object accessor isolation -> becomes slim core + bunch of compatible rules 
+    - try to apply a core vs codec extension split, should be pretty easy i think, if done right core codegen could move into the root machine repo
+    - js codegen total runtime stream and object accessor isolation -> it becomes slim core that basically always uses a runtime dep + bunch of rules that depend on the details of that runtime mainly.
     - c++ codegen the same way as the js works: the core should be almost identical to js + another bunch of specific rules
   - example project
     - develop a narrative as if it was a case study, to show how protocol evolution is handled, keep different version to check interoperability.

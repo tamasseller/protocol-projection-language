@@ -484,6 +484,7 @@ which sees the whole body and can omit the `PUSH`. Cost: `walk`'s
 | `if-else` | 2 | then = `case[0]`, else = `case[1]`; default unreachable |
 | `if` (no else) | 1 | body = `case[0]`, reached when `acc = 0` (complementary comparison, §7.3); default = skip |
 | `switch` | variant count | each variant a case; default is the natural home for an out-of-range `trap()` |
+| ternary | 2 | consequent = `case[0]`, alternate = `case[1]`, arm order as `if-else`; each arm ends by storing the slot §8.7 reserves ahead of the dispatch |
 
 "Default unreachable" for `if-else` is a statement about what this lowerer
 emits, not a guarantee validation checks or an implementation may assume:

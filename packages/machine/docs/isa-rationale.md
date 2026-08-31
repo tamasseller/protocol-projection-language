@@ -70,19 +70,23 @@ it turns the spec into "whatever range analysis this validator happens to
 implement", so a second conforming implementation could not be written from
 the spec at all.
 
-The consequence for a future value-producing branch (a ternary — parsed
-today but not yet lowered) is that its result travels in a TOS slot, not in
-acc (isa-core.md §8.7). The alternative would be a *declared* exhaustive
+The consequence for the one value-producing branch the DSL has — the
+ternary — is that its result travels in a TOS slot, not in acc (isa-core.md
+§8.7): `lower.ts` lifts each one out of the expression it sat in and emits
+it ahead of that expression as a `BR_TABLE 2` writing a slot reserved
+before the dispatch. The alternative would be a *declared* exhaustive
 dispatch — an opcode carrying "this dispatch is total, `acc ≥ N` traps" —
 so that the property is read off the instruction instead of inferred. (The
 out-of-range `trap()` §7.1 mentions already has a home without it: close
 every case with a terminator and the code after the construct *is* the
-default's, as docs/codec-extension.md §8.7's variant decoder does.) That is
-a legitimate §5.3 candidate, but a
-costly one: `BR_TABLE` already spends three of the five local-flow codes, an
-exhaustive flavour needs two more of the four reserved, and §5.3's own
-standard is one narrowly-scoped *measured* addition. A ternary that is
-parsed but not lowered is not a measurement, so the codes stay unspent.
+default's, as docs/codec-extension.md §8.7's variant decoder does.) That was
+a legitimate §5.3 candidate while §5.3 still had codes to spend:
+`BR_TABLE` already takes three of the five local-flow codes, an exhaustive
+flavour needs two more, and the reserved pocket no longer has them to give
+(it went to the extend ops, below). What it would buy is small either way —
+the slot discipline costs one `PUSH` for the whole construct and one
+`STORE` per arm — and the price is now a revision of the encoding rather
+than a spare code.
 
 **Bare block statements are excluded from the DSL.** A `{ ... }` is only
 reachable as the direct body of `if`/`else`/`while`/`for`. `BLOCK_END` is
