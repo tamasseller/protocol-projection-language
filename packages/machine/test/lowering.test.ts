@@ -477,3 +477,26 @@ describe("Root output demand (tileExpr with demand parameter)", () =>
         assert.deepStrictEqual(node.fragment.map(format), ["LOAD x", "CALL foo"])
     })
 })
+
+describe("a unary-shaped rule's tos variant does not lose a sibling's acc", () =>
+{
+    // The `:tos` variants (rules.ts's `unaryTosNode`) compute in acc and
+    // then push, so acc is a *clobber* there rather than the output. A node
+    // that failed to say so would let the orchestrator order it after a
+    // sibling whose value sits in acc — emitting the two fragments in an
+    // order where the second destroys the first. Found by @ppl/codecs'
+    // delta-leb128 zigzag, which is exactly this shape.
+    test("the acc-valued operand is emitted second", () =>
+    {
+        const node = lowerExpr(exprOf("return (x << 1) ^ -(y != 0);"), DEFAULT_RULESET, "acc")
+        assert.ok(node)
+
+        const ops = node.fragment.map(format)
+        const push = ops.indexOf("PUSH")
+        const shl = ops.findIndex(o => o.startsWith("SHL"))
+
+        assert.ok(push >= 0 && shl >= 0, ops.join(" | "))
+        assert.ok(shl > push,
+            `the shifted operand must be computed after the pushed one, got ${ops.join(" | ")}`)
+    })
+})

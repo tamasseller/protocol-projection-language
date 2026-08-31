@@ -25,7 +25,7 @@
  */
 
 import type { RtlProc, RtlProgram, RtlInstr, ExtOpPayload } from "./rtl"
-import { isExtInstr, isStackComboInstr, isRegComboInstr, isImmComboInstr, SHIFT_OPS } from "./rtl"
+import { isExtInstr, isStackComboInstr, isRegComboInstr, isImmComboInstr, SHIFT_OPS, UNARY_ALU_OPS } from "./rtl"
 import type { Extension, ExtOpEffect } from "./extension"
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -340,12 +340,12 @@ function walkProcedure<E extends { ext: string } = ExtOpPayload>(
             if(instr.op === "STORE") requireAcc("STORE")
             else if(isRegComboInstr(instr)) requireAcc(`${instr.op} ${instr.combo} ${instr.target}`)
             else if(isImmComboInstr(instr)) requireAcc(`${instr.op} #${instr.imm}`)
-            else if(instr.op === "NEG" || instr.op === "NOT" || instr.op === "CLZ" || instr.op === "REVBITS") requireAcc(instr.op)
+            else if(UNARY_ALU_OPS.has(instr.op)) requireAcc(instr.op)
 
             if(instr.op === "LOAD" || instr.op === "CONST") accLive = true
             else if(isRegComboInstr(instr)) accLive = instr.combo === "REG_ACC" // REG_REG clobbers (write-back-in-place)
             else if(isImmComboInstr(instr)) accLive = true
-            else if(instr.op === "NEG" || instr.op === "NOT" || instr.op === "CLZ" || instr.op === "REVBITS") accLive = true
+            else if(UNARY_ALU_OPS.has(instr.op)) accLive = true
             // STORE: acc keeps whatever it already held.
 
             pc++

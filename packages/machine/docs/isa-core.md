@@ -230,8 +230,18 @@ Operate on `acc` in place, no addressing-mode bits:
 | `NOT` | bitwise complement |
 | `CLZ` | count leading zeros (0-32) |
 | `REVBITS` | reverse bit order (32-bit width) |
+| `SXTB` / `SXTH` | sign-extend the low 8 / 16 bits to 32 |
+| `UXTB` / `UXTH` | zero-extend the low 8 / 16 bits to 32 |
 
 `CTZ` has no dedicated op: `CTZ(x) = CLZ(REVBITS(x))`.
+
+The four extend ops exist for the narrow integer types (§2.1's word is the
+only *storage* type; a narrow type is a word constrained to a range). A
+narrow variable always holds an already-extended word, so the extend happens
+where a value is written into one, never where one is read. Each also
+subsumes a two-instruction composite — `SHL #24; ASR #24`, or `AND #0xff` —
+at a quarter of the bytes, which is why they are ops rather than an
+idiom.
 
 ### 4.4 Move-class
 
@@ -251,9 +261,6 @@ combo (§4.1 #1/#2) and needs no `LOAD` first.
 `PUSH` is how a call's non-last arguments (§4.6, §6) and expression
 temporaries reach the stack; §4.1 has no push-mode combo of its own.
 `CONST` is the only way to get an arbitrary constant into `acc`.
-
-Four codes in this class's range (§5.2) are reserved rather than assigned
-to `CONST #16..#19` (§5.3).
 
 ### 4.5 Control-flow ops
 
@@ -341,11 +348,10 @@ table.
 |---|---|---|
 | `0-49` | Arithmetic (§4.1) | `op = code / 5`, `mode = code % 5` |
 | `50-89` | Comparison (§4.2) | `op = (code−50) / 4`, `mode = (code−50) % 4` |
-| `90-93` | Unary (§4.3) | `code − 90` selects `NEG, NOT, CLZ, REVBITS` |
-| `94-98` | Local flow control | `code − 94` selects `BLOCK_END, LOOP, BR_TABLE#1, BR_TABLE#2, BR_TABLE-ext` |
-| `99-102` | Global flow control | `code − 99` selects `CALL, RETURN, TRAP#0, TRAP-ext` |
-| `103-123` | Move/const (§4.4) | `code − 103` selects `PUSH, POP, LOAD, STORE, CONST-ext, CONST#0..CONST#15` |
-| `124-127` | Reserved | unassigned (§5.3) |
+| `90-97` | Unary (§4.3) | `code − 90` selects `NEG, NOT, CLZ, REVBITS, SXTB, SXTH, UXTB, UXTH` |
+| `98-102` | Local flow control | `code − 98` selects `BLOCK_END, LOOP, BR_TABLE#1, BR_TABLE#2, BR_TABLE-ext` |
+| `103-106` | Global flow control | `code − 103` selects `CALL, RETURN, TRAP#0, TRAP-ext` |
+| `107-127` | Move/const (§4.4) | `code − 107` selects `PUSH, POP, LOAD, STORE, CONST-ext, CONST#0..CONST#15` |
 
 Op ordering within the two flat-indexed classes: arithmetic is `ADD, SUB,
 RSUB, MUL, AND, OR, XOR, SHL, SHR, ASR` (0-9); comparison is `EQ, NE,
@@ -353,25 +359,28 @@ LT_S, LE_S, GT_S, GE_S, LT_U, LE_U, GT_U, GE_U` (0-9). Mode ordering:
 arithmetic `REG_ACC, REG_REG, PEEK_PEEK, POP_ACC, IMM_EXT` (0-4);
 comparison `REG_ACC, POP_ACC, IMM_SMALL, IMM_EXT` (0-3).
 
-This uses 124 of 128 core codes; see §5.3. The Appendix expands the
-formulas into one row per byte value.
+This uses all 128 core codes; see §5.3. The Appendix expands the formulas
+into one row per byte value.
 
 The formulas above describe the numbering, not a required algorithm — §5.1's
 static table is equally normative, and on a target without a hardware
 divider it is the only sane choice: `jit-armv6m` decodes through a
-108-entry table precisely because `code / 5` and `code % 5` otherwise
+112-entry table precisely because `code / 5` and `code % 5` otherwise
 compile to two libgcc `__udivsi3` calls per instruction decoded. A decoder
 is free to pick either; `jit-armv6m/test/host/test_decode_encode.cpp`
 checks its table against these formulas for every assigned opcode.
 
-### 5.3 Reserved codes
+### 5.3 No reserved codes
 
-Codes `124-127` are unassigned, the only headroom in this layout:
-everywhere else a class is exactly its op × mode count. They exist so one
-narrowly-scoped, *measured* addition (a constant-synthesis op for
-low-entropy value shapes such as power-of-two masks, say) can land without
-renumbering. Anything larger than four codes' worth is a new revision of
-this spec, not an extension of this pocket.
+Every one of the 128 core codes is assigned. The four that §5.2 once held
+back went to §4.3's extend ops when the narrow integer types arrived; the
+unary class grew from four codes to eight and every class after it moved
+down, which is why a decoder built against an earlier draft of this section
+disagrees on everything from byte 94 up rather than only on the four.
+
+There is therefore no headroom: a further core op is a new revision of this
+spec, and renumbers the space again. The extension range (§5.1) is where
+new opcodes go instead.
 
 ### 5.4 Trailing operands
 
@@ -908,40 +917,40 @@ Every trailing operand, where present, is unsigned LEB128 (§5.4).
 | `91` | `NOT` | none |
 | `92` | `CLZ` | none |
 | `93` | `REVBITS` | none |
-| `94` | `BLOCK_END` | none |
-| `95` | `LOOP` | none |
-| `96` | `BR_TABLE (1 case)` | none |
-| `97` | `BR_TABLE (2 cases)` | none |
-| `98` | `BR_TABLE-ext` | case count |
-| `99` | `CALL` | procedure index |
-| `100` | `RETURN` | none |
-| `101` | `TRAP (#0)` | none |
-| `102` | `TRAP-ext` | code |
-| `103` | `PUSH` | none |
-| `104` | `POP` | none |
-| `105` | `LOAD` | register index |
-| `106` | `STORE` | register index |
-| `107` | `CONST-ext` | value |
-| `108` | `CONST #0` | none |
-| `109` | `CONST #1` | none |
-| `110` | `CONST #2` | none |
-| `111` | `CONST #3` | none |
-| `112` | `CONST #4` | none |
-| `113` | `CONST #5` | none |
-| `114` | `CONST #6` | none |
-| `115` | `CONST #7` | none |
-| `116` | `CONST #8` | none |
-| `117` | `CONST #9` | none |
-| `118` | `CONST #10` | none |
-| `119` | `CONST #11` | none |
-| `120` | `CONST #12` | none |
-| `121` | `CONST #13` | none |
-| `122` | `CONST #14` | none |
-| `123` | `CONST #15` | none |
-| `124` | `reserved` | none |
-| `125` | `reserved` | none |
-| `126` | `reserved` | none |
-| `127` | `reserved` | none |
+| `94` | `SXTB` | none |
+| `95` | `SXTH` | none |
+| `96` | `UXTB` | none |
+| `97` | `UXTH` | none |
+| `98` | `BLOCK_END` | none |
+| `99` | `LOOP` | none |
+| `100` | `BR_TABLE #1` | none |
+| `101` | `BR_TABLE #2` | none |
+| `102` | `BR_TABLE ext` | case count |
+| `103` | `CALL` | procedure index |
+| `104` | `RETURN` | none |
+| `105` | `TRAP #0` | none |
+| `106` | `TRAP ext` | trap code |
+| `107` | `PUSH` | none |
+| `108` | `POP` | none |
+| `109` | `LOAD` | register index |
+| `110` | `STORE` | register index |
+| `111` | `CONST ext` | immediate value |
+| `112` | `CONST #0` | none |
+| `113` | `CONST #1` | none |
+| `114` | `CONST #2` | none |
+| `115` | `CONST #3` | none |
+| `116` | `CONST #4` | none |
+| `117` | `CONST #5` | none |
+| `118` | `CONST #6` | none |
+| `119` | `CONST #7` | none |
+| `120` | `CONST #8` | none |
+| `121` | `CONST #9` | none |
+| `122` | `CONST #10` | none |
+| `123` | `CONST #11` | none |
+| `124` | `CONST #12` | none |
+| `125` | `CONST #13` | none |
+| `126` | `CONST #14` | none |
+| `127` | `CONST #15` | none |
 
 ---
 

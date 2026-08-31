@@ -354,6 +354,7 @@ class Raiser<E extends { ext: string } = ExtOpPayload>
                     continue
 
                 case "NEG": case "NOT": case "CLZ": case "REVBITS":
+                case "SXTB": case "SXTH": case "UXTB": case "UXTH":
                 {
                     const prev = this.acc
                     if(!prev) throw new Error(`raise: ${i.op} with no acc value at pc ${this.pc}`)

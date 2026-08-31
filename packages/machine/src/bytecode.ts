@@ -91,7 +91,8 @@ const ARITH_OPS: readonly BinaryOpcode[] =
 const CMP_OPS: readonly BinaryOpcode[] =
     ["EQ", "NE", "LT_S", "LE_S", "GT_S", "GE_S", "LT_U", "LE_U", "GT_U", "GE_U"]
 
-const UNARY_OPS: readonly UnaryOpcode[] = ["NEG", "NOT", "CLZ", "REVBITS"]
+const UNARY_OPS: readonly UnaryOpcode[] =
+    ["NEG", "NOT", "CLZ", "REVBITS", "SXTB", "SXTH", "UXTB", "UXTH"]
 
 // ── Encode ───────────────────────────────────────────────────────────────
 
@@ -144,25 +145,25 @@ export function encodeInstr<E extends { ext: string } = ExtOpPayload>(instr: Rtl
 
     switch (instr.op)
     {
-        case "BLOCK_END": return [94]
-        case "LOOP": return [95]
+        case "BLOCK_END": return [98]
+        case "LOOP": return [99]
         case "BR_TABLE":
-            if (instr.imm === 1) return [96]
-            if (instr.imm === 2) return [97]
-            return [98, ...encodeLeb128(instr.imm)]
+            if (instr.imm === 1) return [100]
+            if (instr.imm === 2) return [101]
+            return [102, ...encodeLeb128(instr.imm)]
         case "CALL":
-            return [99, ...encodeLeb128(instr.calleeIndex)]
-        case "RETURN": return [100]
+            return [103, ...encodeLeb128(instr.calleeIndex)]
+        case "RETURN": return [104]
         case "TRAP":
-            return instr.imm === 0 ? [101] : [102, ...encodeLeb128(instr.imm)]
-        case "PUSH": return [103]
-        case "POP": return [104]
-        case "LOAD": return [105, ...encodeLeb128(instr.target)]
-        case "STORE": return [106, ...encodeLeb128(instr.target)]
+            return instr.imm === 0 ? [105] : [106, ...encodeLeb128(instr.imm)]
+        case "PUSH": return [107]
+        case "POP": return [108]
+        case "LOAD": return [109, ...encodeLeb128(instr.target)]
+        case "STORE": return [110, ...encodeLeb128(instr.target)]
         case "CONST":
             return instr.imm >= 0 && instr.imm <= 15
-                ? [108 + instr.imm]
-                : [107, ...encodeLeb128(instr.imm)]
+                ? [112 + instr.imm]
+                : [111, ...encodeLeb128(instr.imm)]
     }
 
     throw new Error(`encodeInstr: unhandled instruction ${JSON.stringify(instr)}`)
@@ -217,29 +218,27 @@ export function decodeInstr<E extends { ext: string } = ExtOpPayload>(bytes: Uin
         return { instr: { op, combo: "IMM_ACC", imm: r.value }, next: r.next }
     }
 
-    if (code <= 93) return { instr: { op: UNARY_OPS[code - 90]! }, next: pos }
+    if (code <= 97) return { instr: { op: UNARY_OPS[code - 90]! }, next: pos }
 
     switch (code)
     {
-        case 94: return { instr: { op: "BLOCK_END" }, next: pos }
-        case 95: return { instr: { op: "LOOP" }, next: pos }
-        case 96: return { instr: { op: "BR_TABLE", imm: 1 }, next: pos }
-        case 97: return { instr: { op: "BR_TABLE", imm: 2 }, next: pos }
-        case 98: { const r = decodeLeb128(bytes, pos); return { instr: { op: "BR_TABLE", imm: r.value }, next: r.next } }
-        case 99: { const r = decodeLeb128(bytes, pos); return { instr: { op: "CALL", calleeIndex: r.value }, next: r.next } }
-        case 100: return { instr: { op: "RETURN" }, next: pos }
-        case 101: return { instr: { op: "TRAP", imm: 0 }, next: pos }
-        case 102: { const r = decodeLeb128(bytes, pos); return { instr: { op: "TRAP", imm: r.value }, next: r.next } }
-        case 103: return { instr: { op: "PUSH" }, next: pos }
-        case 104: return { instr: { op: "POP" }, next: pos }
-        case 105: { const r = decodeLeb128(bytes, pos); return { instr: { op: "LOAD", target: r.value }, next: r.next } }
-        case 106: { const r = decodeLeb128(bytes, pos); return { instr: { op: "STORE", target: r.value }, next: r.next } }
-        case 107: { const r = decodeLeb128(bytes, pos); return { instr: { op: "CONST", imm: r.value }, next: r.next } }
+        case 98: return { instr: { op: "BLOCK_END" }, next: pos }
+        case 99: return { instr: { op: "LOOP" }, next: pos }
+        case 100: return { instr: { op: "BR_TABLE", imm: 1 }, next: pos }
+        case 101: return { instr: { op: "BR_TABLE", imm: 2 }, next: pos }
+        case 102: { const r = decodeLeb128(bytes, pos); return { instr: { op: "BR_TABLE", imm: r.value }, next: r.next } }
+        case 103: { const r = decodeLeb128(bytes, pos); return { instr: { op: "CALL", calleeIndex: r.value }, next: r.next } }
+        case 104: return { instr: { op: "RETURN" }, next: pos }
+        case 105: return { instr: { op: "TRAP", imm: 0 }, next: pos }
+        case 106: { const r = decodeLeb128(bytes, pos); return { instr: { op: "TRAP", imm: r.value }, next: r.next } }
+        case 107: return { instr: { op: "PUSH" }, next: pos }
+        case 108: return { instr: { op: "POP" }, next: pos }
+        case 109: { const r = decodeLeb128(bytes, pos); return { instr: { op: "LOAD", target: r.value }, next: r.next } }
+        case 110: { const r = decodeLeb128(bytes, pos); return { instr: { op: "STORE", target: r.value }, next: r.next } }
+        case 111: { const r = decodeLeb128(bytes, pos); return { instr: { op: "CONST", imm: r.value }, next: r.next } }
     }
 
-    if (code <= 123) return { instr: { op: "CONST", imm: code - 108 }, next: pos }
-
-    throw new Error(`decodeInstr: byte ${code} at offset ${offset} is reserved and unassigned (isa-core.md §5.3)`)
+    return { instr: { op: "CONST", imm: code - 112 }, next: pos } // 112-127, §5.2's last range
 }
 
 /** Decode a full instruction stream from exactly `bytes` — no header, no

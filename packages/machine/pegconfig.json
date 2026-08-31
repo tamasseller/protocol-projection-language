@@ -21,6 +21,8 @@
         "CallExpression": "import(\"./ast.js\").CallExpression",
         "Literal": "import(\"./ast.js\").Literal",
         "Identifier": "import(\"./ast.js\").Identifier",
-        "LeftHandSideExpression": "import(\"./ast.js\").Identifier"
+        "LeftHandSideExpression": "import(\"./ast.js\").Identifier",
+        "CastExpression": "import(\"./ast.js\").CastExpression",
+        "TypeName": "import(\"./ast.js\").PrimType"
     }
 }

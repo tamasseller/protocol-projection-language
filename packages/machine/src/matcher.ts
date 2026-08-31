@@ -62,6 +62,10 @@ export interface BinaryPattern<
 {
     kind: "Binary"
     operator: BinaryOperator
+    /** For the five operators with signed and unsigned ISA opcodes both,
+     *  which of the two this rule is for. `false` also matches a node types.ts
+     *  never annotated, so an un-annotated tree keeps its old lowering. */
+    signed: boolean
     left: L
     right: R
 }
@@ -288,6 +292,7 @@ export function matchAllEast<P extends EastPattern, E extends { ext: string } = 
             {
                 if(!isEastBinary(N)) return []
                 if(N.operator !== P.operator) return []
+                if((N.signed ?? false) !== P.signed) return []
                 const leftMatches = matchAllEast(N.left, P.left, tile)
                 if(leftMatches.length === 0) return []
                 const rightMatches = matchAllEast(N.right, P.right, tile)
@@ -390,8 +395,9 @@ export const pBinary = <L extends EastPattern, R extends EastPattern>(
     operator: BinaryOperator,
     left: L,
     right: R,
+    signed = false,
 ): BinaryPattern<L, R> =>
-    ({kind: "Binary", operator, left, right})
+    ({kind: "Binary", operator, signed, left, right})
 
 export const pUnary = <A extends EastPattern>(
     operator: UnaryOperator,

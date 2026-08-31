@@ -14,7 +14,7 @@
 import { describe, test } from "node:test"
 import assert from "node:assert/strict"
 
-import { run, evalBinary, UnspecifiedShiftAmount } from "../src/vm"
+import { run, evalBinary, evalUnary, UnspecifiedShiftAmount } from "../src/vm"
 import { bare, brTable, CONST, PUSH, opStack, opRegWriteback } from "../src/rtl"
 import type { RtlProgram } from "../src/rtl"
 
@@ -132,5 +132,45 @@ describe("evalBinary — §4.1 unspecified shift amounts", () =>
             procedures: [{ argCount: 0, body: [CONST(40), PUSH(), CONST(1), opStack("SHL", "POP_ACC"), bare("RETURN")] }],
         }
         assert.throws(() => run(program), UnspecifiedShiftAmount)
+    })
+})
+
+describe("evalUnary — §4.3 extend ops", () =>
+{
+    // Every result is a u32: a narrow variable holds an already-extended
+    // word, which is what lets a read of one cost nothing (§4.3).
+    const cases: [string, number, number][] = [
+        ["SXTB", 0x7f, 0x7f],
+        ["SXTB", 0x80, 0xffffff80],
+        ["SXTB", 0xdeadbeef, 0xffffffef],
+        ["SXTH", 0x7fff, 0x7fff],
+        ["SXTH", 0x8000, 0xffff8000],
+        ["SXTH", 0xdeadbeef, 0xffffbeef],
+        ["UXTB", 0x80, 0x80],
+        ["UXTB", 0xdeadbeef, 0xef],
+        ["UXTH", 0x8000, 0x8000],
+        ["UXTH", 0xdeadbeef, 0xbeef],
+    ]
+
+    for(const [op, input, expected] of cases)
+    {
+        test(`${op}(0x${input.toString(16)}) === 0x${expected.toString(16)}`, () =>
+        {
+            assert.equal(evalUnary(input, op as "SXTB"), expected)
+        })
+    }
+
+    test("the signed pair round-trips a value the unsigned pair truncates", () =>
+    {
+        // -1 narrowed and widened again is -1; the same bits read unsigned
+        // are the type's maximum. Both are u32 words here.
+        assert.equal(evalUnary(0xffffffff, "SXTB"), 0xffffffff)
+        assert.equal(evalUnary(0xffffffff, "UXTB"), 0xff)
+    })
+
+    test("extending an already-narrow word is the identity", () =>
+    {
+        for(const op of ["SXTB", "SXTH", "UXTB", "UXTH"] as const)
+            assert.equal(evalUnary(evalUnary(0xdeadbeef, op), op), evalUnary(0xdeadbeef, op))
     })
 })

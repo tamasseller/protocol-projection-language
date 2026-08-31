@@ -102,7 +102,20 @@ export const COMPARISON_OPS: ReadonlySet<BinaryOpcode> = new Set([
 export const SHIFT_OPS: ReadonlySet<BinaryOpcode> = new Set(["SHL", "SHR", "ASR"])
 
 /** Unary ALU opcodes — operate on acc in place, no combo (§4.3). */
-export type UnaryOpcode = "NEG" | "NOT" | "CLZ" | "REVBITS"
+export type UnaryOpcode =
+    | "NEG" | "NOT" | "CLZ" | "REVBITS"
+    | "SXTB" | "SXTH" | "UXTB" | "UXTH"
+
+/** The four that reduce acc to a narrower type's representation. A narrow
+ *  variable always holds an already-narrowed word, which is what makes
+ *  reading one free — see isa-core.md §4.3. */
+export const EXTEND_OPS: ReadonlySet<UnaryOpcode> = new Set(["SXTB", "SXTH", "UXTB", "UXTH"])
+
+/** All of §4.3, for the consumers that only need "does this read and write
+ *  acc with no combo" — the validator's acc-liveness walk, mainly. */
+export const UNARY_ALU_OPS: ReadonlySet<string> = new Set<UnaryOpcode>([
+    "NEG", "NOT", "CLZ", "REVBITS", "SXTB", "SXTH", "UXTB", "UXTH",
+])
 
 /** No-operand control flow opcodes (§4.5). */
 export type ControlOpcode =

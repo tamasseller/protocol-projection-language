@@ -27,15 +27,19 @@ import type {ExtOpPayload} from "./rtl"
 import type {Procedure} from "./ir"
 import assert from "assert"
 import {Rule, ruleset} from "./rules"
+import {annotate, annotateInto} from "./types"
+import type {TypeEnv} from "./types"
+import type {PrimType} from "./ast"
 import type {Extension} from "./extension"
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Register allocator
 // ─────────────────────────────────────────────────────────────────────────────
 
-class RegAlloc<E extends { ext: string } = ExtOpPayload>
+class RegAlloc<E extends { ext: string } = ExtOpPayload> implements TypeEnv
 {
     private map = new Map<string, number>()
+    private types = new Map<string, PrimType>()
     private next: number
 
     /**
@@ -82,7 +86,7 @@ class RegAlloc<E extends { ext: string } = ExtOpPayload>
     }
 
     /** Allocate a named variable, returning its index. Idempotent. */
-    alloc(name: string): number
+    alloc(name: string, varType: PrimType = "u32"): number
     {
         let idx = this.map.get(name)
         if(idx === undefined)
@@ -90,7 +94,16 @@ class RegAlloc<E extends { ext: string } = ExtOpPayload>
             idx = this.next++
             this.map.set(name, idx)
         }
+        this.types.set(name, varType)
         return idx
+    }
+
+    /** The declared type of `name`, through enclosing scopes the way
+     *  `resolve` goes. Undefined for a procedure argument, which is a plain
+     *  word — types.ts supplies that default. */
+    typeOf(name: string): PrimType | undefined
+    {
+        return this.types.get(name) ?? this._parent?.typeOf(name)
     }
 
     /** Map a string register name to its allocated index. */
@@ -218,7 +231,7 @@ function lowerExprStmt<E extends { ext: string } = ExtOpPayload>(s: ExpressionSt
     // would be needlessly strict — it would exclude a cheaper tiling whose
     // result lands directly in a register write-back (e.g. `x = x op e`,
     // rules.ts). lowerStatementExpr allows any TOS-neutral output instead.
-    const e = lowerStatementExpr(s.expression as EastExpression<E>, alloc.rules())
+    const e = lowerStatementExpr(annotate(s.expression, alloc) as EastExpression<E>, alloc.rules())
     assert.ok(e, `Failed to lower expression statement`)
 
     return e.fragment
@@ -228,7 +241,8 @@ function lowerVarDecl<E extends { ext: string } = ExtOpPayload>(s: VariableDecla
 {
     return s.declarations.map(d =>
     {
-        const node = lowerExpr(d.init as EastExpression<E>, alloc.rules(), "tos")
+        const init = annotateInto(d.init!, alloc, d.varType)
+        const node = lowerExpr(init as EastExpression<E>, alloc.rules(), "tos")
         assert.ok(node, `Failed to lower variable initializer for ${d.id.name}`)
 
         // A "tos"-demand tiling's cheapest winner always nets exactly one
@@ -243,7 +257,7 @@ function lowerVarDecl<E extends { ext: string } = ExtOpPayload>(s: VariableDecla
         assert.equal(node.tosDelta, 1,
             `"tos"-demand initializer for ${d.id.name} nets tosDelta=${node.tosDelta}, expected exactly 1 — ` +
             `the winning tiling should always be a single net push; this indicates a lowerer bug, not a case to handle`)
-        alloc.alloc(d.id.name)
+        alloc.alloc(d.id.name, d.varType)
 
         return node.fragment
     }).flat()
@@ -253,7 +267,7 @@ function lowerReturn<E extends { ext: string } = ExtOpPayload>(s: ReturnStatemen
 {
     if(s.argument)
     {
-        const node = lowerExpr(s.argument as EastExpression<E>, alloc.rules(), "acc")
+        const node = lowerExpr(annotate(s.argument, alloc) as EastExpression<E>, alloc.rules(), "acc")
         assert.ok(node, `Failed to lower return expression`)
         return [...node.fragment, bare("RETURN")]
     }
@@ -366,7 +380,7 @@ function lowerIf<E extends { ext: string } = ExtOpPayload>(s: IfStatement, alloc
         // raw truthy test, so `acc` must be forced to exactly 0/1 first —
         // same normalization as the no-else path below, and the same reason.
         // Arm order then matches §7.1: case[0] = then, case[1] = else.
-        const test = lowerExpr(logicInvertRoot(s.test as EastExpression) as EastExpression<E>, alloc.rules(), "acc")
+        const test = lowerExpr(logicInvertRoot(annotate(s.test, alloc) as EastExpression) as EastExpression<E>, alloc.rules(), "acc")
         assert.ok(test, `Failed to lower if test expression`)
 
         const elseTerm = lowerControlBody(s.alternate, new RegAlloc<E>(alloc))
@@ -381,7 +395,7 @@ function lowerIf<E extends { ext: string } = ExtOpPayload>(s: IfStatement, alloc
     }
     else
     {
-        const test = lowerExpr(logicInvertRoot(s.test as EastExpression) as EastExpression<E>, alloc.rules(), "acc")
+        const test = lowerExpr(logicInvertRoot(annotate(s.test, alloc) as EastExpression) as EastExpression<E>, alloc.rules(), "acc")
         assert.ok(test, `Failed to lower if test expression`)
 
         return [
@@ -394,7 +408,7 @@ function lowerIf<E extends { ext: string } = ExtOpPayload>(s: IfStatement, alloc
 
 function lowerSwitch<E extends { ext: string } = ExtOpPayload>(s: SwitchStatement, alloc: RegAlloc<E>): RtlInstr<E>[]
 {
-    const disc = lowerExpr(s.discriminant as EastExpression<E>, alloc.rules(), "acc")
+    const disc = lowerExpr(annotate(s.discriminant, alloc) as EastExpression<E>, alloc.rules(), "acc")
     assert.ok(disc, `Failed to lower switch discriminant expression`)
 
     const cases = s.cases.filter(c => c.test !== null)
@@ -416,7 +430,7 @@ function lowerSwitch<E extends { ext: string } = ExtOpPayload>(s: SwitchStatemen
 
 function lowerWhile<E extends { ext: string } = ExtOpPayload>(s: WhileStatement, alloc: RegAlloc<E>): RtlInstr<E>[]
 {
-    const test = lowerExpr(s.test as EastExpression<E>, alloc.rules(), "acc")
+    const test = lowerExpr(annotate(s.test, alloc) as EastExpression<E>, alloc.rules(), "acc")
     assert.ok(test, `Failed to lower while test expression`)
 
     const bodyTerm = lowerControlBody(s.body, new RegAlloc<E>(alloc))
@@ -444,7 +458,7 @@ function lowerFor<E extends { ext: string } = ExtOpPayload>(s: ForStatement, all
     // relaxed "any TOS-neutral output") is required here, not optional.
     const test = s.test ? (() =>
     {
-        const node = lowerExpr(s.test as EastExpression<E>, alloc.rules(), "acc")
+        const node = lowerExpr(annotate(s.test, alloc) as EastExpression<E>, alloc.rules(), "acc")
         assert.ok(node, `Failed to lower for-loop test expression`)
         return node.fragment
     })() : []

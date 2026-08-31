@@ -41,6 +41,7 @@ import {CONST, PUSH, LOAD, STORE, opReg, opRegWriteback, opImm, opStack, bare, c
 import type {EastExpression, RtlNode} from "./east"
 import {nodeInvariants, pickBinaryOrder} from "./builders"
 import type {Extension} from "./extension"
+import {CAST_OPS} from "./types"
 
 // ── Rule type + constructor ─────────────────────────────────────────────────
 
@@ -92,7 +93,10 @@ type OpClass = "strict" | "commutative" | "paired"
  * REG_REG variant below: without it, a comparison would get an ISA-invalid
  * "write the boolean back into a register" instruction generated for it.
  */
-interface OpEntry {ast: BinaryOperator; isa: BinaryOpcode; class: OpClass; kind: "alu" | "cmp"; swap?: BinaryOpcode}
+/** `signed` picks which of a sign-sensitive operator's two ISA opcodes this
+ *  row is for; types.ts decides which one a given node gets (isa-core.md
+ *  §4.1/§4.2). The five sign-sensitive operators therefore appear twice. */
+interface OpEntry {ast: BinaryOperator; isa: BinaryOpcode; class: OpClass; kind: "alu" | "cmp"; swap?: BinaryOpcode; signed?: true}
 
 const OP_TABLE: readonly OpEntry[] = [
     {ast: "+", isa: "ADD", class: "commutative", kind: "alu"},
@@ -109,6 +113,11 @@ const OP_TABLE: readonly OpEntry[] = [
     {ast: "<=", isa: "LE_U", class: "strict", kind: "cmp"},
     {ast: ">", isa: "GT_U", class: "strict", kind: "cmp"},
     {ast: ">=", isa: "GE_U", class: "strict", kind: "cmp"},
+    {ast: ">>", isa: "ASR", class: "strict", kind: "alu", signed: true},
+    {ast: "<", isa: "LT_S", class: "strict", kind: "cmp", signed: true},
+    {ast: "<=", isa: "LE_S", class: "strict", kind: "cmp", signed: true},
+    {ast: ">", isa: "GT_S", class: "strict", kind: "cmp", signed: true},
+    {ast: ">=", isa: "GE_S", class: "strict", kind: "cmp", signed: true},
 ] as const
 
 const UNARY_OPS: readonly {ast: UnaryOperator; isa: UnaryOpcode}[] = [
@@ -134,6 +143,24 @@ export function leafNode<E extends { ext: string } = ExtOpPayload>(output: Outpu
 export function unaryNode<E extends { ext: string } = ExtOpPayload>(child: RtlNode<E>, output: OutputLocation[], fragment: RtlInstr<E>[]): RtlNode<E>
 {
     return {type: "RtlNode", output, fragment, clobbers: [...child.clobbers], tosDelta: child.tosDelta, maxStack: child.maxStack}
+}
+
+/** The same node with a trailing `PUSH`, so a unary-shaped rule can satisfy
+ *  a `"tos"` demand. Without one nothing in this class can initialize a
+ *  declaration (`u8 x = u8(e);`, `u32 x = clz(y);`) — a declaration's
+ *  initializer is lowered under exactly that demand (lower.ts). */
+export function unaryTosNode<E extends { ext: string } = ExtOpPayload>(child: RtlNode<E>, fragment: RtlInstr<E>[]): RtlNode<E>
+{
+    return {
+        type: "RtlNode", output: ["tos"], fragment: [...fragment, PUSH<E>()],
+        // `acc` is where the op computes, and here it is *not* the output —
+        // so unlike `unaryNode` it stays a clobber, which is what tells
+        // `destroys` (builders.ts) that a sibling's acc value does not
+        // survive this fragment.
+        clobbers: [...new Set<Resource>([...child.clobbers, "acc"])],
+        tosDelta: child.tosDelta + 1,
+        maxStack: Math.max(child.maxStack, child.tosDelta + 1),
+    }
 }
 
 // ── Leaf rules ──────────────────────────────────────────────────────────────
@@ -226,9 +253,22 @@ const literalOf = (value: number): Literal => ({type: "Literal", value, raw: Str
  *  ever called with an `op` that's actually a key of `OP_TABLE` (below),
  *  so the two operators `BinaryOperator` has but `OP_TABLE` doesn't
  *  ("/", "%") never reach here. */
-function foldBinaryOp(op: BinaryOperator, a: number, b: number): number
+function foldBinaryOp(op: BinaryOperator, a: number, b: number, signed: boolean): number
 {
     const L = a >>> 0, R = b >>> 0
+    if(signed)
+    {
+        // The five sign-sensitive operators, folded the way their signed
+        // opcode evaluates them — `|0` reads the same word as an i32.
+        switch(op)
+        {
+            case ">>": return ((L | 0) >> (R & 31)) >>> 0
+            case "<": return (L | 0) < (R | 0) ? 1 : 0
+            case "<=": return (L | 0) <= (R | 0) ? 1 : 0
+            case ">": return (L | 0) > (R | 0) ? 1 : 0
+            case ">=": return (L | 0) >= (R | 0) ? 1 : 0
+        }
+    }
     switch(op)
     {
         case "+": return (L + R) >>> 0
@@ -253,9 +293,9 @@ function foldRules(): Rule[]
 {
     return [
         rule("fold:unary:-", pUnary("-", pConst()), m => literalOf(-m.argumentMatch.value)),
-        ...OP_TABLE.map(({ast}) =>
-            rule(`fold:binary:${ast}`, pBinary(ast, pConst(), pConst()), m =>
-                literalOf(foldBinaryOp(ast, m.leftMatch.value, m.rightMatch.value)))),
+        ...OP_TABLE.map(({ast, isa, signed}) =>
+            rule(`fold:binary:${ast}->${isa}`, pBinary(ast, pConst(), pConst(), signed ?? false), m =>
+                literalOf(foldBinaryOp(ast, m.leftMatch.value, m.rightMatch.value, signed ?? false)))),
     ]
 }
 
@@ -267,6 +307,11 @@ function unaryRules(): Rule[]
         ...UNARY_OPS.map(({ast, isa}) =>
             rule(`unary:${ast}`, pUnary(ast, pRtl("acc")), m =>
                 unaryNode(m.argumentMatch.node, ["acc"],
+                    [...m.argumentMatch.node.fragment, bare(isa)]))),
+
+        ...UNARY_OPS.map(({ast, isa}) =>
+            rule(`unary:${ast}:tos`, pUnary(ast, pRtl("acc")), m =>
+                unaryTosNode(m.argumentMatch.node,
                     [...m.argumentMatch.node.fragment, bare(isa)]))),
 
         // Multi-level pattern: an involution (NEG or NOT) applied twice
@@ -301,6 +346,10 @@ function unaryRules(): Rule[]
 const BUILTIN_UNARY_CALLS: readonly {name: string; isa: UnaryOpcode}[] = [
     {name: "clz", isa: "CLZ"},
     {name: "revbits", isa: "REVBITS"},
+    // The narrowing casts (types.ts's `CAST_OPS`), which reach here as
+    // ordinary call nodes so they need no pattern kind of their own. A cast
+    // to `u32`/`i32` never appears: it is the identity and types.ts drops it.
+    ...CAST_OPS,
 ] as const
 
 /**
@@ -324,6 +373,11 @@ function builtinCallRules(): Rule[]
         ...BUILTIN_UNARY_CALLS.map(({name, isa}) =>
             rule(`builtin:${name}`, pBuiltinCall(name, pRtl("acc")), m =>
                 unaryNode(m.argumentMatches[0].node, ["acc"],
+                    [...m.argumentMatches[0].node.fragment, bare(isa)]))),
+
+        ...BUILTIN_UNARY_CALLS.map(({name, isa}) =>
+            rule(`builtin:${name}:tos`, pBuiltinCall(name, pRtl("acc")), m =>
+                unaryTosNode(m.argumentMatches[0].node,
                     [...m.argumentMatches[0].node.fragment, bare(isa)]))),
 
         rule("builtin:trap", pBuiltinCall("trap", pConst()), m =>
@@ -350,11 +404,11 @@ function builtinCallRules(): Rule[]
  *   gating on `writeback` here keeps an ISA-invalid instruction from ever
  *   being constructed for e.g. `x = y < 10`.
  */
-function regOperandRules(astOp: BinaryOperator, isaOp: BinaryOpcode, flipped: boolean, writeback: boolean, resolveLocal: (name: string) => number): Rule[]
+function regOperandRules(astOp: BinaryOperator, isaOp: BinaryOpcode, flipped: boolean, writeback: boolean, resolveLocal: (name: string) => number, signed = false): Rule[]
 {
     const pattern = flipped
-        ? pBinary(astOp, pIdentifier(), pRtl("acc"))
-        : pBinary(astOp, pRtl("acc"), pIdentifier())
+        ? pBinary(astOp, pIdentifier(), pRtl("acc"), signed)
+        : pBinary(astOp, pRtl("acc"), pIdentifier(), signed)
     const flipSuffix = flipped ? ":flip" : ""
 
     const accChild = (m: any) => (flipped ? m.rightMatch : m.leftMatch) as {node: RtlNode}
@@ -394,11 +448,11 @@ function regOperandRules(astOp: BinaryOperator, isaOp: BinaryOpcode, flipped: bo
  * via commutativity as `1 + x` (an already-tiled acc value combined with a
  * *register* operand), which is regOperandRules' REG_REG variant, above.
  */
-function immOperandRules(astOp: BinaryOperator, isaOp: BinaryOpcode, flipped: boolean): Rule[]
+function immOperandRules(astOp: BinaryOperator, isaOp: BinaryOpcode, flipped: boolean, signed = false): Rule[]
 {
     const pattern = flipped
-        ? pBinary(astOp, pConst(), pRtl("acc"))
-        : pBinary(astOp, pRtl("acc"), pConst())
+        ? pBinary(astOp, pConst(), pRtl("acc"), signed)
+        : pBinary(astOp, pRtl("acc"), pConst(), signed)
 
     const variants: {loc: OutputLocation; extra: RtlInstr[]; extraTos: number; extraMax: number}[] = [
         {loc: "acc", extra: [], extraTos: 0, extraMax: 0},
@@ -437,11 +491,11 @@ function immOperandRules(astOp: BinaryOperator, isaOp: BinaryOpcode, flipped: bo
  * itself has no such restriction — mode 2 (pop → acc) is valid for both
  * classes — so only `PEEK_PEEK` is gated here.
  */
-function stackOperandRules(astOp: BinaryOperator, isaOp: BinaryOpcode, flipped: boolean, hasPeek: boolean): Rule[]
+function stackOperandRules(astOp: BinaryOperator, isaOp: BinaryOpcode, flipped: boolean, hasPeek: boolean, signed = false): Rule[]
 {
     const pattern = flipped
-        ? pBinary(astOp, pRtl("tos"), pRtl("acc"))
-        : pBinary(astOp, pRtl("acc"), pRtl("tos"))
+        ? pBinary(astOp, pRtl("tos"), pRtl("acc"), signed)
+        : pBinary(astOp, pRtl("acc"), pRtl("tos"), signed)
     // Every variant is built from the same POP_ACC-addressed instruction;
     // only the name/output/trailing-PUSH differ. `hasPeek` swaps the
     // single-instruction PEEK_PEEK route for a two-instruction POP_ACC+PUSH
@@ -480,23 +534,24 @@ function binaryRulesForOp(entry: OpEntry, resolveLocal: (name: string) => number
     // addressing table (§4.1) has either.
     const writeback = entry.kind === "alu"
     const hasPeek = entry.kind === "alu"
+    const signed = entry.signed ?? false
     const rules: Rule[] = []
     // Direct orientation: L→acc, R→operand
-    rules.push(...regOperandRules(entry.ast, entry.isa, false, writeback, resolveLocal))
-    rules.push(...immOperandRules(entry.ast, entry.isa, false))
-    rules.push(...stackOperandRules(entry.ast, entry.isa, false, hasPeek))
+    rules.push(...regOperandRules(entry.ast, entry.isa, false, writeback, resolveLocal, signed))
+    rules.push(...immOperandRules(entry.ast, entry.isa, false, signed))
+    rules.push(...stackOperandRules(entry.ast, entry.isa, false, hasPeek, signed))
     // Flipped orientation
     if(entry.class === "commutative")
     {
-        rules.push(...regOperandRules(entry.ast, entry.isa, true, writeback, resolveLocal))
-        rules.push(...immOperandRules(entry.ast, entry.isa, true))
-        rules.push(...stackOperandRules(entry.ast, entry.isa, true, hasPeek))
+        rules.push(...regOperandRules(entry.ast, entry.isa, true, writeback, resolveLocal, signed))
+        rules.push(...immOperandRules(entry.ast, entry.isa, true, signed))
+        rules.push(...stackOperandRules(entry.ast, entry.isa, true, hasPeek, signed))
     }
     else if(entry.class === "paired" && entry.swap)
     {
-        rules.push(...regOperandRules(entry.ast, entry.swap, true, writeback, resolveLocal))
-        rules.push(...immOperandRules(entry.ast, entry.swap, true))
-        rules.push(...stackOperandRules(entry.ast, entry.swap, true, hasPeek))
+        rules.push(...regOperandRules(entry.ast, entry.swap, true, writeback, resolveLocal, signed))
+        rules.push(...immOperandRules(entry.ast, entry.swap, true, signed))
+        rules.push(...stackOperandRules(entry.ast, entry.swap, true, hasPeek, signed))
     }
     return rules
 }

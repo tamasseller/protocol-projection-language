@@ -91,11 +91,18 @@ SwitchCase
     }
 
 DeclarationStatement
-  = "u32" _ id:Identifier _ init:("=" _ expr:Expression { return expr; })? _ ";" { 
+  = varType:TypeName _ id:Identifier _ init:("=" _ expr:Expression { return expr; })? _ ";" { 
       return { 
         type: "VariableDeclaration", 
-        declarations: [{ type: "VariableDeclarator", id, init: init !== null ? init : null }]
+        declarations: [{ type: "VariableDeclarator", varType, id, init: init !== null ? init : null }]
       }; 
+    }
+
+// The six primitive types. Order matters only in that no name is a prefix
+// of another, so a plain ordered choice is unambiguous.
+TypeName "type name"
+  = name:("u32" / "u16" / "u8" / "i32" / "i16" / "i8") !([a-zA-Z0-9_]) {
+      return name;
     }
 
 ReturnStatement
@@ -199,9 +206,18 @@ LeftHandSideExpression
 
 PrimaryExpression
   = Literal
+  / CastExpression
   / CallExpression
   / Identifier
   / "(" _ expr:Expression _ ")" { return expr; }
+
+// Function-call syntax rather than C's `(i16)x`: a leading parenthesis is
+// already a parenthesized expression here, and telling the two apart needs
+// unbounded lookahead. `i16(x)` needs none, and reads better.
+CastExpression
+  = varType:TypeName _ "(" _ argument:Expression _ ")" {
+      return { type: "CastExpression", varType, argument };
+    }
 
 CallExpression
   = callee:Identifier _ "(" _ args:ArgumentList? _ ")" { 
@@ -238,7 +254,8 @@ Identifier
 
 ReservedWord
   = ( "if" / "else" / "while" / "for" / "switch" / "case" / "default"
-    / "break" / "continue" / "return" / "u32"
+    / "break" / "continue" / "return"
+    / "u32" / "u16" / "u8" / "i32" / "i16" / "i8"
     ) !([a-zA-Z0-9_])
 
 // ---------------------------------------------------------------------

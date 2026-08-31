@@ -139,6 +139,10 @@ export function evalUnary(V: number, op: RtlInstr["op"]): number
         case "NEG": return (-V) >>> 0
         case "NOT": return (~V) >>> 0
         case "CLZ": return Math.clz32(V)
+        case "SXTB": return ((V << 24) >> 24) >>> 0
+        case "SXTH": return ((V << 16) >> 16) >>> 0
+        case "UXTB": return V & 0xff
+        case "UXTH": return V & 0xffff
         case "REVBITS":
         {
             let x = V
@@ -347,6 +351,7 @@ function runProc<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E
                 break
 
             case "NEG": case "NOT": case "CLZ": case "REVBITS":
+            case "SXTB": case "SXTH": case "UXTB": case "UXTH":
                 requireAccLive(i.op)
                 acc = evalUnary(acc, i.op)
                 pc++

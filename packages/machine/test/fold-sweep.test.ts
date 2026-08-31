@@ -56,6 +56,33 @@ describe("Constant folding — binary operators (rules.ts's \"fold:binary:*\")",
     }
 })
 
+/* Both operands above are small, so both are `i32` and every fold picks the
+ * *signed* rule (types.ts). A literal that does not fit `i32` is `u32`, and
+ * one of those on either side is what makes the operation unsigned — which
+ * is the only way to reach `fold:binary:*->{SHR,LT_U,LE_U,GT_U,GE_U}`. Each
+ * pair below disagrees between the two, so a probe landing on the wrong
+ * rule is a wrong value, not a silently equal one. */
+describe("Constant folding — the unsigned half of a sign-sensitive operator", () =>
+{
+    const CASES: readonly {expr: string; unsigned: number; signedWouldBe: number}[] = [
+        {expr: "0xffffffff >> 28", unsigned: 15, signedWouldBe: 0xffffffff},
+        {expr: "0xffffffff < 5", unsigned: 0, signedWouldBe: 1},
+        {expr: "0xffffffff <= 5", unsigned: 0, signedWouldBe: 1},
+        {expr: "0xffffffff > 5", unsigned: 1, signedWouldBe: 0},
+        {expr: "0xffffffff >= 5", unsigned: 1, signedWouldBe: 0},
+    ] as const
+
+    for(const {expr, unsigned, signedWouldBe} of CASES)
+    {
+        test(`${expr} === ${unsigned} (signed would be ${signedWouldBe})`, () =>
+        {
+            assert.notEqual(unsigned, signedWouldBe) // the probe discriminates
+            assert.equal(trapCodeOf(`trap(${expr});`), unsigned)
+        })
+    }
+})
+
+
 describe("Constant folding — unary operator (rules.ts's \"fold:unary:-\")", () =>
 {
     test("negation, as a compile-time constant", () =>
