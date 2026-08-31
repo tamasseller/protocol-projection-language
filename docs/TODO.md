@@ -10,9 +10,6 @@ Open:
   - move @ppl/machine to separate root repo publish on github
   - DSL improvements
     - implement ternary
-    - introduce signed types to expose ASR and signed compare isns
-    - it may worth considering introducing all the basic primitive type sizes as well (byte/halfword)
-      - does this also warrant assigning the four leftover reserved opcodes to signed/unsigned extend byte/halfword?
     - maybe allow extension a bit more freedom to on the dsl expression side, we could allow them to
       - have their own declaration like statements
       - object field access or array element access like syntax for them
