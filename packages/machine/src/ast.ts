@@ -228,3 +228,37 @@ export interface Identifier
     type: "Identifier"
     name: string
 }
+
+export function recurseOver<T, U>(e: Expression, map: (e: Expression) => T, reduce: (...v: T[]) => U, def: U): U
+{
+    switch(e.type)
+    {
+        case "CastExpression": return reduce(map(e.argument))
+        case "AssignmentExpression": return reduce(map(e.right))
+        case "ConditionalExpression": return reduce(map(e.test), map(e.consequent), map(e.alternate))
+        case "LogicalExpression": return reduce(map(e.left), map(e.right))
+        case "BinaryExpression": return reduce(map(e.left), map(e.right))
+        case "UnaryExpression": return reduce(map(e.argument))
+        case "UpdateExpression": return reduce(map(e.argument))
+        case "CallExpression": return reduce(...e.arguments.map(map))
+        default: return def
+    }
+}
+
+/** `recurseOver`'s rewriting half: rebuild `e` with each child replaced by
+ *  `map`'s result, every other field carried over. */
+export function mapOver(e: Expression, map: (e: Expression) => Expression): Expression
+{
+    switch(e.type)
+    {
+        case "CastExpression": return {...e, argument: map(e.argument)}
+        case "AssignmentExpression": return {...e, right: map(e.right)}
+        case "ConditionalExpression": return {...e, test: map(e.test), consequent: map(e.consequent), alternate: map(e.alternate)}
+        case "LogicalExpression": return {...e, left: map(e.left), right: map(e.right)}
+        case "BinaryExpression": return {...e, left: map(e.left), right: map(e.right)}
+        case "UnaryExpression": return {...e, argument: map(e.argument)}
+        case "UpdateExpression": return {...e, argument: map(e.argument)}
+        case "CallExpression": return {...e, arguments: e.arguments.map(map)}
+        default: return e
+    }
+}

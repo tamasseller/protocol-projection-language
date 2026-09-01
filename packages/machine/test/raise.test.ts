@@ -408,6 +408,65 @@ describe("raise: unary operators", () =>
     `, 0xb8000000))
 })
 
+describe("raise: ternary (a dispatch whose arms assign one slot)", () =>
+{
+    test("both arms", () =>
+    {
+        assertRaisedReturn("u32 a = 7; u32 b = 9; return a < b ? a : b;", 7)
+        assertRaisedReturn("u32 a = 9; u32 b = 7; return a < b ? a : b;", 7)
+    })
+
+    test("the slot the arms wrote is read after the merge", () => assertRaisedReturn(`
+        u32 a = 7;
+        u32 b = a > 3 ? 11 : 22;
+        return b + 1;
+    `, 12))
+
+    test("nested in an arm", () =>
+        assertRaisedReturn("u32 a = 0; return a ? 1 : (a == 0 ? 42 : 7);", 42))
+
+    test("in a loop condition", () => assertRaisedReturn(`
+        u32 n = 0;
+        u32 i = 0;
+        while(i < (n ? 3 : 5)) { i = i + 1; }
+        return i;
+    `, 5))
+
+    test("a trap arm", () => assertRaisedTrap("u32 a = 5; return a > 1 ? trap(3) : 9;", 3))
+})
+
+describe("raise: desugared and lifted forms", () =>
+{
+    test("compound assignment", () => assertRaisedReturn("u32 a = 1; a += 2; return a;", 3))
+
+    test("postfix step, whose old value takes a slot", () =>
+        assertRaisedReturn("u32 a = 1; u32 b = a++; return b * 10 + a;", 12))
+
+    test("short-circuit &&", () =>
+        assertRaisedReturn("u32 a = 0; u32 b = 0; u32 r = a && (b = 1); return b;", 0))
+
+    test("a switch whose labels are not consecutive", () => assertRaisedReturn(`
+        u32 x = 100;
+        switch(x)
+        {
+            case 1:   return 11;
+            case 100: return 20;
+            default:  return 99;
+        }
+    `, 20))
+
+    test("a switch with a shifted table", () => assertRaisedReturn(`
+        u32 x = 6;
+        switch(x)
+        {
+            case 5: return 15;
+            case 6: return 16;
+            case 7: return 17;
+            default: return 99;
+        }
+    `, 16))
+})
+
 describe("raise: trap", () =>
 {
     test("unconditional trap", () => assertRaisedTrap("trap(7);", 7))

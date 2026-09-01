@@ -125,6 +125,12 @@ const UNARY_OPS: readonly {ast: UnaryOperator; isa: UnaryOpcode}[] = [
     {ast: "~", isa: "NOT"},
 ] as const
 
+/** Which operators have a lowering at all — for expr.ts, to tell "this
+ *  operator has no opcode" from "these operands could not be arranged".
+ *  `/` and `%` are the two the grammar accepts and neither table covers. */
+export const LOWERED_BINARY_OPS: ReadonlySet<BinaryOperator> = new Set(OP_TABLE.map(e => e.ast))
+export const LOWERED_UNARY_OPS: ReadonlySet<UnaryOperator> = new Set(UNARY_OPS.map(e => e.ast))
+
 // ── RtlNode construction helpers ────────────────────────────────────────────
 
 /** Exported for extensions (extension.ts's `Extension.rules`) — building a
@@ -580,6 +586,19 @@ function assignmentRules(resolveLocal: (name: string) => number): Rule[]
 
             return unaryNode(rhs, ["acc", {"reg": reg}], [...rhs.fragment, STORE(reg)])
         }),
+
+        // The same assignment where its *value* is wanted on the stack —
+        // `u32 b = (a = 3);`, or `u32 b = ++a;` once desugar.ts has turned
+        // that into one. Only the acc path: a write-back RHS left its
+        // result in a register, and re-`LOAD`ing it would cost more than
+        // the plain form this competes with.
+        rule("assign:=:tos", pAssign("=", pRtl()), m =>
+        {
+            const rhs = m.rightMatch.node
+            if(!outputHas(rhs.output, "acc")) return undefined
+
+            return unaryTosNode(rhs, [...rhs.fragment, STORE(resolveLocal(m.target))])
+        }),
     ]
 }
 
@@ -592,14 +611,17 @@ function assignmentRules(resolveLocal: (name: string) => number): Rule[]
  *  instead — the calling convention's last-arg-in-acc rule). `CALL` itself
  *  only ever consumes `stackArgs` values off the stack, never the full
  *  `argNodes.length`. */
-function callNode(m: MatchOf<CallPattern>, resolveCallee: (name: string) => number | undefined):
+function callNode(m: MatchOf<CallPattern>, resolveCallee: (name: string, argCount?: number) => number | undefined):
     Omit<RtlNode, "type" | "output"> | undefined
 {
     const {argNodes, callee} = m
     // A callee this pass can't resolve (e.g. a builtin name like `clz`)
     // isn't an error here — it just means this rule isn't viable for this
-    // call site; a builtin-specific rule handles it instead.
-    const calleeIndex = resolveCallee(callee)
+    // call site; a builtin-specific rule handles it instead. An arity
+    // mismatch is different: the callee *is* known, so the resolver throws
+    // rather than declining, or the surplus would silently shift which
+    // pushed value each parameter binds to (isa-core.md §6).
+    const calleeIndex = resolveCallee(callee, argNodes.length)
     if(calleeIndex === undefined) return undefined
     const stackArgs = Math.max(argNodes.length - 1, 0)
     const fragment: RtlInstr[] = [...argNodes.flatMap(a => a.fragment), call(calleeIndex)]
@@ -622,7 +644,7 @@ function callNode(m: MatchOf<CallPattern>, resolveCallee: (name: string) => numb
  * the last — `call:acc` still directly satisfies a call nested as the
  * *last* argument, e.g. `f(g(x))`, with no bridge needed at all).
  */
-function callRules(resolveCallee: (name: string) => number | undefined): Rule[]
+function callRules(resolveCallee: (name: string, argCount?: number) => number | undefined): Rule[]
 {
     return [
         rule("call:acc", pCall(), m =>
@@ -648,7 +670,7 @@ function callRules(resolveCallee: (name: string) => number | undefined): Rule[]
 
 export const ruleset = <E extends { ext: string } = ExtOpPayload>(
     resolveLocal: (name: string) => number,
-    resolveCallee: (name: string) => number | undefined,
+    resolveCallee: (name: string, argCount?: number) => number | undefined,
     extension?: Extension<E>,
 ): Rule<E>[] => [
     ...foldRules(),

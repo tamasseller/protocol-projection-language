@@ -25,7 +25,10 @@ notion of either.
 | `src/ir.ts` | `proc`/`declareProc`/`defineProc`, fragment identity and splicing |
 | `src/east.ts`, `src/rtl.ts` | expression AST and RTL instruction/combo model |
 | `src/matcher.ts`, `src/rules.ts`, `src/builders.ts`, `src/orchestrator.ts` | pattern-rewrite tiling: patterns, rule table, fragment combining, Pareto-pruned search |
-| `src/lower.ts`, `src/raise.ts` | AST → flat `RtlInstr[]`, and its structural inverse |
+| `src/lower.ts` | statement walk: AST → flat `RtlInstr[]`, one door into the expression pipeline |
+| `src/scope.ts`, `src/desugar.ts`, `src/lift.ts`, `src/types.ts`, `src/expr.ts` | the expression pipeline's phases: scope/register allocation, derived-operator rewriting, the ternary/postfix lift, type annotation, tiling demand |
+| `src/explain.ts` | why a tiling failed, reconstructed from the source for the message |
+| `src/raise.ts` | the structural inverse of `lower.ts`, for target codegen |
 | `src/validate.ts` | isa-core.md §8's whole-program checks, plus the stack-depth and call-depth bounds |
 | `src/vm.ts` | reference interpreter |
 | `src/bytecode.ts`, `src/encoding.ts` | procedure and program wire encoding (isa-core.md §5) |

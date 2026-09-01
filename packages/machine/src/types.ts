@@ -2,9 +2,8 @@
  * @ppl/machine — Type annotation pass
  *
  * Runs over one expression tree between parsing and tiling. It does two
- * things and no more: stamp `signed` on the operators whose ISA opcode
- * depends on it, and insert a cast wherever a value lands in a narrow
- * variable.
+ * things: stamp `signed` on the operators whose ISA opcode depends on it, 
+ * and insert a cast wherever a value lands in a narrow variable.
  *
  * The signedness rule is C's, which for this type menu collapses to one
  * line. C promotes everything narrower than `int` to `int`, so of the six
@@ -26,6 +25,7 @@
 import type {
     Expression, PrimType, BinaryOperator, Identifier, CallExpression,
 } from "./ast"
+import {mapOver} from "./ast"
 
 /** What a name's declared type is, or `undefined` for one this scope never
  *  declared — a procedure argument, which is `u32` (isa-core.md §2.3). */
@@ -39,6 +39,10 @@ const DEFAULT_TYPE: PrimType = "u32"
 /** C's integer promotion over this menu: everything narrower than 32 bits
  *  becomes `i32`, and `u32` alone stays unsigned. */
 const promote = (t: PrimType): "u32" | "i32" => t === "u32" ? "u32" : "i32"
+
+/** C's usual arithmetic conversions over the promoted pair. */
+const usual = (a: PrimType, b: PrimType): PrimType =>
+    promote(a) === "u32" || promote(b) === "u32" ? "u32" : "i32"
 
 /** The five operators with a signed ISA opcode of their own (isa-core.md
  *  §4.1/§4.2). `<<` has none: a left shift is bit-identical either way. */
@@ -99,7 +103,7 @@ function walk(node: Expression, env: TypeEnv): Typed
             // other binary op takes the usual arithmetic conversions.
             const result: PrimType = (node.operator === "<<" || node.operator === ">>")
                 ? promote(left.type)
-                : (promote(left.type) === "u32" || promote(right.type) === "u32" ? "u32" : "i32")
+                : usual(left.type, right.type)
 
             const signed = (node.operator === "<<" || node.operator === ">>")
                 ? promote(left.type) === "i32"
@@ -132,33 +136,31 @@ function walk(node: Expression, env: TypeEnv): Typed
         }
 
         case "CallExpression":
-        {
             // Procedure signatures are untyped for now, so a call's value
             // is a plain word. Arguments are still annotated: each is an
             // expression in its own right.
-            const args = node.arguments.map(a => walk(a, env).expr)
-            return {expr: {...node, arguments: args}, type: DEFAULT_TYPE}
+            return {expr: mapOver(node, a => walk(a, env).expr), type: DEFAULT_TYPE}
+
+        // Reached only through `typeOfExpr`: lower.ts hoists every ternary
+        // into a branch of its own before annotating what is left, so no
+        // `annotate` walk ever meets one. Its type is still C's — the two
+        // arms' usual arithmetic conversions — because that is what types
+        // the slot the branch writes into.
+        case "ConditionalExpression":
+        {
+            const cons = walk(node.consequent, env)
+            const alt = walk(node.alternate, env)
+            return {
+                expr: {...node, test: walk(node.test, env).expr, consequent: cons.expr, alternate: alt.expr},
+                type: usual(cons.type, alt.type),
+            }
         }
 
-        // Parsed but not lowered by anything (ROADMAP: ternary, logical
-        // operators, ++/--). Walked so their children are still annotated
-        // if one of them ever grows a lowering.
-        case "ConditionalExpression":
-            return {
-                expr: {
-                    ...node,
-                    test: walk(node.test, env).expr,
-                    consequent: walk(node.consequent, env).expr,
-                    alternate: walk(node.alternate, env).expr,
-                },
-                type: DEFAULT_TYPE,
-            }
-
+        // Parsed but not lowered by anything (ROADMAP: logical operators,
+        // ++/--). Walked so their children are still annotated if one of
+        // them ever grows a lowering.
         case "LogicalExpression":
-            return {
-                expr: {...node, left: walk(node.left, env).expr, right: walk(node.right, env).expr},
-                type: "i32",
-            }
+            return {expr: mapOver(node, c => walk(c, env).expr), type: "i32"}
 
         case "UpdateExpression":
             return {expr: node, type: env.typeOf((node.argument as Identifier).name ?? "") ?? DEFAULT_TYPE}
@@ -169,6 +171,13 @@ function walk(node: Expression, env: TypeEnv): Typed
 export function annotate(expr: Expression, env: TypeEnv): Expression
 {
     return walk(expr, env).expr
+}
+
+/** The type an expression has, without rewriting it — for a caller that
+ *  needs the type of a tree it is about to take apart rather than lower. */
+export function typeOfExpr(expr: Expression, env: TypeEnv): PrimType
+{
+    return walk(expr, env).type
 }
 
 /** Annotate, then narrow to `target` — a declaration's initializer, where

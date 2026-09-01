@@ -483,7 +483,8 @@ which sees the whole body and can omit the `PUSH`. Cost: `walk`'s
 |---|---|---|
 | `if-else` | 2 | then = `case[0]`, else = `case[1]`; default unreachable |
 | `if` (no else) | 1 | body = `case[0]`, reached when `acc = 0` (complementary comparison, §7.3); default = skip |
-| `switch` | variant count | each variant a case; default is the natural home for an out-of-range `trap()` |
+| `switch` | span of one run of labels | a `case` label is a *value*: consecutive labels index the table directly (shifted by the run's base, so an out-of-range discriminant still lands on the default via unsigned wrap), a gap inside a run is an empty case, and runs too far apart to bridge chain behind range tests. Default is the natural home for an out-of-range `trap()` |
+| ternary | 2 | consequent = `case[0]`, alternate = `case[1]`, arm order as `if-else`; each arm ends by storing the slot §8.7 reserves ahead of the dispatch |
 
 "Default unreachable" for `if-else` is a statement about what this lowerer
 emits, not a guarantee validation checks or an implementation may assume:
@@ -680,14 +681,21 @@ unchanged. The authoring entry point is a TypeScript tagged template,
 
 ### 10.2 Included
 
-Expressions: all of C's operators with C's precedence; `=` and compound
-assignment; prefix/postfix `++`/`--`; integer literals (decimal, `0x…`,
-`0b…`); function calls; parenthesization. Statements: expression
-statements; `if`/`else`, `while`, `for`, `switch`/`case`/`default`,
-`return`; block statements `{ … }` as the direct body of
-`if`/`else`/`while`/`for` (the grammar's `ControlBody` production).
-Declarations: `u32` locals, optionally initialized. `//` and `/* */`
-comments.
+Expressions: C's operators with C's precedence, except `/` and `%` (no
+opcode — §4.1); `=` and compound assignment; prefix and postfix `++`/`--`;
+`&&`/`||`, short-circuiting; the conditional operator; narrowing casts
+(§10.4); integer literals (decimal, `0x…`, `0b…`); function calls;
+parenthesization. Statements: expression statements; `if`/`else`, `while`,
+`for`, `switch`/`case`/`default`, `return`; block statements `{ … }` as the
+direct body of `if`/`else`/`while`/`for` (the grammar's `ControlBody`
+production). Declarations: one local per statement, of any §10.4 type,
+optionally initialized. `//` and `/* */` comments.
+
+Everything below the surface syntax is a rewrite into what the tiler
+already covers: compound assignment into `a = a op e`, `!e` into `e == 0`,
+`a && b` into a conditional, a conditional into a `BR_TABLE` writing a slot
+(§8.7). Only a postfix `++`/`--` whose value is read needs a slot of its
+own, for the value from before the step.
 
 ### 10.3 Excluded
 
@@ -703,21 +711,39 @@ comments.
   real `BR_TABLE` case or `LOOP` sub-block, and always closes via a real
   `BLOCK_END` that resets TOS (§8.1). isa-rationale.md covers why this
   matters to register allocation.
-- Comma operator, casts, `sizeof`, non-integer literals, storage
-  qualifiers, the preprocessor.
+- **`switch` fallthrough.** A case's code is reachable only through the
+  dispatch, so one case cannot run into the next; an empty case body — C's
+  way of spelling a shared one — is rejected rather than silently lowered
+  as "do nothing for this label".
+- **Octal literals.** A leading zero is rejected, not reinterpreted: this
+  is a subset of C, so it may refuse a spelling, but must not disagree with
+  C about what one means.
+- `/` and `%`, which parse but have no opcode to lower to (§4.1).
+- Comma operator, `sizeof`, non-integer literals, storage qualifiers, the
+  preprocessor, declarator lists (`u32 a, b;` — one name per statement).
 
-### 10.4 The single type rule
+### 10.4 Types
 
-All values are `u32`; a declaration must spell the type name:
+The six primitive types of §4.3: `u32`/`i32` are the machine word, and
+`u16`/`u8`/`i16`/`i8` are that word held already extended, which is what
+makes reading one free and writing one cost an extend.
 
 ```
-u32 x;            // ok
-u32 y = 5;        // ok
-u32 a, b, c;      // ok, declarator list, all u32
+u32 x;            // ok — reserves a zeroed slot
+i16 y = -5;       // ok
+u8  z = u8(y);    // ok — a cast is written call-style (§10.5)
+u32 a, b;         // rejected: one declarator per statement
 int x;            // rejected
 ```
 
-Function parameters are also `u32`, declared out-of-band in the procedure
+A name may not be declared twice in one scope, and a procedure argument is
+in the body's own scope, so a local may not shadow one either — both would
+push a slot the name no longer answers to. A nested scope may shadow
+freely: its block reclaims the slot at `BLOCK_END`. A `for` init's
+declarations are scoped to the loop, but their registers are not reclaimed
+until the enclosing block ends.
+
+Function parameters are `u32`, declared out-of-band in the procedure
 header (§2.3), visible as named locals from the body's first statement.
 
 ### 10.5 Function calls
@@ -730,6 +756,13 @@ lowering:
 | `trap(code)` | `TRAP #code` |
 | `clz(x)` | `CLZ` |
 | `revbits(x)` | `REVBITS` |
+| `i8(x)` / `i16(x)` / `u8(x)` / `u16(x)` | `SXTB` / `SXTH` / `UXTB` / `UXTH` |
+
+A cast takes the same call-like syntax rather than C's `(u8)x`: a leading
+parenthesis is already a parenthesized expression, and telling the two
+apart needs unbounded lookahead. The four names are the §10.4 types that
+narrow; a cast to `u32`/`i32` is the identity and emits nothing. The same
+extend is inserted implicitly wherever a value lands in a narrow variable.
 
 `trap` is a function rather than a keyword so `return` stays the only
 procedure-exit keyword. Resolving any other call name (procedure table
@@ -742,13 +775,17 @@ mechanism, out of scope here.
 |---|---|
 | expression | instructions computing the value into `acc`, using TOS for intermediates as needed; operand addressing mode is an implementation choice |
 | `if (c) T` | `c` into `acc` (complementary comparison, §7.3); `BR_TABLE 1`, `T` at `case[0]` |
-| `if (c) T else E` | `c` into `acc ∈ {0,1}`; `BR_TABLE 2`, `E` at `case[0]`, `T` at `case[1]` |
-| `switch (v) { case k: … }` | `v` into `acc`; `BR_TABLE N`; out-of-range falls to the implicit default |
+| `if (c) T else E` | `c` into `acc ∈ {0,1}`, complementary; `BR_TABLE 2`, `T` at `case[0]`, `E` at `case[1]` (§7.1) |
+| `switch (v) { case k: … }` | `v` into `acc`; `BR_TABLE` over one run of labels, shifted by that run's base; further runs chain behind range tests off a slot holding `v`; out-of-range falls to the implicit default |
 | `while (c) B` | `LOOP`; condition block = `c` into `acc`; `BLOCK_END`; body block = `B`; `BLOCK_END` |
-| `for (init; c; inc) B` | `init`; `LOOP`; condition block = `c`; `BLOCK_END`; body block = `B` then `inc`; `BLOCK_END` |
-| `return e;` / `return;` | `e` into `acc` (or unspecified); `RETURN` |
+| `for (init; c; inc) B` | `init`; `LOOP`; condition block = `c` (omitted ⇒ `1`); `BLOCK_END`; body block = `B` then `inc`; `BLOCK_END` |
+| `return e;` / `return;` | `e` into `acc` (or `CONST #0`); `RETURN` |
 | `trap(c);` | `TRAP #c` |
-| `u32 x = e;` | `e` into `acc`; `STORE` into `x`'s allocated slot |
+| `u32 x = e;` | `e` into TOS: the push that computes it *is* the slot, and `x` names that index |
+| `u32 x;` | `CONST #0`, `PUSH` — the slot still has to exist, and `PUSH` needs a live value |
+| `c ? a : b` | a slot reserved by `PUSH`, then `BR_TABLE 2` storing it from each arm; the slot is the value (§8.7) |
+| `a op= e`, `++a`, `!e`, `a && b` | rewritten into the above before anything is emitted (§10.2) |
+| `a++` (value read) | `LOAD a`, `PUSH` — the pre-step value in a slot — then the step |
 
 The `for` increment lowers to a single copy at the end of the body block,
 immediately before its `BLOCK_END`: with no `continue` to jump around it,
