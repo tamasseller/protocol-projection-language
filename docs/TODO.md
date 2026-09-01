@@ -6,10 +6,13 @@ Open:
   - move to separate root repo, publish on github (needs to move the current @ppl/machine as well)
   
 - @ppl/machine
+  - process improvements.md with regard to recent ISA revision
   - move @ppl/machine to separate root repo publish on github
   - DSL improvements
-    - process dsl-gaps.md
-    - I'm thining to maybe allow extension a bit more freedom on the DSL expression side, we could allow them to have their own declaration like statements for pinning compile time constants (like stream ids and such) and object field access and/or array element access like syntax either globally (like memory[address]) or on their declared magic object instances (iterator.read())
+
+- ISA
+  - opcode mapping change
+  - BR_TABLE exhaustive, change encoding to rule out BR_TABLE 0
 
 - the actual PPL itself
   - Quantities / units of measurement — design sketch in docs/quantities.md, nothing implemented.

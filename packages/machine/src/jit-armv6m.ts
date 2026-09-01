@@ -23,7 +23,7 @@ import type { Extension } from "./extension"
 /** Bump when the wire contract changes: an older producer's programs then
  *  stop verifying instead of being misread. Mirrors
  *  jit-armv6m/src/runtime/program_frame.h. */
-export const PROGRAM_CONTRACT_VERSION = 1
+export const PROGRAM_CONTRACT_VERSION = 2
 
 export const PROGRAM_FRAME_BYTES = 2
 

@@ -601,7 +601,8 @@ const pushingProgram: RtlProgram = {
             { op: "CONST", imm: 0x1234 },
             { op: "PUSH" }, // slot 0 = 0x1234
             extInstr("SPLIT_REG", [0]), // reads reg 0, pushes lo then hi
-            { op: "POP" }, // acc = hi
+            { op: "CONST", imm: 0 },
+            { op: "ADD", combo: "POP_ACC" }, // acc = hi
             { op: "ADD", combo: "POP_ACC" }, // acc = hi + lo — just needs to be *some* function of both
             { op: "RETURN" },
         ],

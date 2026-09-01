@@ -68,7 +68,7 @@ only it, so moving `codec-extension.ts` (built on
 
 ## 8. Multi-procedure program envelope - Done
 
-isa-core.md §5.4/§5.5: `CALL`'s numeric encode/decode (byte 99 plus
+isa-core.md §5.4/§5.5: `CALL`'s numeric encode/decode (§5.2's own code plus
 unbounded LEB128 `proc_idx`) and program framing, in `bytecode.ts`'s
 `encodeProgram`/`decodeProgram`. A procedure count, a real offset table (one
 header row per procedure: `arg_count` plus body byte length), then every
@@ -289,7 +289,7 @@ point; choosing what to do with it is real target-codegen work.
 leaves, `grammer.pegjs`'s recursive-descent parser dominates wall-clock
 time; `tileExpr` is flat in tree width. Not investigated further.
 
-**The DSL has three limitations that follow from the ISA.** docs/dsl-gaps.md
+**The DSL has three limitations that follow from the ISA.** docs/dsl-limitations.md
 states each with what to write instead: no divide (write the helper), a
 `for` init's register outliving its name (C's own equivalence, minus the
 bare block this DSL excludes), and no spelling for a no-op `switch` case.

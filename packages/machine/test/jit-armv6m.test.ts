@@ -124,8 +124,8 @@ describe("jit-armv6m program frame (design.md §1.1)", () =>
         // 0x80 rather than a core opcode, so a byte with its high bit set goes
         // through the mixer: nothing else here would catch one side widening
         // it as signed.
-        const vector = Uint8Array.from([0x00, 0x00, 0x01, 0x00, 0x80, 104])
-        assert.equal(programFrameHash(vector), 0x9a66)
+        const vector = Uint8Array.from([0x00, 0x00, 0x01, 0x00, 0x80, 102])
+        assert.equal(programFrameHash(vector), 0xdc7d)
     })
 
     test("the unframed envelope still round-trips on its own", () =>

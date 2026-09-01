@@ -21,7 +21,7 @@ import {
 } from "../src/bytecode"
 import {
     opReg, opRegWriteback, opStack, opImm, bare, brTable, trap, call,
-    LOAD, STORE, PUSH, POP, CONST,
+    LOAD, STORE, PUSH, CONST,
 } from "../src/rtl"
 import type { RtlInstr, RtlProgram, BinaryOpcode } from "../src/rtl"
 import { validateProgram } from "../src/validate"
@@ -52,25 +52,40 @@ for (const [i, op] of CMP.entries())
     rows.push({ byte: 50 + i * 4 + 2, instr: opImm(op, 0) })
     rows.push({ byte: 50 + i * 4 + 3, instr: opImm(op, EXT_IMM) })
 }
-const UNARY = ["NEG", "NOT", "CLZ", "REVBITS", "SXTB", "SXTH", "UXTB", "UXTH"] as const
+const UNARY = ["NEG", "NOT", "SXTB", "SXTH", "UXTB", "UXTH"] as const
 for (const [i, op] of UNARY.entries())
     rows.push({ byte: 90 + i, instr: bare(op) })
-rows.push({ byte: 98, instr: bare("BLOCK_END") })
-rows.push({ byte: 99, instr: bare("LOOP") })
-rows.push({ byte: 100, instr: brTable(1) })
-rows.push({ byte: 101, instr: brTable(2) })
-rows.push({ byte: 102, instr: brTable(3) })
-rows.push({ byte: 103, instr: call(REG) })
-rows.push({ byte: 104, instr: bare("RETURN") })
-rows.push({ byte: 105, instr: trap(0) })
-rows.push({ byte: 106, instr: trap(5) })
-rows.push({ byte: 107, instr: PUSH() })
-rows.push({ byte: 108, instr: POP() })
-rows.push({ byte: 109, instr: LOAD(REG) })
-rows.push({ byte: 110, instr: STORE(REG) })
-rows.push({ byte: 111, instr: CONST(EXT_IMM) })
+rows.push({ byte: 96, instr: bare("BLOCK_END") })
+rows.push({ byte: 97, instr: bare("LOOP") })
+rows.push({ byte: 98, instr: brTable(1) })
+rows.push({ byte: 99, instr: brTable(2) })
+rows.push({ byte: 100, instr: brTable(3) })
+rows.push({ byte: 101, instr: call(REG) })
+rows.push({ byte: 102, instr: bare("RETURN") })
+rows.push({ byte: 103, instr: trap(0) })
+rows.push({ byte: 104, instr: trap(5) })
+rows.push({ byte: 105, instr: PUSH() })
+rows.push({ byte: 106, instr: LOAD(REG) })
+rows.push({ byte: 107, instr: STORE(REG) })
+rows.push({ byte: 108, instr: CONST(EXT_IMM) })
 for (let k = 0; k <= 15; k++)
-    rows.push({ byte: 112 + k, instr: CONST(k) })
+    rows.push({ byte: 109 + k, instr: CONST(k) })
+
+// §5.3's three escapes. Only MISC_UNARY has assigned sub-codes so far;
+// FALLTHROUGH (MISC_CF #0) is assigned by the spec but no consumer
+// implements it, so it is rejected exactly like a reserved one.
+const MISC_BYTES = [125, 126, 127]
+const miscRows: { byte: number; sub: number; instr: RtlInstr }[] = [
+    { byte: 126, sub: 0, instr: bare("REVBITS") },
+    { byte: 126, sub: 1, instr: bare("CLZ") },
+]
+const miscRejected: [number, number, RegExp][] = [
+    [125, 0, /FALLTHROUGH is assigned but not implemented/],
+    [125, 1, /sub-code 1 is reserved/],
+    [126, 2, /sub-code 2 is reserved/],
+    [127, 0, /sub-code 0 is reserved/],
+    [127, 9, /sub-code 9 is reserved/],
+]
 
 describe("Bytecode codec — 128-row opcode table (isa-core.md Appendix)", () =>
 {
@@ -95,12 +110,35 @@ describe("Bytecode codec — 128-row opcode table (isa-core.md Appendix)", () =>
         }
     })
 
-    test("all 128 byte values are accounted for — no gaps, nothing reserved", () =>
+    test("all 128 byte values are accounted for — no gaps", () =>
     {
-        const assigned = new Set(rows.map(r => r.byte))
+        const assigned = new Set([...rows.map(r => r.byte), ...MISC_BYTES])
         for (let b = 0; b < 128; b++)
             assert.ok(assigned.has(b), `byte ${b} has no row — a gap in the table`)
         assert.equal(assigned.size, 128)
+        assert.equal(rows.length, 125) // 0-124 direct, 125-127 escapes
+    })
+
+    test("an assigned escape sub-code round-trips", () =>
+    {
+        for (const { byte, sub, instr } of miscRows)
+        {
+            const encoded = encodeInstr(instr)
+            assert.deepEqual(encoded, [byte, sub], `${JSON.stringify(instr)}: wrong escape encoding`)
+            const { instr: decoded, next } = decodeInstr(Uint8Array.from(encoded), 0)
+            assert.deepEqual(decoded, instr)
+            assert.equal(next, 2)
+        }
+    })
+
+    // An escape's operand shape is defined only when its sub-code is
+    // assigned, so an unassigned one has no known length — it has to be
+    // rejected rather than skipped over (isa-core.md §5.3).
+    test("an unassigned escape sub-code is rejected, not skipped", () =>
+    {
+        for (const [byte, sub, message] of miscRejected)
+            assert.throws(() => decodeInstr(Uint8Array.of(byte, sub), 0), message,
+                `[${byte}, ${sub}] should be rejected`)
     })
 
     test("extension bytes (>=128) are rejected on decode", () =>
@@ -123,8 +161,8 @@ describe("Bytecode codec — small/extended boundary cases", () =>
 {
     test("CONST: #15 stays small, #16 switches to extended", () =>
     {
-        assert.deepEqual(encodeInstr(CONST(15)), [112 + 15])
-        assert.deepEqual(encodeInstr(CONST(16)), [111, 16])
+        assert.deepEqual(encodeInstr(CONST(15)), [109 + 15])
+        assert.deepEqual(encodeInstr(CONST(16)), [108, 16])
     })
 
     test("comparison immediate: #0 stays small, #1 switches to extended", () =>
@@ -142,16 +180,16 @@ describe("Bytecode codec — small/extended boundary cases", () =>
 
     test("BR_TABLE: N=1 and N=2 stay dedicated, N=0 and N=3 switch to extended", () =>
     {
-        assert.deepEqual(encodeInstr(brTable(1)), [100])
-        assert.deepEqual(encodeInstr(brTable(2)), [101])
-        assert.deepEqual(encodeInstr(brTable(0)), [102, 0])
-        assert.deepEqual(encodeInstr(brTable(3)), [102, 3])
+        assert.deepEqual(encodeInstr(brTable(1)), [98])
+        assert.deepEqual(encodeInstr(brTable(2)), [99])
+        assert.deepEqual(encodeInstr(brTable(0)), [100, 0])
+        assert.deepEqual(encodeInstr(brTable(3)), [100, 3])
     })
 
     test("TRAP: code=0 stays dedicated, any other code switches to extended", () =>
     {
-        assert.deepEqual(encodeInstr(trap(0)), [105])
-        assert.deepEqual(encodeInstr(trap(1)), [106, 1])
+        assert.deepEqual(encodeInstr(trap(0)), [103])
+        assert.deepEqual(encodeInstr(trap(1)), [104, 1])
     })
 })
 
@@ -293,7 +331,7 @@ describe("Bytecode codec — program framing (isa-core.md §5.5)", () =>
         const bytes = encodeProgram(program)
         // count(2), argCount_0(0), body_0's RETURN(100), argCount_1(0),
         // body_1's CONST(108+1)/RETURN(100) — no bodyLength byte anywhere.
-        assert.deepEqual([...bytes], [2, 0, 104, 0, 112 + 1, 104])
+        assert.deepEqual([...bytes], [2, 0, 102, 0, 109 + 1, 102])
     })
 
     test("a LOOP body block closed by a bare terminator (isa-core.md §7.2) still self-delimits correctly", () =>

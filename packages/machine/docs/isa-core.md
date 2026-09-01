@@ -228,12 +228,18 @@ Operate on `acc` in place, no addressing-mode bits:
 |---|---|
 | `NEG` | two's-complement negation |
 | `NOT` | bitwise complement |
-| `CLZ` | count leading zeros (0-32) |
-| `REVBITS` | reverse bit order (32-bit width) |
 | `SXTB` / `SXTH` | sign-extend the low 8 / 16 bits to 32 |
 | `UXTB` / `UXTH` | zero-extend the low 8 / 16 bits to 32 |
 
-`CTZ` has no dedicated op: `CTZ(x) = CLZ(REVBITS(x))`.
+Two more reach acc the same way but encode through §5.3's `MISC_UNARY`
+escape rather than a dedicated code, so they cost two bytes each:
+
+| Op | Sub-code | Semantics |
+|---|---|---|
+| `REVBITS` | `0` | reverse bit order (32-bit width) |
+| `CLZ` | `1` | count leading zeros (0-32) |
+
+`CTZ` has no op at all: `CTZ(x) = CLZ(REVBITS(x))`.
 
 The four extend ops exist for the narrow integer types (§2.1's word is the
 only *storage* type; a narrow type is a word constrained to a range). A
@@ -252,7 +258,6 @@ combo (§4.1 #1/#2) and needs no `LOAD` first.
 | Op | Effect | Trailing |
 |---|---|---|
 | `PUSH` | `[tos++] = acc` | none |
-| `POP` | `acc = [--tos]` | none |
 | `LOAD` | `acc = rN` | LEB128 register index |
 | `STORE` | `rN = acc` | LEB128 register index |
 | `CONST #k` (small) | `acc = k`, `k ∈ 0..15` | none (`k` inline in opcode) |
@@ -261,6 +266,11 @@ combo (§4.1 #1/#2) and needs no `LOAD` first.
 `PUSH` is how a call's non-last arguments (§4.6, §6) and expression
 temporaries reach the stack; §4.1 has no push-mode combo of its own.
 `CONST` is the only way to get an arbitrary constant into `acc`.
+
+There is no plain `POP`. Every stack operand is consumed by the combo that
+reads it (§4.1's `POP_ACC`), and a block's own `BLOCK_END` is what returns
+TOS to the block's entry depth (§8.1) — between them nothing is left for a
+bare discard to do.
 
 ### 4.5 Control-flow ops
 
@@ -348,10 +358,11 @@ table.
 |---|---|---|
 | `0-49` | Arithmetic (§4.1) | `op = code / 5`, `mode = code % 5` |
 | `50-89` | Comparison (§4.2) | `op = (code−50) / 4`, `mode = (code−50) % 4` |
-| `90-97` | Unary (§4.3) | `code − 90` selects `NEG, NOT, CLZ, REVBITS, SXTB, SXTH, UXTB, UXTH` |
-| `98-102` | Local flow control | `code − 98` selects `BLOCK_END, LOOP, BR_TABLE#1, BR_TABLE#2, BR_TABLE-ext` |
-| `103-106` | Global flow control | `code − 103` selects `CALL, RETURN, TRAP#0, TRAP-ext` |
-| `107-127` | Move/const (§4.4) | `code − 107` selects `PUSH, POP, LOAD, STORE, CONST-ext, CONST#0..CONST#15` |
+| `90-95` | Unary (§4.3) | `code − 90` selects `NEG, NOT, SXTB, SXTH, UXTB, UXTH` |
+| `96-100` | Local flow control | `code − 96` selects `BLOCK_END, LOOP, BR_TABLE#1, BR_TABLE#2, BR_TABLE-ext` |
+| `101-104` | Global flow control | `code − 101` selects `CALL, RETURN, TRAP#0, TRAP-ext` |
+| `105-124` | Move/const (§4.4) | `code − 105` selects `PUSH, LOAD, STORE, CONST-ext, CONST#0..CONST#15` |
+| `125-127` | Escapes (§5.3) | `MISC_CF, MISC_UNARY, MISC_BINARY`, each with a sub-code |
 
 Op ordering within the two flat-indexed classes: arithmetic is `ADD, SUB,
 RSUB, MUL, AND, OR, XOR, SHL, SHR, ASR` (0-9); comparison is `EQ, NE,
@@ -359,28 +370,50 @@ LT_S, LE_S, GT_S, GE_S, LT_U, LE_U, GT_U, GE_U` (0-9). Mode ordering:
 arithmetic `REG_ACC, REG_REG, PEEK_PEEK, POP_ACC, IMM_EXT` (0-4);
 comparison `REG_ACC, POP_ACC, IMM_SMALL, IMM_EXT` (0-3).
 
-This uses all 128 core codes; see §5.3. The Appendix expands the formulas
-into one row per byte value.
+This uses all 128 core codes: 50 + 40 + 6 + 5 + 4 + 20 + 3. See §5.3 for
+what the last three buy. The Appendix expands the formulas into one row per
+byte value.
 
 The formulas above describe the numbering, not a required algorithm — §5.1's
 static table is equally normative, and on a target without a hardware
 divider it is the only sane choice: `jit-armv6m` decodes through a
-112-entry table precisely because `code / 5` and `code % 5` otherwise
+109-entry table precisely because `code / 5` and `code % 5` otherwise
 compile to two libgcc `__udivsi3` calls per instruction decoded. A decoder
 is free to pick either; `jit-armv6m/test/host/test_decode_encode.cpp`
 checks its table against these formulas for every assigned opcode.
 
-### 5.3 No reserved codes
+### 5.3 Escape opcodes
 
-Every one of the 128 core codes is assigned. The four that §5.2 once held
-back went to §4.3's extend ops when the narrow integer types arrived; the
-unary class grew from four codes to eight and every class after it moved
-down, which is why a decoder built against an earlier draft of this section
-disagrees on everything from byte 94 up rather than only on the four.
+Every one of the 128 core codes is assigned, and the last three are escapes:
+one per instruction class, each taking an unsigned LEB128 **sub-code** as
+its trailing operand. They are where a core op goes once the single-byte
+ranges are full — two bytes instead of one, in exchange for a space that
+does not run out.
 
-There is therefore no headroom: a further core op is a new revision of this
-spec, and renumbers the space again. The extension range (§5.1) is where
-new opcodes go instead.
+| Code | Escape | Assigned sub-codes |
+|---|---|---|
+| `125` | `MISC_CF` | `0` = `FALLTHROUGH` |
+| `126` | `MISC_UNARY` | `0` = `REVBITS`, `1` = `CLZ` |
+| `127` | `MISC_BINARY` | none yet |
+
+A sub-code's own operand shape — whether anything trails the sub-code, and
+what — is defined when that sub-code is assigned, not by the escape. So an
+**unassigned sub-code has no length**, and a decoder cannot skip over one:
+it must reject the program, exactly as it rejects an extension byte no
+extension claims (§11.1). This is the one place where a well-formed-looking
+core byte can still be invalid.
+
+`MISC_BINARY` is deliberately empty. It is reserved for the general-purpose
+arithmetic the core should own rather than push onto a domain extension —
+`UDIV`/`IDIV`/`MOD`, a multiply-accumulate — none of which is specified
+here yet.
+
+`FALLTHROUGH` is assigned but **not implemented**: no lowering emits it and
+no consumer executes it, so a program containing one is rejected today, the
+same as a reserved sub-code. It is listed here because its meaning is
+settled — close a `BR_TABLE` case by continuing into the next case's body
+rather than leaving the construct, which is what `switch` fallthrough
+(§10.3) needs and what a jump-table target can express for free.
 
 ### 5.4 Trailing operands
 
@@ -389,6 +422,7 @@ new opcodes go instead.
 | Extended immediate (arithmetic/comparison ext form, `CONST` ext form) | unsigned LEB128, 1-5 bytes |
 | Register index (`LOAD`, `STORE`, both classes' `REG_ACC`/`REG_REG` combos) | unsigned LEB128 |
 | `BR_TABLE` extended case count, `TRAP` extended code, `CALL` procedure index | unsigned LEB128 |
+| Escape sub-code (§5.3's `MISC_*`) | unsigned LEB128 |
 
 Register indices are LEB128 in every instruction that carries one: one
 rule, no special case for small frames. `CALL`'s `proc_idx` is a plain
@@ -607,7 +641,7 @@ A register index is valid to reference via `LOAD`, `STORE` or a
 `PUSH`es have run since.
 
 §8.1's TOS balance does not imply this: it bounds
-`PUSH`/`POP`/peek/pop-combo/`CALL` against a block's entry depth and never
+`PUSH`/peek/pop-combo/`CALL` against a block's entry depth and never
 looks at a `LOAD`/`STORE`/register-combo operand. Violating §8.6 is a
 validation error, not undefined runtime behavior: a register no `PUSH`
 established has no value to read and no reason to be writable.
@@ -952,42 +986,42 @@ Every trailing operand, where present, is unsigned LEB128 (§5.4).
 | `89` | `GE_U IMM_EXT` | immediate value |
 | `90` | `NEG` | none |
 | `91` | `NOT` | none |
-| `92` | `CLZ` | none |
-| `93` | `REVBITS` | none |
-| `94` | `SXTB` | none |
-| `95` | `SXTH` | none |
-| `96` | `UXTB` | none |
-| `97` | `UXTH` | none |
-| `98` | `BLOCK_END` | none |
-| `99` | `LOOP` | none |
-| `100` | `BR_TABLE #1` | none |
-| `101` | `BR_TABLE #2` | none |
-| `102` | `BR_TABLE ext` | case count |
-| `103` | `CALL` | procedure index |
-| `104` | `RETURN` | none |
-| `105` | `TRAP #0` | none |
-| `106` | `TRAP ext` | trap code |
-| `107` | `PUSH` | none |
-| `108` | `POP` | none |
-| `109` | `LOAD` | register index |
-| `110` | `STORE` | register index |
-| `111` | `CONST ext` | immediate value |
-| `112` | `CONST #0` | none |
-| `113` | `CONST #1` | none |
-| `114` | `CONST #2` | none |
-| `115` | `CONST #3` | none |
-| `116` | `CONST #4` | none |
-| `117` | `CONST #5` | none |
-| `118` | `CONST #6` | none |
-| `119` | `CONST #7` | none |
-| `120` | `CONST #8` | none |
-| `121` | `CONST #9` | none |
-| `122` | `CONST #10` | none |
-| `123` | `CONST #11` | none |
-| `124` | `CONST #12` | none |
-| `125` | `CONST #13` | none |
-| `126` | `CONST #14` | none |
-| `127` | `CONST #15` | none |
+| `92` | `SXTB` | none |
+| `93` | `SXTH` | none |
+| `94` | `UXTB` | none |
+| `95` | `UXTH` | none |
+| `96` | `BLOCK_END` | none |
+| `97` | `LOOP` | none |
+| `98` | `BR_TABLE #1` | none |
+| `99` | `BR_TABLE #2` | none |
+| `100` | `BR_TABLE ext` | case count |
+| `101` | `CALL` | procedure index |
+| `102` | `RETURN` | none |
+| `103` | `TRAP #0` | none |
+| `104` | `TRAP ext` | trap code |
+| `105` | `PUSH` | none |
+| `106` | `LOAD` | register index |
+| `107` | `STORE` | register index |
+| `108` | `CONST ext` | immediate value |
+| `109` | `CONST #0` | none |
+| `110` | `CONST #1` | none |
+| `111` | `CONST #2` | none |
+| `112` | `CONST #3` | none |
+| `113` | `CONST #4` | none |
+| `114` | `CONST #5` | none |
+| `115` | `CONST #6` | none |
+| `116` | `CONST #7` | none |
+| `117` | `CONST #8` | none |
+| `118` | `CONST #9` | none |
+| `119` | `CONST #10` | none |
+| `120` | `CONST #11` | none |
+| `121` | `CONST #12` | none |
+| `122` | `CONST #13` | none |
+| `123` | `CONST #14` | none |
+| `124` | `CONST #15` | none |
+| `125` | `MISC_CF` | sub-code |
+| `126` | `MISC_UNARY` | sub-code |
+| `127` | `MISC_BINARY` | sub-code |
 
 ---
 

@@ -14,7 +14,7 @@ import assert from "node:assert/strict"
 import { ir, proc } from "../src/ir"
 import { lowerProgram } from "../src/lower"
 import { validateProgram } from "../src/validate"
-import { bare, call, brTable, trap, PUSH, POP, CONST, LOAD, STORE, opStack, opImm, opRegWriteback } from "../src/rtl"
+import { bare, call, brTable, trap, PUSH, CONST, LOAD, STORE, opStack, opImm, opRegWriteback } from "../src/rtl"
 import type { RtlProgram, RtlProc } from "../src/rtl"
 
 describe("validateProgram — happy path (real pipeline)", () =>
@@ -48,7 +48,7 @@ describe("validateProgram — §8.3 stack-depth bound is the tight one, not the 
     // body. It pushes 3 more here, netting a local peak of 2 + 3 = 5.
     const callee: RtlProc = {
         argCount: 2,
-        body: [PUSH(), PUSH(), PUSH(), POP(), POP(), POP(), bare("RETURN")],
+        body: [PUSH(), PUSH(), PUSH(), ...Array.from({ length: 3 }, () => opStack("ADD", "POP_ACC")), bare("RETURN")],
     }
 
     // caller: argCount=0; first reaches a deep, call-unrelated peak of 10,
@@ -68,7 +68,7 @@ describe("validateProgram — §8.3 stack-depth bound is the tight one, not the 
         body: [
             CONST(0),
             ...Array.from({ length: 10 }, () => PUSH()),
-            ...Array.from({ length: 10 }, () => POP()),
+            ...Array.from({ length: 10 }, () => opStack("ADD", "POP_ACC")),
             PUSH(),
             call(1),
             bare("RETURN"),
@@ -102,7 +102,7 @@ describe("validateProgram — §8.3 stack-depth bound is the tight one, not the 
                 ...Array.from({ length: 9 }, () => PUSH()),
                 PUSH(), // tos now 10
                 call(1), // consumes stackArgsOf(2) = 1; tos back to 9
-                ...Array.from({ length: 9 }, () => POP()),
+                ...Array.from({ length: 9 }, () => opStack("ADD", "POP_ACC")),
                 bare("RETURN"),
             ],
         }
@@ -138,10 +138,12 @@ describe("validateProgram — §8.3 stack-depth bound is the tight one, not the 
 
 describe("validateProgram — §8.1 TOS balance", () =>
 {
-    test("POP below the procedure's own entry depth is rejected", () =>
+    test("a popping stack combo below the procedure's own entry depth is rejected", () =>
     {
-        const program: RtlProgram = { procedures: [{ argCount: 0, body: [POP(), bare("RETURN")] }] }
-        assert.throws(() => validateProgram(program), /underflow/)
+        const program: RtlProgram = {
+            procedures: [{ argCount: 0, body: [opStack("ADD", "POP_ACC"), bare("RETURN")] }],
+        }
+        assert.throws(() => validateProgram(program), /below this block's entry depth/)
     })
 
     test("a stack-combo op reading below entry depth is rejected", () =>
@@ -155,7 +157,7 @@ describe("validateProgram — §8.1 TOS balance", () =>
     test("a balanced push/pop pair around a call is fine", () =>
     {
         const callee: RtlProc = { argCount: 0, body: [CONST(0), bare("RETURN")] }
-        const caller: RtlProc = { argCount: 0, body: [CONST(1), PUSH(), POP(), bare("RETURN")] }
+        const caller: RtlProc = { argCount: 0, body: [CONST(1), PUSH(), opStack("ADD", "POP_ACC"), bare("RETURN")] }
         assert.doesNotThrow(() => validateProgram({ procedures: [caller, callee] }))
     })
 })

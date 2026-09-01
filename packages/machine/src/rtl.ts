@@ -156,7 +156,7 @@ export interface ExtOpPayload
  *      else → stack-combo
  *   4. `instr.op === "LOAD"/"STORE"`    → move-register (`target`)
  *   5. `instr.op === "CONST"`           → move-immediate (`imm`)
- *   6. else                              → bare (unary / PUSH / POP / control)
+ *   6. else                              → bare (unary / PUSH / control)
  *
  * `E` parameterizes only the `EXT` arm's payload — every other arm is
  * fixed, core ISA shape, entirely independent of which extension (if any)
@@ -189,9 +189,9 @@ export type BaseRtlInstr =
     // 3. Move-class, immediate: constant load. Small (0..15) vs extended is
     //    a cost distinction only (encoding.ts), not a type distinction.
     | { op: "CONST"; imm: number }
-    // 4. Bare: unary ALU (acc in place), no-operand move (PUSH/POP), and
+    // 4. Bare: unary ALU (acc in place), no-operand move (PUSH), and
     //    no-operand control flow.
-    | { op: UnaryOpcode | ControlOpcode | "PUSH" | "POP" }
+    | { op: UnaryOpcode | ControlOpcode | "PUSH" }
     // 5. Parametric: single numeric parameter (BR_TABLE case count, TRAP code).
     | { op: "BR_TABLE" | "TRAP"; imm: number }
     // 6. Call: procedure invocation by resolved procedure-table index
@@ -258,10 +258,6 @@ export const STORE = <E extends { ext: string } = ExtOpPayload>(target: number):
 /** `[tos++] ← acc` — push accumulator onto stack. */
 export const PUSH = <E extends { ext: string } = ExtOpPayload>(): RtlInstr<E> =>
     ({ op: "PUSH" })
-
-/** `acc ← [--tos]` — pop stack into accumulator. */
-export const POP = <E extends { ext: string } = ExtOpPayload>(): RtlInstr<E> =>
-    ({ op: "POP" })
 
 /** `acc ← #imm` — load constant into accumulator. */
 export const CONST = <E extends { ext: string } = ExtOpPayload>(imm: number): RtlInstr<E> =>
@@ -344,7 +340,7 @@ export interface RtlProgram<E extends { ext: string } = ExtOpPayload>
 //
 //   LOAD r0            move-class, register
 //   STORE r0           move-class, register
-//   PUSH / POP         move-class, bare
+//   PUSH               move-class, bare
 //   CONST #5           move-class, immediate
 //   ADD r0             <op> + REG_ACC
 //   ADD r0 → r0        <op> + REG_REG (write-back)
@@ -398,7 +394,7 @@ export function format(instr: RtlInstr): string
         return `${instr.op} ${instr.target}`
     if (instr.op === "CONST")
         return `CONST #${instr.imm}`
-    if (instr.op === "PUSH" || instr.op === "POP")
+    if (instr.op === "PUSH")
         return instr.op
 
     // 4. Bare unary/control

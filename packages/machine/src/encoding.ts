@@ -28,7 +28,9 @@ export function instrBytes<E extends { ext: string } = ExtOpPayload>(instr: RtlI
     if (instr.op === "CALL") return 2
     if (instr.op === "BR_TABLE" || instr.op === "TRAP") return 2
     if (instr.op === "LOAD" || instr.op === "STORE") return 2
-    if (instr.op === "PUSH" || instr.op === "POP") return 1
+    if (instr.op === "PUSH") return 1
+    // §5.3's MISC_UNARY escape: opcode byte plus a sub-code.
+    if (instr.op === "CLZ" || instr.op === "REVBITS") return 2
     if (instr.op === "CONST")
         return instr.imm >= 0 && instr.imm <= 15 ? 1 : 1 + leb128Bytes(instr.imm)
     if (!("combo" in instr)) return 1

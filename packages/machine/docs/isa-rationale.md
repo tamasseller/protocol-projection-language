@@ -82,11 +82,10 @@ every case with a terminator and the code after the construct *is* the
 default's, as docs/codec-extension.md §8.7's variant decoder does.) That was
 a legitimate §5.3 candidate while §5.3 still had codes to spend:
 `BR_TABLE` already takes three of the five local-flow codes, an exhaustive
-flavour needs two more, and the reserved pocket no longer has them to give
-(it went to the extend ops, below). What it would buy is small either way —
-the slot discipline costs one `PUSH` for the whole construct and one
-`STORE` per arm — and the price is now a revision of the encoding rather
-than a spare code.
+flavour needs two more, and the single-byte ranges are full. What it would
+buy is small either way — the slot discipline costs one `PUSH` for the whole
+construct and one `STORE` per arm — so it has not been taken; §5.3's
+`MISC_CF` escape is where it would go, at two bytes.
 
 **Bare block statements are excluded from the DSL.** A `{ ... }` is only
 reachable as the direct body of `if`/`else`/`while`/`for`. `BLOCK_END` is
@@ -139,14 +138,19 @@ special case.
 
 ## Opcode space
 
-**Every op is first-class, none quarantined to a second byte.** There is no
-"common" versus "rare" tier for arithmetic, comparison or unary ops.
+**Arithmetic and comparison stay flat; only the unary class is tiered.**
 Splitting a class into a compact subset plus an escape-byte overflow pays
-off only if the frequency split is right, and there is no corpus to measure
-against yet: guessing wrong adds a second encoding path for no savings.
-Treating every op in a class identically keeps the op tables flat and keeps
-the lowerer's cost model from needing to know which ops are expensive to
-select.
+off only if the frequency split is right, and for the two big classes there
+is still no corpus that says which ops are rare — guessing wrong adds a
+second encoding path for no savings, so all 50 and all 40 codes stay
+single-byte and the lowerer's cost model never has to know which ops are
+expensive to select.
+
+The unary class is the one place a split is actually measured rather than
+guessed: `CLZ` and `REVBITS` appear in no benchmark workload and in no
+codec, while `NEG`, `NOT` and the four extend ops are on ordinary
+expression paths. That is a frequency claim with evidence behind it, so
+those two sit behind §5.3's `MISC_UNARY` escape and the other six do not.
 
 **Arithmetic's immediate operand has no small form; comparison's does.**
 The right constant to special-case for `ADD` is not the right one for
@@ -159,30 +163,45 @@ single-byte form. One is a justified universal case, the other would be a
 per-operator guess.
 
 **The core opcode space is a flat range dispatch, not a bit-prefix tree.**
-Each instruction class's size is its actual op × mode count (50, 40, 8, 5,
-4, 21), not rounded up to a power of two. Those sizes don't nest under a
+Each instruction class's size is its actual op × mode count (50, 40, 6, 5,
+4, 20), not rounded up to a power of two. Those sizes don't nest under a
 cascading single-bit split the way equal halves would, so the decoder is a
 handful of numeric range checks or one 128-entry table instead of bit
 masking, and is simpler to implement and verify. The 128-code budget is
-exactly consumed.
+exactly consumed, the last three codes going to §5.3's escapes.
 
-**The reserved pocket is spent.** Four codes were once held back
-(isa-core.md §5.3) for one specific, later, *measured* addition. That
-addition turned out to be §4.3's `SXTB`/`SXTH`/`UXTB`/`UXTH`, which the
-narrow integer types need: a narrow variable holds an already-extended
-word, so every write into one costs an extend, and the composites those
-ops replace (`SHL #24; ASR #24`, `AND #0xff`) are 3-4 bytes each against
-one. Rather than leaving the unary class split across two ranges, taking
-the pocket renumbered everything above byte 93 — a decoder built against
-the earlier layout is wrong from there up, not merely on four codes.
+**Three escape codes instead of a reserved pocket.** Codes were once held
+back for one specific, later, *measured* addition, which turned out to be
+§4.3's `SXTB`/`SXTH`/`UXTB`/`UXTH`. That worked exactly once: a pocket is
+spent the first time it is used, and the next addition has nowhere to go
+without renumbering the space again.
 
-The candidate this displaced was a constant-synthesis op for low-entropy
-value shapes (powers of two, all-ones masks, contiguous bit masks): a
-single `MASK(width, offset)` packing both parameters into one trailing
-byte, subsuming a 4-6 byte extended `CONST` at 2 bytes. It was never
-adopted — no corpus showed those shapes appearing often enough, the same
-unmeasured bet the per-op arithmetic literal table was rejected for — and
-it now needs a spec revision rather than a free slot.
+Escapes replace it, and are strictly better for the same three bytes: a
+sub-code space per class that never runs out, at a cost of one extra byte
+only on the ops that live there. What goes behind an escape is therefore a
+frequency judgement rather than a budget one — a two-byte op is the right
+price for something rare, and the wrong one for something in every loop.
+
+`CLZ`/`REVBITS` moved there on exactly that basis. Neither appears in any
+benchmark workload, both are one instruction on the target anyway, and both
+already reach a helper vector in `jit-armv6m` (`triggersLRSave`,
+`proc_scan.cpp`) — so a second byte is noise against what they already
+cost. `POP` was dropped outright rather than moved: it had no producer
+anywhere in the toolchain, because every stack operand is consumed by the
+combo that reads it and every block's `BLOCK_END` reclaims the rest.
+
+`MISC_BINARY` is held empty for the general-computing arithmetic the core
+should own rather than push onto a *domain* extension — `UDIV`/`IDIV`/`MOD`
+above all, which the DSL currently has no lowering for at all
+(`docs/dsl-limitations.md`).
+
+The candidate the original pocket displaced was a constant-synthesis op for
+low-entropy value shapes (powers of two, all-ones masks, contiguous bit
+masks): a single `MASK(width, offset)` packing both parameters into one
+trailing byte, subsuming a 4-6 byte extended `CONST` at 2 bytes. It was
+never adopted — no corpus showed those shapes appearing often enough, the
+same unmeasured bet the per-op arithmetic literal table was rejected for —
+and `MISC_UNARY` is now where it would go if one ever did.
 
 ---
 

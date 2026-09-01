@@ -327,13 +327,6 @@ function runProc<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E
                 pc++
                 break
 
-            case "POP":
-                assert.ok(tos > 0, `POP with empty stack`)
-                acc = regs[--tos] ?? 0
-                accLive = true
-                pc++
-                break
-
             case "CONST":
                 acc = i.imm >>> 0
                 accLive = true

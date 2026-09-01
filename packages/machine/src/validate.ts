@@ -171,12 +171,6 @@ function walkProcedure<E extends { ext: string } = ExtOpPayload>(
 
             if(instr.op === "PUSH") { requireAcc("PUSH"); tos++; pc++; continue }
 
-            if(instr.op === "POP")
-            {
-                if(tos <= entryTos) fail(pc, `POP would underflow below this block's entry depth (${entryTos})`)
-                tos--; accLive = true; pc++; continue
-            }
-
             if(isStackComboInstr(instr))
             {
                 if(tos <= entryTos)

@@ -335,16 +335,6 @@ class Raiser<E extends { ext: string } = ExtOpPayload>
                     this.pc++
                     continue
 
-                case "POP":
-                {
-                    if(this.tos <= 0) throw new Error(`raise: POP with empty stack at pc ${this.pc}`)
-                    this.killAcc(stmts)
-                    this.tos--
-                    this.setAcc(slotExpr(this.tos), true)
-                    this.pc++
-                    continue
-                }
-
                 case "ADD": case "SUB": case "RSUB": case "MUL":
                 case "AND": case "OR": case "XOR": case "SHL": case "SHR": case "ASR":
                 case "EQ": case "NE":

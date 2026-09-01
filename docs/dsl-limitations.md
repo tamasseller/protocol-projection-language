@@ -17,6 +17,11 @@ constant power-of-two divisor is `SHR #k` / `AND #(2ᵏ−1)` and would be a
 fold rule, and an application with a divider in native code can expose it
 as an extension op.
 
+There is now somewhere for a real one to go: isa-core.md §5.3's
+`MISC_BINARY` escape is held empty for exactly this, so `UDIV`/`IDIV`/`MOD`
+would be a sub-code assignment rather than another renumbering of the
+opcode space.
+
 ## A `for` init's register outlives its name
 
 `for(u32 i = 0; …)` scopes `i` to the loop; its register is not reclaimed
