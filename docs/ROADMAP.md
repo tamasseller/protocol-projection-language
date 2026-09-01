@@ -289,7 +289,8 @@ point; choosing what to do with it is real target-codegen work.
 leaves, `grammer.pegjs`'s recursive-descent parser dominates wall-clock
 time; `tileExpr` is flat in tree width. Not investigated further.
 
-**The DSL surface has gaps the grammar does not reject.** docs/dsl-gaps.md
-lists them case by case, reproduced: four produce wrong programs that
-validate, one crashes, the rest are clean refusals. Signed types and the
-ternary, both listed here before, are done.
+**The DSL has three limitations that follow from the ISA.** docs/dsl-gaps.md
+states each with what to write instead: no divide (write the helper), a
+`for` init's register outliving its name (C's own equivalence, minus the
+bare block this DSL excludes), and no spelling for a no-op `switch` case.
+The audit that found them also closed everything else it found.
