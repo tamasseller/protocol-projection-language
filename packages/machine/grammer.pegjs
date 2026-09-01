@@ -235,11 +235,26 @@ ArgumentList
 // ---------------------------------------------------------------------
 Literal
   = HexLiteral
+  / BinaryLiteral
+  / OctalLiteral
   / DecimalLiteral
 
 HexLiteral
   = "0x"i digits:$[0-9a-fA-F]+ { 
       return { type: "Literal", value: parseInt(digits, 16), raw: text() }; 
+    }
+
+BinaryLiteral
+  = "0b"i digits:$[01]+ {
+      return { type: "Literal", value: parseInt(digits, 2), raw: text() };
+    }
+
+// C reads a leading zero as octal; this DSL has no octal literals, so it
+// rejects the spelling rather than silently disagreeing with C about what
+// `010` means. Plain `0` is a DecimalLiteral — this needs a digit after it.
+OctalLiteral
+  = "0" digits:$[0-9]+ {
+      error(`leading zeros are not allowed ('0${digits}' is octal in C, and this DSL has no octal literals)`);
     }
 
 DecimalLiteral

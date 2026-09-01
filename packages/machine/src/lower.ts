@@ -2,12 +2,9 @@
  * @ppl/machine — Statement lowering pass
  *
  * Converts a parsed AST fragment (Statement[]) into a ResolvedProc with
- * numerical register indices and flattened control flow.
- *
- * Pipeline:
- *   1. Walk declarations to allocate registers (name → index).
- *   2. Walk statements, emitting RtlInstr[] with control flow.
- *   3. Expression sub-trees lowered via lowerExpr + register resolution.
+ * numerical register indices and flattened control flow: walk the
+ * statements, allocating a register per declaration (scope.ts) and
+ * emitting each expression through `lowerExpression` below.
  *
  * `lowerProc` handles one standalone body; `lowerProgram` handles a
  * `Procedure` plus everything it transitively calls, resolving each `CALL`
@@ -15,119 +12,44 @@
  * (ROADMAP.md item 2).
  */
 
-import {lowerExpr, lowerStatementExpr} from "./orchestrator"
-import type {EastExpression} from "./east"
 import type {
     Statement, ControlBody, IfStatement, WhileStatement,
     ForStatement, SwitchStatement, VariableDeclaration, ReturnStatement,
-    ExpressionStatement, Expression, ConditionalExpression, Identifier,
+    ExpressionStatement, Expression,
 } from "./ast"
-import {recurseOver, mapOver} from "./ast"
-import {RtlProc, RtlProgram, RtlInstr, bare, brTable, CONST, PUSH, STORE} from "./rtl"
+import {RtlProc, RtlProgram, RtlInstr, bare, brTable, CONST, PUSH, LOAD, opImm} from "./rtl"
 import type {ExtOpPayload} from "./rtl"
+import type {RtlNode} from "./east"
 import type {Procedure} from "./ir"
 import assert from "assert"
-import {Rule, ruleset} from "./rules"
-import {annotate, annotateInto, typeOfExpr} from "./types"
-import type {TypeEnv} from "./types"
-import type {PrimType} from "./ast"
+import {RegAlloc} from "./scope"
+import {desugar} from "./desugar"
+import {lift} from "./lift"
+import {tileExpression, isTrapCall} from "./expr"
+import type {TileRequest} from "./expr"
 import type {Extension} from "./extension"
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Register allocator
+// The expression pipeline
 // ─────────────────────────────────────────────────────────────────────────────
 
-class RegAlloc<E extends { ext: string } = ExtOpPayload> implements TypeEnv
+/**
+ * Every expression in the DSL is lowered here and nowhere else, in four
+ * phases: rewrite the derived operators (desugar.ts), lift what cannot be
+ * tiled in place into code ahead of the expression (lift.ts), annotate
+ * types and optionally invert for a dispatch test (expr.ts), tile under the
+ * demand (orchestrator.ts). Sites differ only in that demand, and in
+ * whether the value is used at all, so they say only that.
+ *
+ * `fragment` is the whole thing in order, lifted branches first. `node` is
+ * the tiling, for the one caller that needs its stack effect.
+ */
+function lowerExpression<E extends { ext: string } = ExtOpPayload>(expr: Expression, scope: RegAlloc<E>, req: TileRequest): {fragment: RtlInstr<E>[]; node: RtlNode<E>}
 {
-    private map = new Map<string, number>()
-    private types = new Map<string, PrimType>()
-    private next: number
+    const lifted = lift(desugar(expr, req.demand !== "statement"), scope)
+    const node = tileExpression(lifted.expr, scope, req)
 
-    /**
-     * A nested scope's numbering continues from its parent's current count
-     * rather than restarting at 0. This matters because the ISA resets TOS
-     * to a block's entry depth at its `BLOCK_END` (isa-core.md §15.1): once
-     * this scope's own block closes, its locals are gone and the parent
-     * resumes allocating from exactly where it left off. If a child instead
-     * renumbered from 0, its locals would alias whatever the parent (or an
-     * argument) already put at those low indices.
-     */
-    constructor(
-        private _parent?: RegAlloc<E>,
-        private _resolveCallee?: (name: string) => number | undefined,
-        private _extension?: Extension<E>,
-        base?: number,
-    )
-    {
-        this.next = base ?? _parent?.next ?? 0
-    }
-
-    /** How far TOS has grown by the time this scope's next allocation
-     *  lands — the index that allocation will get. */
-    get depth(): number {return this.next}
-
-    get parent(): RegAlloc<E> | undefined {return this._parent}
-
-    /** A nested scope (`new RegAlloc(alloc)`, no second argument) has no
-     *  callee resolver of its own — it inherits the enclosing procedure's,
-     *  the same way it inherits register numbering via `parent`. Returning
-     *  `undefined` (rather than throwing) for a name it can't place is
-     *  deliberate: `callRule` (rules.ts) treats that as "not a viable
-     *  candidate here," which is what lets a builtin call (`clz`, `trap`,
-     *  `revbits`) fall through to its own dedicated rule instead of every
-     *  call site hard-failing on names that were never meant to resolve
-     *  against a procedure table. */
-    get resolveCallee(): (name: string) => number | undefined
-    {
-        return this._resolveCallee
-            ?? this._parent?.resolveCallee
-            ?? (() => undefined)
-    }
-
-    /** A nested scope has no `Extension` of its own — it inherits the
-     *  enclosing procedure's, same as `resolveCallee`. */
-    get extension(): Extension<E> | undefined
-    {
-        return this._extension ?? this._parent?.extension
-    }
-
-    /** Allocate a named variable, returning its index. Idempotent. */
-    alloc(name: string, varType: PrimType = "u32"): number
-    {
-        let idx = this.map.get(name)
-        if(idx === undefined)
-        {
-            idx = this.next++
-            this.map.set(name, idx)
-        }
-        this.types.set(name, varType)
-        return idx
-    }
-
-    /** The declared type of `name`, through enclosing scopes the way
-     *  `resolve` goes. Undefined for a procedure argument, which is a plain
-     *  word — types.ts supplies that default. */
-    typeOf(name: string): PrimType | undefined
-    {
-        return this.types.get(name) ?? this._parent?.typeOf(name)
-    }
-
-    /** Map a string register name to its allocated index. */
-    resolve(name: string): number | undefined
-    {
-        const own = this.map.get(name)
-        if(own !== undefined) return own
-        return this._parent?.resolve(name)
-    }
-
-    rules(): Rule<E>[]
-    {
-        return ruleset<E>(
-            name => this.resolve(name) ?? (() => {throw new Error(`Unresolved variable: ${name}`)})(),
-            this.resolveCallee,
-            this.extension,
-        )
-    }
+    return {fragment: [...lifted.prelude, ...node.fragment], node}
 }
 
 /** Lower a single, standalone procedure body — the common case for tests
@@ -177,10 +99,18 @@ export function lowerProgram<E extends { ext: string } = ExtOpPayload>(entry: Pr
         // `revbits`) or an extension call, which this pass knows nothing
         // about; returning `undefined` lets that call site's own rule win
         // instead (see RegAlloc.resolveCallee's doc comment).
-        const alloc = new RegAlloc<E>(undefined, name =>
+        const alloc = new RegAlloc<E>(undefined, (name, argCount) =>
         {
             const callee = target.fragment.calls.get(name)
-            return callee && resolve(callee)
+            if(!callee) return undefined
+
+            // `argCount` is a plain `CALL` site's own arity. An extension op
+            // that resolves a name to an index without passing one (a codec
+            // invocation) has its own ABI, and is not checked here.
+            if(argCount !== undefined && argCount !== callee.args.length)
+                throw new Error(`Call to '${name}' passes ${argCount} argument(s), but it takes ${callee.args.length}`)
+
+            return resolve(callee)
         }, extension)
         for(const arg of target.args) alloc.alloc(arg)
 
@@ -233,25 +163,26 @@ function lowerControlBody<E extends { ext: string } = ExtOpPayload>(body: Contro
 
 function lowerExprStmt<E extends { ext: string } = ExtOpPayload>(s: ExpressionStatement, alloc: RegAlloc<E>): RtlInstr<E>[]
 {
-    // The statement's value is discarded, so demand "acc" specifically
-    // would be needlessly strict — it would exclude a cheaper tiling whose
-    // result lands directly in a register write-back (e.g. `x = x op e`,
-    // rules.ts). lowerStatementExpr allows any TOS-neutral output instead.
-    const h = hoistTernaries(s.expression, alloc)
-    const e = lowerStatementExpr(annotate(h.expr, alloc) as EastExpression<E>, alloc.rules())
-    assert.ok(e, `Failed to lower expression statement`)
-
-    return [...h.prelude, ...e.fragment]
+    return lowerExpression(s.expression, alloc,
+        {demand: "statement", what: "expression statement"}).fragment
 }
 
 function lowerVarDecl<E extends { ext: string } = ExtOpPayload>(s: VariableDeclaration, alloc: RegAlloc<E>): RtlInstr<E>[]
 {
     return s.declarations.map(d =>
     {
-        const h = hoistTernaries(d.init!, alloc)
-        const init = annotateInto(h.expr, alloc, d.varType)
-        const node = lowerExpr(init as EastExpression<E>, alloc.rules(), "tos")
-        assert.ok(node, `Failed to lower variable initializer for ${d.id.name}`)
+        // No initializer: the slot still has to exist, and `PUSH` needs a
+        // value in acc to establish it — the ISA has no "reserve
+        // uninitialized". Zero, rather than whatever acc happened to hold,
+        // which may not even be live here (isa-core.md §8.7).
+        if(!d.init)
+        {
+            alloc.alloc(d.id.name, d.varType)
+            return [CONST<E>(0), PUSH<E>()]
+        }
+
+        const {fragment, node} = lowerExpression(d.init, alloc,
+            {demand: "tos", into: d.varType, what: `variable initializer for ${d.id.name}`})
 
         // A "tos"-demand tiling's cheapest winner always nets exactly one
         // push: every stack-combining rule only ever offers net-neutral
@@ -267,7 +198,7 @@ function lowerVarDecl<E extends { ext: string } = ExtOpPayload>(s: VariableDecla
             `the winning tiling should always be a single net push; this indicates a lowerer bug, not a case to handle`)
         alloc.alloc(d.id.name, d.varType)
 
-        return [...h.prelude, ...node.fragment]
+        return fragment
     }).flat()
 }
 
@@ -275,10 +206,9 @@ function lowerReturn<E extends { ext: string } = ExtOpPayload>(s: ReturnStatemen
 {
     if(s.argument)
     {
-        const h = hoistTernaries(s.argument, alloc)
-        const node = lowerExpr(annotate(h.expr, alloc) as EastExpression<E>, alloc.rules(), "acc")
-        assert.ok(node, `Failed to lower return expression`)
-        return [...h.prelude, ...node.fragment, bare("RETURN")]
+        const {fragment} = lowerExpression(s.argument, alloc,
+            {demand: "acc", what: "return expression"})
+        return [...fragment, bare("RETURN")]
     }
 
     // A bare `return;` has no source-level value, but the bytecode-level
@@ -291,111 +221,6 @@ function lowerReturn<E extends { ext: string } = ExtOpPayload>(s: ReturnStatemen
     // producer makes this correct regardless of what's live going in; the
     // value itself is never observed by any caller of a void return.
     return [CONST(0), bare("RETURN")]
-}
-
-function logicInvertRoot(expr: EastExpression): EastExpression
-{
-    if(expr.type === "BinaryExpression")
-    {
-        switch(expr.operator)
-        {
-            case "==": return {...expr, operator: "!="}
-            case "!=": return {...expr, operator: "=="}
-            case "<": return {...expr, operator: ">="}
-            case "<=": return {...expr, operator: ">"}
-            case ">": return {...expr, operator: "<="}
-            case ">=": return {...expr, operator: "<"}
-        }
-    }
-
-    // Fallback for a non-comparison test (e.g. `if (x) ...`, `if (foo()) ...`):
-    // invert via `expr == 0`. There is no logical-NOT opcode; comparing
-    // against zero is exactly the ISA's lenient truthy test (isa-core.md
-    // §3.2) run in reverse, and reuses the existing EQ rules rather than
-    // needing a dedicated `!` lowering rule.
-    return {
-        type: "BinaryExpression", operator: "==", left: expr,
-        right: {type: "Literal", value: 0, raw: "0"},
-    } as EastExpression
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Ternary
-// ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * Lift every `ConditionalExpression` out of `expr`, returning the branch
- * code to emit ahead of it and what is left once each one has become a
- * reference to the slot its branch wrote.
- *
- * A split clobbers acc (isa-core.md §8.7), so a value-producing branch
- * cannot hand its result over in acc: the slot is reserved *before* the
- * dispatch, since one pushed inside a case is dropped again by that case's
- * own `BLOCK_END` (§8.1). Lifting only moves evaluation across operands of
- * one expression, which C leaves unsequenced; a ternary in another's arm
- * is lifted into that arm's block instead, so it stays conditional.
- */
-function hoistTernaries<E extends { ext: string } = ExtOpPayload>(expr: Expression, alloc: RegAlloc<E>): {prelude: RtlInstr<E>[]; expr: Expression}
-{
-    if(!hasConditional(expr)) return {prelude: [], expr}
-
-    const prelude: RtlInstr<E>[] = []
-    return {prelude, expr: hoist(expr, alloc, prelude)}
-}
-
-function hasConditional(e: Expression): boolean
-{
-    return e.type === "ConditionalExpression"
-        || recurseOver(e, hasConditional, (...v) => v.includes(true), false)
-}
-
-function hoist<E extends { ext: string } = ExtOpPayload>(e: Expression, alloc: RegAlloc<E>, out: RtlInstr<E>[]): Expression
-{
-    if(!hasConditional(e)) return e
-
-    return e.type === "ConditionalExpression"
-        ? hoistConditional(e, alloc, out)
-        : mapOver(e, c => hoist(c, alloc, out))
-}
-
-function hoistConditional<E extends { ext: string } = ExtOpPayload>(e: ConditionalExpression, alloc: RegAlloc<E>, out: RtlInstr<E>[]): Identifier
-{
-    // Complementary test, exactly as `lowerIf`: `acc = 0` selects the
-    // consequent, matching §7.1's arm order, and a comparison is what makes
-    // acc exactly 0 or 1 for an index-exact `BR_TABLE 2`.
-    const test = lowerExpr(logicInvertRoot(annotate(hoist(e.test, alloc, out), alloc) as EastExpression) as EastExpression<E>, alloc.rules(), "acc")
-    assert.ok(test, `Failed to lower ternary condition`)
-
-    // The reserving PUSH carries the test value — arbitrary, since both
-    // arms overwrite the slot, and `PUSH` leaves acc live for the dispatch.
-    const name = `?${alloc.depth}`
-    const slot = alloc.alloc(name, typeOfExpr(e, alloc))
-
-    out.push(
-        ...test.fragment,
-        PUSH<E>(),
-        brTable(2),
-        ...ternaryArm(e.consequent, slot, new RegAlloc<E>(alloc)),
-        ...ternaryArm(e.alternate, slot, new RegAlloc<E>(alloc)),
-    )
-
-    return {type: "Identifier", name}
-}
-
-function ternaryArm<E extends { ext: string } = ExtOpPayload>(arm: Expression, slot: number, scope: RegAlloc<E>): RtlInstr<E>[]
-{
-    const inner: RtlInstr<E>[] = []
-    const rewritten = hoist(arm, scope, inner)
-
-    const node = lowerExpr(annotate(rewritten, scope) as EastExpression<E>, scope.rules(), "acc")
-    assert.ok(node, `Failed to lower ternary arm`)
-
-    // A `trap(...)` arm closes its own case (isa-core.md §4.5); a
-    // `STORE`/`BLOCK_END` after it would be unreachable, and the stray
-    // `BLOCK_END` would be read as the *next* case's close.
-    return isTrapCall(arm)
-        ? [...inner, ...node.fragment]
-        : [...inner, ...node.fragment, STORE<E>(slot), bare("BLOCK_END")]
 }
 
 /**
@@ -420,15 +245,6 @@ function ternaryArm<E extends { ext: string } = ExtOpPayload>(arm: Expression, s
  * direct `return`/`trap` *is* this slot's own close, with nothing to
  * desync.
  */
-/** `trap(code);` — like `return`, a terminator (isa-core.md §4.5), but
- *  parsed as an ordinary call (§10.5: `trap` is a function, not a
- *  keyword), so there's no dedicated AST node to switch on; it's
- *  recognized structurally by callee name instead. */
-function isTrapCall(expr: Expression): boolean
-{
-    return expr.type === "CallExpression" && expr.callee.name === "trap"
-}
-
 function alwaysTerminates(stmts: readonly Statement[]): boolean
 {
     const last = stmts[stmts.length - 1]
@@ -459,16 +275,11 @@ function closeControlBody<E extends { ext: string } = ExtOpPayload>(body: Contro
 
 function lowerIf<E extends { ext: string } = ExtOpPayload>(s: IfStatement, alloc: RegAlloc<E>): RtlInstr<E>[]
 {
-    // BR_TABLE is index-exact (isa-core.md §4.5), not lenient like a raw
-    // truthy test, so `acc` must be forced to exactly 0/1 first. Arm order
-    // then matches §7.1: case[0] = then, case[1] = else.
-    //
     // A scope snapshots its parent's numbering at construction, so the test
     // is lowered before either branch's: a ternary in it allocates a slot
     // one built earlier would renumber over.
-    const h = hoistTernaries(s.test, alloc)
-    const test = lowerExpr(logicInvertRoot(annotate(h.expr, alloc) as EastExpression) as EastExpression<E>, alloc.rules(), "acc")
-    assert.ok(test, `Failed to lower if test expression`)
+    const test = lowerExpression(s.test, alloc,
+        {demand: "acc", invert: true, what: "if test expression"})
 
     const thenTerm = lowerControlBody(s.consequent, new RegAlloc<E>(alloc))
     assert.ok(thenTerm, `Failed to lower then branch`)
@@ -479,7 +290,6 @@ function lowerIf<E extends { ext: string } = ExtOpPayload>(s: IfStatement, alloc
         assert.ok(elseTerm, `Failed to lower else branch`)
 
         return [
-            ...h.prelude,
             ...test.fragment,
             brTable(2),
             ...closeControlBody(s.consequent, thenTerm),
@@ -488,34 +298,154 @@ function lowerIf<E extends { ext: string } = ExtOpPayload>(s: IfStatement, alloc
     }
 
     return [
-        ...h.prelude,
         ...test.fragment,
         brTable(1),
         ...closeControlBody(s.consequent, thenTerm),
     ]
 }
 
+/**
+ * Roughly what one link of the compare chain costs in bytes: a `LOAD` of
+ * the discriminant, the comparison, the `BR_TABLE 2`, and the two
+ * `BLOCK_END`s that close its arms.
+ *
+ * It is the whole grouping rule. A gap inside a table costs exactly one
+ * byte per missing label (an empty case is a lone `BLOCK_END`), so two
+ * runs are worth merging into one table whenever the gap between them is
+ * cheaper than the chain link that would otherwise separate them.
+ */
+const CHAIN_LINK_BYTES = 8
+
+/** Ascending labels into runs — a label is a *value*, not a position, so
+ *  only consecutive ones map onto `BR_TABLE`'s index directly. */
+function switchGroups(labels: readonly number[]): number[][]
+{
+    const groups: number[][] = [[labels[0]!]]
+
+    for(const label of labels.slice(1))
+    {
+        const group = groups[groups.length - 1]!
+        const gap = label - group[group.length - 1]! - 1
+
+        if(gap < CHAIN_LINK_BYTES) group.push(label)
+        else groups.push([label])
+    }
+
+    return groups
+}
+
+function caseLabel(test: Expression): number
+{
+    if(test.type !== "Literal")
+        throw new Error(`A switch case label must be an integer literal`)
+
+    return test.value >>> 0
+}
+
 function lowerSwitch<E extends { ext: string } = ExtOpPayload>(s: SwitchStatement, alloc: RegAlloc<E>): RtlInstr<E>[]
 {
-    const h = hoistTernaries(s.discriminant, alloc)
-    const disc = lowerExpr(annotate(h.expr, alloc) as EastExpression<E>, alloc.rules(), "acc")
-    assert.ok(disc, `Failed to lower switch discriminant expression`)
+    const disc = lowerExpression(s.discriminant, alloc,
+        {demand: "acc", what: "switch discriminant expression"})
 
-    const cases = s.cases.filter(c => c.test !== null)
-    const defaultCase = s.cases.find(c => c.test === null)
-    const N = cases.length
+    const labelled = s.cases.filter(c => c.test !== null)
+    const defaults = s.cases.filter(c => c.test === null)
+
+    if(defaults.length > 1) throw new Error(`A switch has more than one default clause`)
+    if(labelled.length === 0) throw new Error(`A switch needs at least one case`)
+
+    const seen = new Set<number>()
+    const sorted = labelled
+        .map(c =>
+        {
+            const label = caseLabel(c.test!)
+
+            if(seen.has(label)) throw new Error(`Duplicate switch case label ${label}`)
+            seen.add(label)
+
+            // In C this would fall through into the next case. There is no
+            // opcode for that (isa-core.md §4.5) and no way to reach one
+            // case's code from another, so the idiom is rejected rather
+            // than silently lowered as "do nothing for this label".
+            if(c.consequent.length === 0)
+                throw new Error(`Empty body for case ${label}: this DSL has no fallthrough — give the label its own statements, ` +
+                    `or omit it to let that value reach the default`)
+
+            return {label, stmts: c.consequent}
+        })
+        .sort((a, b) => a.label - b.label)
+
+    const groups = switchGroups(sorted.map(c => c.label))
+
+    // A chain needs the discriminant more than once, and acc does not
+    // survive the first split (isa-core.md §8.7) — so it goes to a slot,
+    // reserved by the `PUSH` that stores it. One group needs no chain, so
+    // it dispatches straight out of acc.
+    const chained = groups.length > 1
+    const slot = chained ? alloc.alloc(`?${alloc.depth}`) : -1
+
+    // Case scopes are built after that allocation: a scope snapshots its
+    // parent's numbering (scope.ts), so one built earlier would sit on the
+    // discriminant's own slot.
+    const bodyOf = new Map<number, RtlInstr<E>[]>()
+    for(const c of sorted)
+    {
+        const body = lowerBlock(c.stmts, new RegAlloc<E>(alloc))
+        assert.ok(body, `Failed to lower switch case ${c.label}`)
+        bodyOf.set(c.label, closeBlock(c.stmts, body))
+    }
+
+    const load = (): RtlInstr<E>[] => [LOAD<E>(slot)]
+    const shift = (lo: number): RtlInstr<E>[] => lo === 0 ? [] : [opImm<E>("SUB", lo)]
+
+    /** One group as a `BR_TABLE` over `label - lo`, gaps included: an
+     *  absent label's slot is an empty case, which exits the construct
+     *  exactly as an out-of-range discriminant does. */
+    function table(group: number[], from: RtlInstr<E>[]): RtlInstr<E>[]
+    {
+        const lo = group[0]!
+        const span = group[group.length - 1]! - lo + 1
+        const filled = [...Array(span)].map((_, i) =>
+            bodyOf.get(lo + i) ?? [bare<E>("BLOCK_END")])
+
+        return [...from, ...shift(lo), brTable(span), ...filled.flat()]
+    }
+
+    /** Groups after the first are reached through a test on the previous
+     *  one's failure. The last needs none: `BR_TABLE`'s own out-of-range
+     *  case already means "none of these", which is what the default is. */
+    function chain(index: number): RtlInstr<E>[]
+    {
+        const group = groups[index]!
+        if(index === groups.length - 1) return table(group, load())
+
+        const lo = group[0]!
+        const span = group[group.length - 1]! - lo + 1
+
+        // Complementary test, as everywhere a `BR_TABLE` dispatches
+        // (isa-core.md §7.3): acc = 0 selects case[0], this group.
+        //
+        // A lone label needs no table behind its test — passing it *is* the
+        // dispatch, so case[0] is the body itself.
+        if(span === 1)
+            return [
+                ...load(), opImm<E>("NE", lo),
+                brTable(2),
+                ...bodyOf.get(lo)!,
+                ...chain(index + 1), bare("BLOCK_END"),
+            ]
+
+        return [
+            ...load(), ...shift(lo), opImm<E>("GT_U", span - 1),
+            brTable(2),
+            ...table(group, load()), bare("BLOCK_END"),
+            ...chain(index + 1), bare("BLOCK_END"),
+        ]
+    }
 
     return [
-        ...h.prelude,
         ...disc.fragment,
-        brTable(N),
-        ...cases.flatMap(c =>
-        {
-            const blockTerm = lowerBlock(c.consequent, new RegAlloc<E>(alloc))
-            assert.ok(blockTerm, `Failed to lower switch case`)
-            return closeBlock(c.consequent, blockTerm)
-        }),
-        ...(defaultCase ? lowerBlock(defaultCase.consequent, new RegAlloc<E>(alloc)) : []),
+        ...(chained ? [PUSH<E>(), ...chain(0)] : table(groups[0]!, [])),
+        ...(defaults[0] ? lowerBlock(defaults[0].consequent, new RegAlloc<E>(alloc)) : []),
     ]
 }
 
@@ -526,17 +456,14 @@ function lowerWhile<E extends { ext: string } = ExtOpPayload>(s: WhileStatement,
     // drops it again (isa-core.md §8.1), so the scope holding it must be a
     // child, or the body would number its locals above a slot that is gone
     // by the time the body runs.
-    const cond = new RegAlloc<E>(alloc)
-    const h = hoistTernaries(s.test, cond)
-    const test = lowerExpr(annotate(h.expr, cond) as EastExpression<E>, cond.rules(), "acc")
-    assert.ok(test, `Failed to lower while test expression`)
+    const test = lowerExpression(s.test, new RegAlloc<E>(alloc),
+        {demand: "acc", what: "while test expression"})
 
     const bodyTerm = lowerControlBody(s.body, new RegAlloc<E>(alloc))
     assert.ok(bodyTerm, `Failed to lower while body`)
 
     return [
         bare("LOOP"),
-        ...h.prelude,
         ...test.fragment,
         bare("BLOCK_END"),
         ...closeControlBody(s.body, bodyTerm),
@@ -545,26 +472,31 @@ function lowerWhile<E extends { ext: string } = ExtOpPayload>(s: WhileStatement,
 
 function lowerFor<E extends { ext: string } = ExtOpPayload>(s: ForStatement, alloc: RegAlloc<E>): RtlInstr<E>[]
 {
-    const init: RtlInstr<E>[] | undefined = (s.init) ?
+    // C scopes a `for` init's declarations to the loop, but their registers
+    // live until the enclosing block ends — nothing pops them at the
+    // back-edge. So they get a scope of their own for name visibility, and
+    // the enclosing scope is told to number past them at the end.
+    const loop = new RegAlloc<E>(alloc)
+
+    const init: RtlInstr<E>[] = (s.init) ?
         (s.init.type === "VariableDeclaration")
-            ? lowerVarDecl(s.init, alloc)
-            : lowerExprStmt({type: "ExpressionStatement", expression: s.init}, alloc)
+            ? lowerVarDecl(s.init, loop)
+            : lowerExprStmt({type: "ExpressionStatement", expression: s.init}, loop)
         : []
 
     // Unlike init/update (discarded), the condition's value feeds the
     // LOOP's condition-block test directly — it must land in acc, same as
     // lowerWhile's test. Demanding acc specifically (not lowerExprStmt's
     // relaxed "any TOS-neutral output") is required here, not optional.
-    const cond = new RegAlloc<E>(alloc)
-    const test = s.test ? (() =>
-    {
-        const h = hoistTernaries(s.test!, cond)
-        const node = lowerExpr(annotate(h.expr, cond) as EastExpression<E>, cond.rules(), "acc")
-        assert.ok(node, `Failed to lower for-loop test expression`)
-        return [...h.prelude, ...node.fragment]
-    })() : []
+    // An omitted test is C's `for(;;)`: always true. The condition block
+    // must still produce a value — its `BLOCK_END` is the dispatch and
+    // reads acc (isa-core.md §8.7), so leaving it empty would branch on
+    // whatever happened to be live.
+    const testExpr: Expression = s.test ?? {type: "Literal", value: 1, raw: "1"}
+    const test = lowerExpression(testExpr, new RegAlloc<E>(loop),
+        {demand: "acc", what: "for-loop test expression"}).fragment
 
-    const bodyScope = new RegAlloc<E>(alloc)
+    const bodyScope = new RegAlloc<E>(loop)
     const body = lowerControlBody(s.body, bodyScope)
     const bodyStmts = s.body.type === "BlockStatement" ? s.body.body : [s.body]
 
@@ -574,8 +506,10 @@ function lowerFor<E extends { ext: string } = ExtOpPayload>(s: ForStatement, all
     // C's do.
     const update = s.update
         ? lowerExprStmt({type: "ExpressionStatement", expression: s.update},
-            new RegAlloc<E>(alloc, undefined, undefined, bodyScope.depth))
+            new RegAlloc<E>(loop, undefined, undefined, bodyScope.depth))
         : []
+
+    alloc.consume(loop.depth - alloc.depth)
 
     return [
         ...init,

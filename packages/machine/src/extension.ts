@@ -155,7 +155,7 @@ export interface Extension<E extends { ext: string } = ExtOpPayload>
      *  `builtinCallRules()` (rules.ts) already uses for `clz`/`trap`/
      *  `revbits`, generalized so an extension contributes its own rules
      *  instead of them being hardcoded there. */
-    rules?: (resolveLocal: (name: string) => number, resolveCallee: (name: string) => number | undefined) => Rule<E>[]
+    rules?: (resolveLocal: (name: string) => number, resolveCallee: (name: string, argCount?: number) => number | undefined) => Rule<E>[]
     /** One `ExtOpEffect` per opcode this extension defines, keyed by the
      *  `ExtInstr.ext` name validate.ts will see. */
     effects?: Readonly<Record<string, ExtOpEffect<E>>>

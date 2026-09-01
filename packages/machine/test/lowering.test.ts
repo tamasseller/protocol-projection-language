@@ -427,11 +427,16 @@ describe("Root output demand (tileExpr with demand parameter)", () =>
         assert.deepStrictEqual(vs[0], ["LOAD y", "STORE x"])
     })
 
-    test("x = y with tos demand — zero variants (assignment never outputs tos)", () =>
+    test("x = y with tos demand — the assignment's own value, pushed", () =>
     {
+        // `u32 b = (a = 3);` and, after desugaring, `u32 b = ++a;` both
+        // land here: the store happens and the value carries on to the
+        // stack. Only the acc path has a tos variant — a write-back RHS
+        // left its result in a register, and re-`LOAD`ing it would cost
+        // more than the plain form it competes with.
         const vs = variantsOf("return x = y;", "tos")
-        assert.equal(vs.length, 0,
-            `assignment cannot produce tos output, expected 0 variants, got ${vs.length}`)
+        assert.equal(vs.length, 1)
+        assert.deepStrictEqual(vs[0], ["LOAD y", "STORE x", "PUSH"])
     })
 
     // ── Compound — acc demand still allows stack bridging internally ─────────

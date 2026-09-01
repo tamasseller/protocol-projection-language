@@ -435,6 +435,38 @@ describe("raise: ternary (a dispatch whose arms assign one slot)", () =>
     test("a trap arm", () => assertRaisedTrap("u32 a = 5; return a > 1 ? trap(3) : 9;", 3))
 })
 
+describe("raise: desugared and lifted forms", () =>
+{
+    test("compound assignment", () => assertRaisedReturn("u32 a = 1; a += 2; return a;", 3))
+
+    test("postfix step, whose old value takes a slot", () =>
+        assertRaisedReturn("u32 a = 1; u32 b = a++; return b * 10 + a;", 12))
+
+    test("short-circuit &&", () =>
+        assertRaisedReturn("u32 a = 0; u32 b = 0; u32 r = a && (b = 1); return b;", 0))
+
+    test("a switch whose labels are not consecutive", () => assertRaisedReturn(`
+        u32 x = 100;
+        switch(x)
+        {
+            case 1:   return 11;
+            case 100: return 20;
+            default:  return 99;
+        }
+    `, 20))
+
+    test("a switch with a shifted table", () => assertRaisedReturn(`
+        u32 x = 6;
+        switch(x)
+        {
+            case 5: return 15;
+            case 6: return 16;
+            case 7: return 17;
+            default: return 99;
+        }
+    `, 16))
+})
+
 describe("raise: trap", () =>
 {
     test("unconditional trap", () => assertRaisedTrap("trap(7);", 7))

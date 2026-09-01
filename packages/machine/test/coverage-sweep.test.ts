@@ -303,6 +303,10 @@ describe("Rule-coverage sweep: unary-shaped rules under a tos demand", () =>
         ["~x", "unary:~:tos"],
         ["clz(x)", "builtin:clz:tos"],
         ["revbits(x)", "builtin:revbits:tos"],
+        // The one non-unary rule with the same shape: an assignment whose
+        // value is wanted on the stack — `u32 b = (a = 3);`, and every
+        // `u32 b = ++a;` desugar.ts turns into one.
+        ["x = y", "assign:=:tos"],
     ] as const)
     {
         test(source, () => { winsRule(source, "tos", want) })
