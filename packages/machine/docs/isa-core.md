@@ -1,7 +1,8 @@
 # Generic Core ISA
 
 > **Status:** normative spec, the *what*. Rationale for the non-obvious
-> choices: [isa-rationale.md](./isa-rationale.md). §11 specifies how a
+> choices: [isa-rationale.md](./isa-rationale.md). What the machine is for:
+> [applications.md](./applications.md). §11 specifies how a
 > domain extension plugs into the core: the opcode space it owns (§5.1),
 > and what it must declare about its own opcodes to keep §8's guarantees
 > intact. What a concrete extension's opcodes *do* is specified separately
