@@ -13,10 +13,8 @@
 
 ## JIT
 
-6 testAccNonzero flushes acc to r0 just to CMP it against 0, where the value's own producer could have set the flags in place.
+6 testAccNonzero flushes acc to r0 just to CMP it against 0, where the value's own producer could have set the flags in place. `Shape::ofFlags` is the representation for it — an arithmetic producer would leave `Flags(NE)` exactly as a comparison leaves its own condition. What is missing is the table of which producers leave usable flags, and the guarantee that nothing between such a producer and its branch disturbs them.
 
 # Correctness
 
-7 An extension opcode cannot declare that it destroys acc. isa-core.md §11.2's effect table has four fields and never mentions acc; ExtOpEffect grew readsAcc and writesAcc but no kill, so validate.ts:230-241 passes acc liveness through an op declaring neither and vm.ts:485-487 agrees — EXT MEMMOVE; RETURN validates with acc live. jit-armv6m gives every extension ExtSite::accInvalidate(), and one reaching a helper has no alternative since r0 is an argument register from the first pop (ext_rawmem.cpp:156). Assert on the host (shape.h's `reg()`/`imm()`, reading a Poisoned shape), wrong answer under NDEBUG (0x18 for 0). Mirror of the first campaign's §9b, whose fix was writesAcc for the opposite direction. Not confined to the test extension: CODEC_EFFECTS' ENTER, ENTER_NEXT, OPEN_LIST, CLONE_RD, CLONE_WR and SEEK declare neither and leave state.acc alone, and all six are helper-call work, so the first jit-armv6m codec emitter inherits this. Needs a third direction in §11.2 and a decision on whether "declares neither" keeps meaning preserves or becomes undefined; either changes which programs are legal. Blocks EXT fuzzing — a campaign aborts on it ~30s in (jit-armv6m/docs/fuzzing-campaign.md, third campaign §1).
-
-8 No repo document states the intended application domains; target-profile.md documents legality ceilings (131 ABI, 128 fuzz cap) but has no note that the performance cliff is WINDOW_SIZE = 4, which realistic hand-written programs cross at the fourth local.
+7 No repo document states the intended application domains; target-profile.md documents legality ceilings (131 ABI, 128 fuzz cap) but has no note that the performance cliff is WINDOW_SIZE = 4, which realistic hand-written programs cross at the fourth local.

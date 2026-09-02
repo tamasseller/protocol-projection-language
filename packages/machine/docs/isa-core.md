@@ -671,7 +671,8 @@ Acc liveness is a derived static property, tracked forward from a
 procedure's entry, where it is live iff that procedure takes at least one
 argument (§4.6). A
 write-back-in-place combo (`REG_REG`/`PEEK_PEEK` — §4.1) invalidates it
-without re-establishing it. Every instruction that reads acc as an implicit
+without re-establishing it, and so does an extension opcode declaring the
+destroying accumulator effect (§11.2). Every instruction that reads acc as an implicit
 operand — an arithmetic/comparison combo, `STORE`, `PUSH`, `RETURN`,
 `NEG`/`NOT`/`CLZ`/`REVBITS`, a `CALL` whose callee takes at least one
 argument, or a `BR_TABLE`/`LOOP`-condition dispatch itself — is a
@@ -860,6 +861,22 @@ opcode declares:
 | Peak transient depth | The deepest TOS gets above its own entry depth while the opcode executes, even if it nets back by the time the opcode is done. |
 | Terminates? | Whether the opcode ends its enclosing block on its own, as `RETURN`/`TRAP` do (§4.5, §8.4). |
 | Call-shaped? | Whether the opcode invokes a procedure, and if so which operand carries the resolved procedure-table index and what the callee's logical argument count `N` is. |
+| Reads acc? | Whether the opcode's input includes whatever `acc` already holds, on top of whatever it pops. |
+| Accumulator effect | What it leaves behind in `acc`: **preserves**, **writes**, or **destroys**. |
+
+The accumulator effect is three-valued and defaults to *preserves*: an
+opcode that says nothing about `acc` leaves its value and its liveness
+(§8.7) exactly as it found them. *Writes* establishes a fresh value, so
+`acc` is live after the opcode whatever it was before. *Destroys* leaves
+nothing readable, exactly as a CFG split does: `acc` is dead after the
+opcode, and reading it before something re-establishes one is a validation
+error.
+
+*Destroys* is what an opcode that hands its work to target code reached
+through an argument register has to declare — on a register machine the
+accumulator's own register is one of those, so the value is gone whether
+the opcode wanted it gone or not. Reading is orthogonal to all three:
+consume-and-destroy is that opcode's ordinary shape.
 
 A call-shaped extension opcode follows `CALL`'s convention (§4.6, §6):
 only `max(N-1, 0)` of its arguments are expected on the stack, the last

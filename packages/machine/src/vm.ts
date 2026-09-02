@@ -30,7 +30,8 @@
 
 import assert from "assert"
 import type {RtlProgram, RtlProc, RtlInstr, ExtOpPayload} from "./rtl"
-import type {Extension} from "./extension"
+import type {Extension, ExtOpEffect} from "./extension"
+import {accOutOf} from "./extension"
 
 const MAX_STEPS = 10_000_000
 
@@ -242,9 +243,26 @@ function runProc<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E
     // The state surface an extension's `exec` is allowed to touch — no pc,
     // no control stack, since a generic extension op is straight-line by
     // construction (isa-core.md §5.1).
+    // The op currently inside `exec`, so the accessors below can hold it to
+    // its own §11.2 declaration. `extEffect` is undefined for an exec-only
+    // extension (`effects` is optional on Extension), which is the one
+    // configuration that keeps the unchecked pre-declaration behavior.
+    let extName = ""
+    let extEffect: ExtOpEffect<E> | undefined
+    let extWroteAcc = false
+
     const extState = {
-        get acc() {return acc},
-        set acc(v: number) {acc = v >>> 0},
+        get acc()
+        {
+            assert.ok(!extEffect || extEffect.readsAcc, `EXT ${extName}: exec reads acc without declaring readsAcc`)
+            return acc
+        },
+        set acc(v: number)
+        {
+            assert.ok(!extEffect || extEffect.writesAcc, `EXT ${extName}: exec writes acc without declaring writesAcc`)
+            extWroteAcc = true
+            acc = v >>> 0
+        },
         push(value: number) {regs[tos++] = value >>> 0},
         pop(): number {assert.ok(tos > 0, `EXT: pop with empty stack`); return regs[--tos] ?? 0},
         reg(index: number): number {return regs[index] ?? 0},
@@ -461,33 +479,42 @@ function runProc<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E
             {
                 if(!extension?.exec) throw new Error(`EXT ${i.ext}: no extension registered to execute it`)
 
-                // The same two declarations validate.ts's own EXT case
-                // reads, honored here in the same order and for the same
-                // reason: an extension op is opaque to the acc-clobbering
+                // The same declarations validate.ts's own EXT case reads,
+                // honored here in the same order and for the same reason:
+                // an extension op is opaque to the acc-clobbering
                 // convention (isa-core.md §8.7) *except* where its effect
                 // speaks, and both halves have to believe the same thing
                 // about acc or the validator accepts programs the VM then
-                // refuses to run.
+                // refuses to run. That failed once already: the codec
+                // extension's TAG assigns `state.acc` and once didn't say
+                // so, so validate.ts had acc live where runProc still
+                // believed an upstream `OR REG_REG` had poisoned it.
                 //
-                // Which is exactly what happened. The codec extension's
-                // TAG declares `writesAcc` and its exec() really does
-                // assign `state.acc`, so validate.ts had acc live again
-                // after it — while runProc still believed the `OR REG_REG`
-                // upstream had poisoned it, and threw on the next read. A
-                // struct with two hoistable union fields packs its bitmap
-                // with exactly that shape (`OR REG_REG; EXT ENTER; EXT
-                // TAG; SHL IMM_ACC`), which is how six tests across
-                // @ppl/codecs and @ppl/target-js found it.
-                //
-                // A missing declaration is not fatal here, unlike in
-                // validate.ts: a caller may register an exec-only
-                // extension (`effects` is optional on Extension), and this
-                // is the same pass-acc-through-unchanged that every EXT op
-                // got before either flag existed.
+                // Which is what `extState`'s accessors are for — the
+                // declaration is checked against what `exec` actually does,
+                // rather than trusted. A missing declaration is not fatal
+                // here, unlike in validate.ts: a caller may register an
+                // exec-only extension, and that path keeps the unchecked
+                // pass-acc-through-unchanged behavior.
                 const effect = extension.effects?.[i.ext]
                 if(effect?.readsAcc) requireAccLive(`EXT ${i.ext}`)
+
+                extName = i.ext
+                extEffect = effect
+                extWroteAcc = false
                 extension.exec(i, extState)
-                if(effect?.writesAcc) accLive = true
+                extEffect = undefined
+
+                if(effect)
+                {
+                    const accOut = accOutOf(effect, `EXT ${i.ext}`)
+                    if(accOut === "write")
+                    {
+                        assert.ok(extWroteAcc, `EXT ${i.ext}: declares writesAcc but exec left acc unassigned`)
+                        accLive = true
+                    }
+                    else if(accOut === "kill") accLive = false
+                }
                 pc++
                 break
             }

@@ -109,6 +109,32 @@ export interface ExtOpEffect<E extends { ext: string } = ExtOpPayload>
      *  outright with no way for the extension to say otherwise. Defaults to
      *  falsy, so an effect that doesn't set it behaves exactly as before. */
     writesAcc?: boolean
+
+    /** Whether this op *destroys* acc — leaves nothing readable behind,
+     *  exactly as a CFG split does (isa-core.md §8.7). The third direction
+     *  of §11.2's accumulator effect, and the one an op that hands its
+     *  operands to a helper needs: on a register machine the accumulator's
+     *  register is an argument register, so the value is gone whether the
+     *  op wanted it gone or not (jit-armv6m's `ExtSite::accInvalidate`).
+     *
+     *  Mutually exclusive with `writesAcc` — an op either leaves a fresh
+     *  value or leaves none. `readsAcc` is orthogonal: consume-and-destroy
+     *  is what a helper reached through an argument register does. */
+    killsAcc?: boolean
+}
+
+/** §11.2's accumulator effect as the one three-valued thing it is, read
+ *  identically by `validate.ts`, `vm.ts` and `raise.ts`. "Declares
+ *  neither" means the op preserves acc, value and liveness alike. */
+export type AccOut = "preserve" | "write" | "kill"
+
+export function accOutOf(effect: {writesAcc?: boolean; killsAcc?: boolean}, context: string): AccOut
+{
+    if(effect.writesAcc && effect.killsAcc)
+        throw new Error(`${context}: declares both writesAcc and killsAcc — an op either leaves a fresh acc value or leaves none`)
+    if(effect.writesAcc) return "write"
+    if(effect.killsAcc) return "kill"
+    return "preserve"
 }
 
 /** The subset of VM state one extension opcode's `exec` is allowed to

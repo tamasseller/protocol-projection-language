@@ -601,7 +601,19 @@ class Raiser<E extends { ext: string } = ExtOpPayload>
                     // raised `Expr` node unchanged, alongside the popped/
                     // acc-sourced `args`.
                     const {op: _op, ...payload} = i
-                    this.setAcc({kind: ExprKind.Ext, ...payload, args} as Expr<E>, false)
+                    const node = {kind: ExprKind.Ext, ...payload, args} as Expr<E>
+
+                    // A kill op leaves nothing readable behind (isa-core.md
+                    // §11.2), so its node can't be acc's new value the way a
+                    // preserving/writing op's is — it is the statement it
+                    // was, and acc stays whatever the kill made it: nothing.
+                    if(effect.killsAcc)
+                    {
+                        stmts.push({kind: StmtKind.ExprStmt, value: node})
+                        this.acc = undefined
+                    }
+                    else this.setAcc(node, false)
+
                     this.pc++
                     continue
                 }

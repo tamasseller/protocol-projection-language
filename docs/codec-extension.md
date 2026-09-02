@@ -391,6 +391,14 @@ value across). A tree-based consumer such as `raise.ts` needs that flag to
 capture the pending acc value as the op's trailing argument; `run()` reads
 the real register and never needed it.
 
+Each op also declares isa-core.md §11.2's accumulator effect.
+`LOAD_VAL`/`COUNT`/`TAG`/`READ`/`HAS_NEXT` and both `CALL_CODEC` forms
+*write* it. `ENTER`/`ENTER_NEXT`/`OPEN_LIST`/`CLONE_RD`/`CLONE_WR`/`SEEK`
+*destroy* it: `exec()` leaves `state.acc` alone, but all six are
+handle/stream work a target reaches through a helper call, where the
+accumulator's own register is an argument register. Declaring it is what
+keeps a lowering from carrying a value across one.
+
 ### 6.4 Byte assignment
 
 Bands are laid out in `CODEC_OPCODES`' declared order (§3's table order),

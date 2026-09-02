@@ -19,8 +19,8 @@ import { run } from "../src/vm"
 import { encodeInstr, encodeBody, decodeBody, encodeLeb128, decodeLeb128 } from "../src/bytecode"
 import { rule, leafNode } from "../src/rules"
 import { pBuiltinCall, pIdentifier } from "../src/matcher"
-import { extInstr, bare, CONST, PUSH, opRegWriteback } from "../src/rtl"
-import type { RtlProgram } from "../src/rtl"
+import { extInstr, bare, brTable, CONST, PUSH, opRegWriteback } from "../src/rtl"
+import type { RtlProgram, RtlInstr } from "../src/rtl"
 import type { Extension } from "../src/extension"
 
 function doubleExtension(): Extension
@@ -30,7 +30,7 @@ function doubleExtension(): Extension
             rule("ext:double", pBuiltinCall("double", pIdentifier()), m =>
                 leafNode(["acc"], [extInstr("DOUBLE_REG", [resolveLocal(m.argumentMatches[0].name)])], [], 0, 0)),
         ],
-        effects: { DOUBLE_REG: { tosDelta: 0, maxTransient: 0 } },
+        effects: { DOUBLE_REG: { tosDelta: 0, maxTransient: 0, writesAcc: true } },
         exec: (instr, state) => { state.acc = (state.reg(instr.operands[0]!) * 2) >>> 0 },
         codec: {
             encode: instr => [128, ...encodeLeb128(instr.operands[0]!)],
@@ -235,4 +235,119 @@ describe("extension hook — acc liveness agrees between validate.ts and vm.ts",
         assert.doesNotThrow(() => validateProgram(program, ext))
         assert.equal(run(program, ext).ok, true)
     })
+})
+
+/* ── isa-core.md §11.2's third direction: an op that destroys acc ───────
+ *
+ * MEMMOVE's shape (jit-armv6m/fuzz/rawmem_ext.ts): every operand goes off
+ * the stack into a helper's argument registers, acc's own among them, so
+ * nothing readable is left behind. The reference `exec` simply doesn't
+ * touch acc — the declaration is what makes both halves agree that a read
+ * after it is not a legal program.
+ */
+function killAccExtension(): Extension
+{
+    return {
+        effects: {
+            KILL:   { tosDelta: 0, maxTransient: 0, killsAcc: true },
+            REVIVE: { tosDelta: 0, maxTransient: 0, writesAcc: true },
+        },
+        exec: (instr, state) => { if(instr.ext === "REVIVE") state.acc = 9 },
+    }
+}
+
+describe("extension hook — killsAcc, an op that destroys acc", () =>
+{
+    test("a kill leaves acc dead — the RETURN after it is rejected by both halves", () =>
+    {
+        const program: RtlProgram = {
+            procedures: [{ argCount: 0, body: [CONST(1), extInstr("KILL", []), bare("RETURN")] }],
+        }
+        const ext = killAccExtension()
+        assert.throws(() => validateProgram(program, ext), /RETURN/)
+        assert.throws(() => run(program, ext), /read of acc/)
+    })
+
+    test("re-establishing acc after a kill is legal and runs", () =>
+    {
+        const program: RtlProgram = {
+            procedures: [{ argCount: 0, body: [CONST(1), extInstr("KILL", []), CONST(5), bare("RETURN")] }],
+        }
+        const ext = killAccExtension()
+        assert.doesNotThrow(() => validateProgram(program, ext))
+        assert.equal(run(program, ext).acc, 5)
+    })
+
+    test("a writesAcc op re-establishes what a kill destroyed", () =>
+    {
+        const program: RtlProgram = {
+            procedures: [{ argCount: 0, body: [CONST(1), extInstr("KILL", []), extInstr("REVIVE", []), bare("RETURN")] }],
+        }
+        const ext = killAccExtension()
+        assert.doesNotThrow(() => validateProgram(program, ext))
+        assert.equal(run(program, ext).acc, 9)
+    })
+
+    test("a kill in one dispatch case kills the merge (isa-core.md §8.7)", () =>
+    {
+        const cases = (tail: RtlInstr[]): RtlInstr[] => [
+            CONST(0), brTable(1),
+            CONST(1), bare("BLOCK_END"),
+            CONST(2), extInstr("KILL", []), bare("BLOCK_END"),
+            ...tail,
+        ]
+        const ext = killAccExtension()
+
+        assert.throws(() => validateProgram({ procedures: [{ argCount: 0, body: cases([bare("RETURN")]) }] }, ext), /RETURN/)
+        assert.doesNotThrow(() =>
+            validateProgram({ procedures: [{ argCount: 0, body: cases([CONST(3), bare("RETURN")]) }] }, ext))
+    })
+
+    test("writesAcc and killsAcc together is a declaration error, not a program one", () =>
+    {
+        const ext: Extension = {
+            effects: { BOTH: { tosDelta: 0, maxTransient: 0, writesAcc: true, killsAcc: true } },
+            exec: () => {},
+        }
+        const program: RtlProgram = {
+            procedures: [{ argCount: 0, body: [CONST(1), extInstr("BOTH", []), bare("RETURN")] }],
+        }
+        assert.throws(() => validateProgram(program, ext), /both writesAcc and killsAcc/)
+        assert.throws(() => run(program, ext), /both writesAcc and killsAcc/)
+    })
+})
+
+/* ── the declaration is checked against what `exec` really does ─────────
+ *
+ * `ExecState.acc` is an accessor pair, so vm.ts sees every acc read and
+ * write an extension makes and holds it to its own effect declaration —
+ * the reference-side counterpart of the post-emit acc check jit-armv6m
+ * runs on an extension's emitted code.
+ */
+describe("extension hook — vm.ts holds exec to its own acc declaration", () =>
+{
+    const program: RtlProgram = {
+        procedures: [{ argCount: 0, body: [CONST(1), extInstr("OP", []), CONST(0), bare("RETURN")] }],
+    }
+    const withOp = (effect: NonNullable<Extension["effects"]>[string], exec: NonNullable<Extension["exec"]>): Extension =>
+        ({ effects: { OP: effect }, exec })
+
+    test("a write with no writesAcc is caught", () =>
+        assert.throws(() => run(program, withOp({ tosDelta: 0, maxTransient: 0 }, (_i, s) => { s.acc = 3 })),
+            /without declaring writesAcc/))
+
+    test("a read with no readsAcc is caught", () =>
+        assert.throws(() => run(program, withOp({ tosDelta: 0, maxTransient: 0 }, (_i, s) => { s.setReg(0, s.acc) })),
+            /without declaring readsAcc/))
+
+    test("writesAcc with nothing assigned is caught", () =>
+        assert.throws(() => run(program, withOp({ tosDelta: 0, maxTransient: 0, writesAcc: true }, () => {})),
+            /left acc unassigned/))
+
+    test("a killsAcc op that assigns acc anyway is caught", () =>
+        assert.throws(() => run(program, withOp({ tosDelta: 0, maxTransient: 0, killsAcc: true }, (_i, s) => { s.acc = 3 })),
+            /without declaring writesAcc/))
+
+    test("an exec-only extension keeps the unchecked path", () =>
+        assert.equal(run(program, { exec: (_i, s) => { s.acc = 3 } }).ok, true))
 })

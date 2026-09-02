@@ -160,8 +160,13 @@ export const CODEC_EFFECTS: Readonly<Record<CodecOpcode, ExtOpEffect<CodecExtIns
     // procedure's entry acc is not live (isa-core.md §4.6), so a codec
     // procedure opening with `READ; WRITE` had the validator reject the
     // WRITE for reading an acc it believed nothing had established.
-    ENTER:      { tosDelta: 0, maxTransient: 0 },
-    ENTER_NEXT: { tosDelta: 0, maxTransient: 0 },
+    // killsAcc marks the handle/stream ops: their own exec() leaves
+    // state.acc alone, but every one of them is helper-call work on a real
+    // target, where the accumulator's register is an argument register —
+    // isa-core.md §11.2's third direction, declared here so no lowering
+    // may carry a value across one.
+    ENTER:      { tosDelta: 0, maxTransient: 0, killsAcc: true },
+    ENTER_NEXT: { tosDelta: 0, maxTransient: 0, killsAcc: true },
     LOAD_VAL:   { tosDelta: 0, maxTransient: 0, writesAcc: true },
     // STORE_VAL/WRITE/WRITE_SEQ/READ_SEQ's real value/count argument is
     // codecRules()'s trailing pRtl("acc") demand (each rule's own doc
@@ -176,13 +181,13 @@ export const CODEC_EFFECTS: Readonly<Record<CodecOpcode, ExtOpEffect<CodecExtIns
     STORE_VAL:  { tosDelta: 0, maxTransient: 0, readsAcc: true },
     COUNT:      { tosDelta: 0, maxTransient: 0, writesAcc: true },
     TAG:        { tosDelta: 0, maxTransient: 0, writesAcc: true },
-    OPEN_LIST:  { tosDelta: 0, maxTransient: 0 },
+    OPEN_LIST:  { tosDelta: 0, maxTransient: 0, killsAcc: true },
     READ:       { tosDelta: 0, maxTransient: 0, writesAcc: true },
     WRITE:      { tosDelta: 0, maxTransient: 0, readsAcc: true },
     HAS_NEXT:   { tosDelta: 0, maxTransient: 0, writesAcc: true },
-    CLONE_RD:   { tosDelta: 0, maxTransient: 0 },
-    CLONE_WR:   { tosDelta: 0, maxTransient: 0 },
-    SEEK:       { tosDelta: 0, maxTransient: 0 },
+    CLONE_RD:   { tosDelta: 0, maxTransient: 0, killsAcc: true },
+    CLONE_WR:   { tosDelta: 0, maxTransient: 0, killsAcc: true },
+    SEEK:       { tosDelta: 0, maxTransient: 0, killsAcc: true },
     // §3.3/§4: CALL_CODEC codec_idx, src, ref, [args...] — validate.ts
     // derives the actual pop count from the resolved callee's own
     // argCount header (extension.ts's `ExtOpEffect.calleeOf` doc comment),

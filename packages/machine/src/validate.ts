@@ -27,6 +27,7 @@
 import type { RtlProc, RtlProgram, RtlInstr, ExtOpPayload } from "./rtl"
 import { isExtInstr, isStackComboInstr, isRegComboInstr, isImmComboInstr, SHIFT_OPS, UNARY_ALU_OPS } from "./rtl"
 import type { Extension, ExtOpEffect } from "./extension"
+import { accOutOf } from "./extension"
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -238,14 +239,15 @@ function walkProcedure<E extends { ext: string } = ExtOpPayload>(
                 if(tos < entryTos) fail(pc, `EXT ${instr.ext}: net effect would underflow below this block's entry depth (${entryTos})`)
 
                 // Extension ops are otherwise opaque to the core's own
-                // acc-clobbering convention (their effect on acc is their
-                // own business), so accLive passes through unchanged
-                // unless the effect declares one of the two directions.
-                // vm.ts's own EXT case reads the same two flags in the
-                // same order — it has to, or this accepts programs it then
-                // refuses to run.
+                // acc-clobbering convention, so acc's liveness passes
+                // through unchanged unless the effect declares one of
+                // §11.2's other two directions. vm.ts's own EXT case reads
+                // the same declarations in the same order — it has to, or
+                // this accepts programs it then refuses to run.
                 if(effect.readsAcc) requireAcc(`EXT ${instr.ext}`)
-                if(effect.writesAcc) accLive = true
+                const accOut = accOutOf(effect, `EXT ${instr.ext}`)
+                if(accOut === "write") accLive = true
+                else if(accOut === "kill") accLive = false
 
                 if(effect.terminates) return { nextPc: pc + 1, close: "terminated", exitAccLive: accLive }
                 pc++; continue

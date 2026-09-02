@@ -544,7 +544,7 @@ function doubleExtension(): Extension
             rule("ext:double", pBuiltinCall("double", pIdentifier()), m =>
                 leafNode(["acc"], [extInstr("DOUBLE_REG", [resolveLocal(m.argumentMatches[0].name)])], [], 0, 0)),
         ],
-        effects: { DOUBLE_REG: { tosDelta: 0, maxTransient: 0 } },
+        effects: { DOUBLE_REG: { tosDelta: 0, maxTransient: 0, writesAcc: true } },
         exec: (instr, state) => { state.acc = (state.reg(instr.operands[0]!) * 2) >>> 0 },
     }
 }
@@ -561,7 +561,7 @@ function doubleExtension(): Extension
 function sumTwoExtension(): Extension
 {
     return {
-        effects: { SUM_TWO: { tosDelta: -2, maxTransient: 0 } },
+        effects: { SUM_TWO: { tosDelta: -2, maxTransient: 0, writesAcc: true } },
         exec: (_instr, state) => { const b = state.pop(); const a = state.pop(); state.acc = (a + b) >>> 0 },
     }
 }
@@ -611,6 +611,52 @@ const pushingProgram: RtlProgram = {
     }],
 }
 
+/**
+ * killsAcc (ExtOpEffect.killsAcc) — an op that leaves nothing readable
+ * behind, so its raised node can't become acc's next value the way an
+ * ordinary one does. Its own side effect still has to survive: this one
+ * stashes the popped operand into a slot, which the LOAD after it reads.
+ */
+function killAccExtension(): Extension
+{
+    return {
+        effects: { STASH: { tosDelta: -1, maxTransient: 0, killsAcc: true } },
+        exec: (_instr, state) => { state.setReg(0, (state.pop() + 1) >>> 0) },
+    }
+}
+
+const stashProgram: RtlProgram = {
+    procedures: [{
+        argCount: 0,
+        body: [
+            { op: "CONST", imm: 7 }, { op: "PUSH" },
+            { op: "CONST", imm: 5 }, { op: "PUSH" },
+            extInstr("STASH", []), // slot 0 = 6, acc destroyed
+            { op: "LOAD", target: 0 },
+            { op: "RETURN" },
+        ],
+    }],
+}
+
+describe("raise: EXT — killsAcc (the op is a statement, never a value)", () =>
+{
+    test("a kill op's side effect survives raising, and acc after it is nobody's value", () =>
+    {
+        const ext = killAccExtension()
+        const vmResult = run(stashProgram, ext)
+        assert.ok(vmResult.ok)
+        assert.equal(vmResult.acc, 6)
+
+        const raised = raiseProgram(stashProgram, ext)
+        assert.ok(raised[0]!.body.some(st => st.kind === StmtKind.ExprStmt && st.value.kind === ExprKind.Ext),
+            "the kill op is raised as a statement of its own, not as some expression's value")
+
+        const raisedResult = evalRaisedProgram(raised, ext)
+        assert.ok(raisedResult.ok, `raised tree trapped (code ${raisedResult.trapCode})`)
+        assert.equal(raisedResult.acc, vmResult.acc)
+    })
+})
+
 describe("raise: EXT — tosDelta ≤ 0 (opaque acc result)", () =>
 {
     test("tosDelta: 0 — no operands popped, one acc result (the real codec-op shape)", () =>
@@ -659,7 +705,7 @@ function readsAccExtension(): Extension
                 return unaryNode(value.node, ["acc"], [...value.node.fragment, extInstr("WRITE_IT", [])])
             }),
         ],
-        effects: { WRITE_IT: { tosDelta: 0, maxTransient: 0, readsAcc: true } },
+        effects: { WRITE_IT: { tosDelta: 0, maxTransient: 0, readsAcc: true, writesAcc: true } },
         exec: (_instr, state) => { state.acc = (state.acc + 100) >>> 0 },
     }
 }
