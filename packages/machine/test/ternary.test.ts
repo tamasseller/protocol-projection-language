@@ -102,6 +102,18 @@ describe("ternary — only one arm runs", () =>
 
     test("an arm nested in an arm stays conditional", () =>
         returns("u32 a = 1; return a ? 5 : (a ? trap(7) : trap(8));", 5))
+
+    // One trapping arm is the useful "value or bail" shape, above. All of
+    // them is a ternary with no value at all, which §4.5 gives no edge into
+    // the merge — rejected here rather than left to surface as an acc
+    // liveness error, or as dead code the validator lets through.
+    test("a ternary whose arms all trap has no value to give", () =>
+    {
+        const noValue = /arms all trap/
+        assert.throws(() => lowerProc(ir`u32 c = 1; return c ? trap(1) : trap(2);`.body), noValue)
+        assert.throws(() => lowerProc(ir`u32 c = 1; u32 x = 0; x = c ? trap(1) : trap(2); return x;`.body), noValue)
+        assert.throws(() => lowerProc(ir`u32 c = 1; u32 x = c ? trap(1) : (c ? trap(2) : trap(3)); return x;`.body), noValue)
+    })
 })
 
 describe("ternary — where the value rides", () =>

@@ -61,3 +61,11 @@ export function isTrapCall(expr: Expression): boolean
 {
     return expr.type === "CallExpression" && expr.callee.name === "trap"
 }
+
+/** Terminates instead of producing a value — a `trap`, or a ternary whose
+ *  every arm is one, which §4.5 leaves with no edge into the merge. */
+export function neverProduces(expr: Expression): boolean
+{
+    return isTrapCall(expr)
+        || (expr.type === "ConditionalExpression" && neverProduces(expr.consequent) && neverProduces(expr.alternate))
+}

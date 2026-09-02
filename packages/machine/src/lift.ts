@@ -25,7 +25,7 @@ import type {PrimType} from "./ast"
 import type {ExtOpPayload, RtlInstr} from "./rtl"
 import {bare, brTable, PUSH, STORE} from "./rtl"
 import {RegAlloc} from "./scope"
-import {tileExpression, isTrapCall} from "./expr"
+import {tileExpression, isTrapCall, neverProduces} from "./expr"
 import {typeOfExpr} from "./types"
 import {desugar} from "./desugar"
 
@@ -98,6 +98,8 @@ function hoistPostfixStep<E extends { ext: string } = ExtOpPayload>(e: UpdateExp
  */
 export function conditionalToAcc<E extends { ext: string } = ExtOpPayload>(e: ConditionalExpression, alloc: RegAlloc<E>, into?: PrimType): RtlInstr<E>[]
 {
+    if(neverProduces(e)) throw new Error("A ternary whose arms all trap has no value to use")
+
     const out: RtlInstr<E>[] = []
     const test = tileExpression(hoist(e.test, alloc, out), alloc,
         {demand: "acc", what: "ternary condition"})
