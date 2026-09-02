@@ -17,15 +17,16 @@ import type {
     ForStatement, SwitchStatement, VariableDeclaration, ReturnStatement,
     ExpressionStatement, Expression,
 } from "./ast"
-import {RtlProc, RtlProgram, RtlInstr, bare, brTable, CONST, PUSH, LOAD, opImm} from "./rtl"
+import {RtlProc, RtlProgram, RtlInstr, bare, brTable, CONST, PUSH, LOAD, opImm, trap, fallsThrough, reachesEnd} from "./rtl"
 import type {ExtOpPayload} from "./rtl"
 import type {RtlNode} from "./east"
 import type {Procedure} from "./ir"
 import assert from "assert"
 import {RegAlloc} from "./scope"
 import {desugar} from "./desugar"
-import {lift} from "./lift"
-import {tileExpression, isTrapCall} from "./expr"
+import {lift, conditionalToAcc} from "./lift"
+import {tileExpression} from "./expr"
+import {instrBytes} from "./encoding"
 import type {TileRequest} from "./expr"
 import type {Extension} from "./extension"
 
@@ -37,19 +38,31 @@ import type {Extension} from "./extension"
  * Every expression in the DSL is lowered here and nowhere else, in four
  * phases: rewrite the derived operators (desugar.ts), lift what cannot be
  * tiled in place into code ahead of the expression (lift.ts), annotate
- * types and optionally invert for a dispatch test (expr.ts), tile under the
- * demand (orchestrator.ts). Sites differ only in that demand, and in
- * whether the value is used at all, so they say only that.
+ * types (expr.ts), tile under the demand (orchestrator.ts). Sites differ
+ * only in that demand, and in whether the value is used at all, so they
+ * say only that.
  *
  * `fragment` is the whole thing in order, lifted branches first. `node` is
  * the tiling, for the one caller that needs its stack effect.
  */
-function lowerExpression<E extends { ext: string } = ExtOpPayload>(expr: Expression, scope: RegAlloc<E>, req: TileRequest): {fragment: RtlInstr<E>[]; node: RtlNode<E>}
+function lowerExpression<E extends { ext: string } = ExtOpPayload>(expr: Expression, scope: RegAlloc<E>, req: TileRequest): {fragment: RtlInstr<E>[]; tosDelta: number}
 {
-    const lifted = lift(desugar(expr, req.demand !== "statement"), scope)
+    const sugared = desugar(expr, req.demand !== "statement")
+
+    // A ternary that *is* the whole expression rides acc across the merge
+    // (lift.ts) instead of writing a slot.
+    if(sugared.type === "ConditionalExpression" && (req.demand === "acc" || req.demand === "tos"))
+    {
+        const fragment = conditionalToAcc(sugared, scope, req.into)
+        return req.demand === "tos"
+            ? {fragment: [...fragment, PUSH<E>()], tosDelta: 1}
+            : {fragment, tosDelta: 0}
+    }
+
+    const lifted = lift(sugared, scope)
     const node = tileExpression(lifted.expr, scope, req)
 
-    return {fragment: [...lifted.prelude, ...node.fragment], node}
+    return {fragment: [...lifted.prelude, ...node.fragment], tosDelta: node.tosDelta}
 }
 
 /** Lower a single, standalone procedure body — the common case for tests
@@ -63,7 +76,7 @@ export function lowerProc<E extends { ext: string } = ExtOpPayload>(stmts: reado
 
     for(const arg of args) alloc.alloc(arg)
 
-    return { argCount: args.length, body: lowerBlock(stmts, alloc) }
+    return { argCount: args.length, body: closeProcBody(lowerBlock(stmts, alloc)) }
 }
 
 /**
@@ -114,12 +127,29 @@ export function lowerProgram<E extends { ext: string } = ExtOpPayload>(entry: Pr
         }, extension)
         for(const arg of target.args) alloc.alloc(arg)
 
-        procedures[index] = { argCount: target.args.length, body: lowerBlock(target.fragment.body, alloc), header: target.header }
+        procedures[index] = { argCount: target.args.length, body: closeProcBody(lowerBlock(target.fragment.body, alloc)), header: target.header }
         return index
     }
 
     resolve(entry)
     return { procedures }
+}
+
+/**
+ * A procedure body has no enclosing block to close it, so it has to end in
+ * a terminator of its own. One whose last statement is a construct every
+ * case of which returns does end there — but a `BR_TABLE` structurally
+ * continues into its merge whatever its cases do (rtl.ts's `blockClose`),
+ * so the stream still needs something at that merge to close on. `TRAP #0`
+ * is what goes there: isa-core.md §4.5 already reserves code 0 for
+ * "unreachable", which is exactly what this is.
+ *
+ * A body that genuinely runs off its end is left alone, so it stays the
+ * validation error it has always been rather than becoming a silent trap.
+ */
+function closeProcBody<E extends { ext: string } = ExtOpPayload>(body: RtlInstr<E>[]): RtlInstr<E>[]
+{
+    return fallsThrough(body) && !reachesEnd(body) ? [...body, trap<E>(0)] : body
 }
 
 function lowerBlock<E extends { ext: string } = ExtOpPayload>(stmts: readonly Statement[], alloc: RegAlloc<E>): RtlInstr<E>[]
@@ -181,7 +211,7 @@ function lowerVarDecl<E extends { ext: string } = ExtOpPayload>(s: VariableDecla
             return [CONST<E>(0), PUSH<E>()]
         }
 
-        const {fragment, node} = lowerExpression(d.init, alloc,
+        const {fragment, tosDelta} = lowerExpression(d.init, alloc,
             {demand: "tos", into: d.varType, what: `variable initializer for ${d.id.name}`})
 
         // A "tos"-demand tiling's cheapest winner always nets exactly one
@@ -193,8 +223,8 @@ function lowerVarDecl<E extends { ext: string } = ExtOpPayload>(s: VariableDecla
         // single net push a "tos" demand needs. A different value here
         // means that invariant broke somewhere — a real lowerer bug, not a
         // shape to accommodate.
-        assert.equal(node.tosDelta, 1,
-            `"tos"-demand initializer for ${d.id.name} nets tosDelta=${node.tosDelta}, expected exactly 1 — ` +
+        assert.equal(tosDelta, 1,
+            `"tos"-demand initializer for ${d.id.name} nets tosDelta=${tosDelta}, expected exactly 1 — ` +
             `the winning tiling should always be a single net push; this indicates a lowerer bug, not a case to handle`)
         alloc.alloc(d.id.name, d.varType)
 
@@ -223,54 +253,12 @@ function lowerReturn<E extends { ext: string } = ExtOpPayload>(s: ReturnStatemen
     return [CONST(0), bare("RETURN")]
 }
 
-/**
- * Does this statement list's *own* fragment already end in a terminator
- * with nothing further needing a close — i.e. is a following `BLOCK_END`
- * both unnecessary and unreachable? Only the *last* statement matters, and
- * only when it's a *direct* terminator (`return`/`trap(...)`) — not a
- * compound construct (`if`, `switch`, a loop) whose branches merely happen
- * to all terminate.
- *
- * That distinction matters: `closeBlock`'s caller is always closing *this
- * block's own slot* among an enclosing construct's siblings (an if's
- * branch, a switch case, a loop's body sub-block) — never the true
- * top-level procedure body (`lowerBlock` never calls `closeBlock`). A
- * nested `if (a) return 1; else return 2;` as the last statement closes
- * *itself* fully (both its own branches end in RETURN, 2-for-2) — but
- * that says nothing about whether *this* (outer) slot has been closed;
- * omitting this slot's own `BLOCK_END` on that reasoning desyncs the
- * sibling-counting every consumer of the flat instruction stream relies
- * on (`vm.ts`'s `skipBlocks`, and the eventual validator) — a case after
- * this one gets misidentified as more of this case's own content. Only a
- * direct `return`/`trap` *is* this slot's own close, with nothing to
- * desync.
- */
-function alwaysTerminates(stmts: readonly Statement[]): boolean
+/** Close a branch/case/loop-body fragment, unless it already closed itself
+ *  (isa-core.md §4.5: a terminator closes its own block, and so does a
+ *  construct no block of which reaches the merge). */
+function closeBlock<E extends { ext: string } = ExtOpPayload>(fragment: RtlInstr<E>[]): RtlInstr<E>[]
 {
-    const last = stmts[stmts.length - 1]
-    if(!last) return false
-
-    switch(last.type)
-    {
-        case "ReturnStatement": return true
-        case "ExpressionStatement": return isTrapCall(last.expression)
-        default: return false
-    }
-}
-
-/** Close a branch/case/loop-body fragment: omit the `BLOCK_END` only when
- *  the statements it was lowered from end *directly* in `return`/`trap`
- *  (§14.3/§14.4 of isa-core.md — a terminator closes its own block on its
- *  own, so a `BLOCK_END` right after would be unreachable, per
- *  `alwaysTerminates`'s doc comment above). */
-function closeBlock<E extends { ext: string } = ExtOpPayload>(stmts: readonly Statement[], fragment: RtlInstr<E>[]): RtlInstr<E>[]
-{
-    return alwaysTerminates(stmts) ? fragment : [...fragment, bare("BLOCK_END")]
-}
-
-function closeControlBody<E extends { ext: string } = ExtOpPayload>(body: ControlBody, fragment: RtlInstr<E>[]): RtlInstr<E>[]
-{
-    return closeBlock(body.type === "BlockStatement" ? body.body : [body], fragment)
+    return fallsThrough(fragment) ? [...fragment, bare("BLOCK_END")] : fragment
 }
 
 function lowerIf<E extends { ext: string } = ExtOpPayload>(s: IfStatement, alloc: RegAlloc<E>): RtlInstr<E>[]
@@ -279,46 +267,51 @@ function lowerIf<E extends { ext: string } = ExtOpPayload>(s: IfStatement, alloc
     // is lowered before either branch's: a ternary in it allocates a slot
     // one built earlier would renumber over.
     const test = lowerExpression(s.test, alloc,
-        {demand: "acc", invert: true, what: "if test expression"})
+        {demand: "acc", what: "if test expression"})
 
     const thenTerm = lowerControlBody(s.consequent, new RegAlloc<E>(alloc))
     assert.ok(thenTerm, `Failed to lower then branch`)
+
+    // `BR_TABLE 1` is truthy (isa-core.md §4.5), so `case[0]` is the false
+    // arm and `case[1]` the true one. With no `else` the false arm is an
+    // empty block — one byte, and no complemented test to emit.
+    let falseArm: RtlInstr<E>[] = [bare("BLOCK_END")]
 
     if(s.alternate)
     {
         const elseTerm = lowerControlBody(s.alternate, new RegAlloc<E>(alloc))
         assert.ok(elseTerm, `Failed to lower else branch`)
-
-        return [
-            ...test.fragment,
-            brTable(2),
-            ...closeControlBody(s.consequent, thenTerm),
-            ...closeControlBody(s.alternate, elseTerm),
-        ]
+        falseArm = closeBlock(elseTerm)
     }
 
     return [
         ...test.fragment,
         brTable(1),
-        ...closeControlBody(s.consequent, thenTerm),
+        ...falseArm,
+        ...closeBlock(thenTerm),
     ]
 }
 
 /**
- * Roughly what one link of the compare chain costs in bytes: a `LOAD` of
- * the discriminant, the comparison, the `BR_TABLE 2`, and the two
- * `BLOCK_END`s that close its arms.
- *
- * It is the whole grouping rule. A gap inside a table costs exactly one
- * byte per missing label (an empty case is a lone `BLOCK_END`), so two
- * runs are worth merging into one table whenever the gap between them is
- * cheaper than the chain link that would otherwise separate them.
+ * Roughly what starting a second table costs in bytes: a `LOAD` of the
+ * discriminant, the `SUB` shifting it to that run's base, the `BR_TABLE`
+ * itself, and the `BLOCK_END` closing the default case it sits in. No
+ * range test — a group's own `case[N]` is where the next one goes
+ * (isa-core.md §7.1).
  */
-const CHAIN_LINK_BYTES = 8
+const CHAIN_LINK_BYTES = 7
 
 /** Ascending labels into runs — a label is a *value*, not a position, so
- *  only consecutive ones map onto `BR_TABLE`'s index directly. */
-function switchGroups(labels: readonly number[]): number[][]
+ *  only consecutive ones map onto `BR_TABLE`'s index directly.
+ *
+ *  Two runs are worth merging into one table whenever the gap between them
+ *  is cheaper than the second table that would otherwise separate them. A
+ *  gap costs one copy of the default block per missing label (`gapBytes`),
+ *  since `BR_TABLE`'s index is exact below `N` and a gap therefore cannot
+ *  share `case[N]`'s code. With no `default:` clause that is a lone
+ *  `BLOCK_END`; a substantial one makes merging never worth it, which is
+ *  the right answer rather than a special case. */
+function switchGroups(labels: readonly number[], gapBytes: number): number[][]
 {
     const groups: number[][] = [[labels[0]!]]
 
@@ -327,7 +320,7 @@ function switchGroups(labels: readonly number[]): number[][]
         const group = groups[groups.length - 1]!
         const gap = label - group[group.length - 1]! - 1
 
-        if(gap < CHAIN_LINK_BYTES) group.push(label)
+        if(gap * gapBytes < CHAIN_LINK_BYTES) group.push(label)
         else groups.push([label])
     }
 
@@ -362,19 +355,40 @@ function lowerSwitch<E extends { ext: string } = ExtOpPayload>(s: SwitchStatemen
             if(seen.has(label)) throw new Error(`Duplicate switch case label ${label}`)
             seen.add(label)
 
-            // In C this would fall through into the next case. There is no
-            // opcode for that (isa-core.md §4.5) and no way to reach one
-            // case's code from another, so the idiom is rejected rather
-            // than silently lowered as "do nothing for this label".
-            if(c.consequent.length === 0)
-                throw new Error(`Empty body for case ${label}: this DSL has no fallthrough — give the label its own statements, ` +
-                    `or omit it to let that value reach the default`)
-
             return {label, stmts: c.consequent}
         })
         .sort((a, b) => a.label - b.label)
 
-    const groups = switchGroups(sorted.map(c => c.label))
+    // C's `case 0: case 1: X` — an empty body shares the next label's.
+    // `FALLTHROUGH` (isa-core.md §4.5) continues into the case physically
+    // next in the table, so the shared label has to be the next one:
+    // anything else would land in a gap filler, which exits to the default.
+    for(const [i, c] of sorted.entries())
+    {
+        if(c.stmts.length > 0) continue
+
+        const next = sorted[i + 1]
+        if(!next || next.label !== c.label + 1)
+            throw new Error(`Empty body for case ${c.label}: it can only share the body of case ${c.label + 1}, ` +
+                `which this switch does not have — repeat the statements under each label instead`)
+    }
+
+    // The `default:` clause is a case block of its own — `case[N]`, run
+    // only when no label matched, never also when a non-terminating case
+    // fell out of the construct. A gap inside a group runs it too, so a
+    // gap costs one copy of it and grouping cannot be decided without its
+    // size; the throwaway scope here measures, the real one below emits.
+    const lowerDefault = (scope: RegAlloc<E>): RtlInstr<E>[] =>
+    {
+        if(!defaults[0]) return [bare<E>("BLOCK_END")]
+
+        const body = lowerBlock(defaults[0].consequent, scope)
+        assert.ok(body, `Failed to lower switch default clause`)
+        return closeBlock(body)
+    }
+
+    const gapBytes = lowerDefault(new RegAlloc<E>(alloc)).reduce((n, i) => n + instrBytes(i), 0)
+    const groups = switchGroups(sorted.map(c => c.label), gapBytes)
 
     // A chain needs the discriminant more than once, and acc does not
     // survive the first split (isa-core.md §8.7) — so it goes to a slot,
@@ -389,63 +403,44 @@ function lowerSwitch<E extends { ext: string } = ExtOpPayload>(s: SwitchStatemen
     const bodyOf = new Map<number, RtlInstr<E>[]>()
     for(const c of sorted)
     {
+        if(c.stmts.length === 0) { bodyOf.set(c.label, [bare<E>("FALLTHROUGH")]); continue }
+
         const body = lowerBlock(c.stmts, new RegAlloc<E>(alloc))
         assert.ok(body, `Failed to lower switch case ${c.label}`)
-        bodyOf.set(c.label, closeBlock(c.stmts, body))
+        bodyOf.set(c.label, closeBlock(body))
     }
+
+    const otherwise = lowerDefault(new RegAlloc<E>(alloc))
 
     const load = (): RtlInstr<E>[] => [LOAD<E>(slot)]
     const shift = (lo: number): RtlInstr<E>[] => lo === 0 ? [] : [opImm<E>("SUB", lo)]
 
-    /** One group as a `BR_TABLE` over `label - lo`, gaps included: an
-     *  absent label's slot is an empty case, which exits the construct
-     *  exactly as an out-of-range discriminant does. */
-    function table(group: number[], from: RtlInstr<E>[]): RtlInstr<E>[]
+    /** One group as a `BR_TABLE` over `label - lo`. An absent label inside
+     *  the span gets its own copy of the default block: `BR_TABLE`'s index
+     *  is exact below `N`, so a gap cannot share `case[N]`'s code — which
+     *  is exactly what `switchGroups` prices a gap at. */
+    function table(group: number[], from: RtlInstr<E>[], dflt: RtlInstr<E>[]): RtlInstr<E>[]
     {
         const lo = group[0]!
         const span = group[group.length - 1]! - lo + 1
-        const filled = [...Array(span)].map((_, i) =>
-            bodyOf.get(lo + i) ?? [bare<E>("BLOCK_END")])
+        const filled = [...Array(span)].map((_, i) => bodyOf.get(lo + i) ?? otherwise)
 
-        return [...from, ...shift(lo), brTable(span), ...filled.flat()]
+        return [...from, ...shift(lo), brTable(span), ...filled.flat(), ...dflt]
     }
 
-    /** Groups after the first are reached through a test on the previous
-     *  one's failure. The last needs none: `BR_TABLE`'s own out-of-range
-     *  case already means "none of these", which is what the default is. */
+    /** Groups after the first sit in the previous one's `case[N]`: "none of
+     *  these" is a place code can go (isa-core.md §7.1), so no group needs
+     *  a range test of its own. That default case is a block like any
+     *  other, so what goes in it gets closed like any other. */
     function chain(index: number): RtlInstr<E>[]
     {
-        const group = groups[index]!
-        if(index === groups.length - 1) return table(group, load())
-
-        const lo = group[0]!
-        const span = group[group.length - 1]! - lo + 1
-
-        // Complementary test, as everywhere a `BR_TABLE` dispatches
-        // (isa-core.md §7.3): acc = 0 selects case[0], this group.
-        //
-        // A lone label needs no table behind its test — passing it *is* the
-        // dispatch, so case[0] is the body itself.
-        if(span === 1)
-            return [
-                ...load(), opImm<E>("NE", lo),
-                brTable(2),
-                ...bodyOf.get(lo)!,
-                ...chain(index + 1), bare("BLOCK_END"),
-            ]
-
-        return [
-            ...load(), ...shift(lo), opImm<E>("GT_U", span - 1),
-            brTable(2),
-            ...table(group, load()), bare("BLOCK_END"),
-            ...chain(index + 1), bare("BLOCK_END"),
-        ]
+        return table(groups[index]!, load(),
+            index === groups.length - 1 ? otherwise : closeBlock(chain(index + 1)))
     }
 
     return [
         ...disc.fragment,
-        ...(chained ? [PUSH<E>(), ...chain(0)] : table(groups[0]!, [])),
-        ...(defaults[0] ? lowerBlock(defaults[0].consequent, new RegAlloc<E>(alloc)) : []),
+        ...(chained ? [PUSH<E>(), ...chain(0)] : table(groups[0]!, [], otherwise)),
     ]
 }
 
@@ -466,7 +461,7 @@ function lowerWhile<E extends { ext: string } = ExtOpPayload>(s: WhileStatement,
         bare("LOOP"),
         ...test.fragment,
         bare("BLOCK_END"),
-        ...closeControlBody(s.body, bodyTerm),
+        ...closeBlock(bodyTerm),
     ]
 }
 
@@ -520,6 +515,6 @@ function lowerFor<E extends { ext: string } = ExtOpPayload>(s: ForStatement, all
         // The increment is dead code when the body always terminates first
         // (e.g. every path `return`s) — omit it and the back-edge closer
         // with it, matching the terminator-closed body shape (§14.4).
-        ...(alwaysTerminates(bodyStmts) ? [] : [...update, bare("BLOCK_END")]),
+        ...(fallsThrough(body) ? [...update, bare("BLOCK_END")] : []),
     ]
 }

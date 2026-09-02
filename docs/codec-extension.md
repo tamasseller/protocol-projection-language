@@ -543,15 +543,15 @@ BLOCK_END
 BLOCK_END
   CALL_CODEC codec_c, o0, 2
 BLOCK_END
-CONST #0                  ; acc is dead after a BR_TABLE (isa-core.md §8.7)
+BLOCK_END                 ; the default case: no such variant
+CONST #0                  ; the empty default case leaves acc dead (§8.7)
 RETURN
 ```
 
-The shared `RETURN` needs that producer of its own: §4.5's implicit default
-reaches the merge too, and being pure fall-through it holds no instructions
-that could establish a value, so no case's `CALL_CODEC` result is readable
-past the construct. §8.7's variant-decoder shape avoids the question
-entirely by closing every case with `RETURN`.
+The shared `RETURN` needs that producer of its own: acc crosses a dispatch
+merge only when *every* case reaching it leaves it live (§8.7), and the
+empty default case does not. §8.7's variant-decoder shape avoids the
+question entirely by closing every case with `RETURN`.
 
 ### 8.3 LEB128 encoder: generic-core loop as a shared `CALL` target
 
@@ -721,39 +721,39 @@ site.
 
 Decoder-side counterpart of §8.4. After reading the body, recompute the
 checksum and compare against the received byte; on mismatch, `TRAP`. This
-is an `if`-without-`else` (isa-core.md §7.3), so it lowers to `BR_TABLE 1`:
-mismatch is `case[0]`, reached when `acc = 0`, and match falls through the
-implicit default. `TRAP` is a terminator (isa-core.md §4.5), so it closes
-`case[0]` with no `BLOCK_END` and no trailing `RETURN`:
+is an `if`-without-`else`, so it lowers to `BR_TABLE 1` with the mismatch in
+`case[0]` — the case `acc = 0` selects (isa-core.md §4.5) — and the match in
+`case[1]`. `TRAP` is a terminator (§4.5), so it closes `case[0]` with no
+`BLOCK_END` and no trailing `RETURN`:
 
 ```
 ; (assume reader fork i1 walked, checksum accumulated in r_sum, as in §8.4)
 LOAD r_sum
 READ 2, 1              ; acc = received checksum byte from parked writer fork
 EQ r_expected          ; acc = (computed == received)
-BR_TABLE 1             ; case 0 (mismatch): trap; default (match): continue
+BR_TABLE 1             ; case 0 (mismatch): trap; case 1 (match): continue
   TRAP ERR_CHECKSUM    ; terminator: no BLOCK_END, no RETURN follows
-; --- implicit default: match, continue decode ---
+; --- case 1: match, continue decode ---
 ; ...rest of decode...
 RETURN
 ```
 
-Exhaustive-union decoding uses the same implicit default as the home for an
-out-of-range tag. A union decoder dispatches on the received tag via
-`BR_TABLE N` over all `N` valid variants; `acc ≥ N` falls through to the
-trailing `TRAP`. Each variant case delegates to its variant's decoder and
-`RETURN`s, which closes the case so no `BLOCK_END` follows:
+Exhaustive-union decoding puts an out-of-range tag in the default case. A
+union decoder dispatches on the received tag via `BR_TABLE N` over all `N`
+valid variants; `acc ≥ N` runs `case[N]`, which is the `TRAP`. Each variant
+case delegates to its variant's decoder and `RETURN`s, which closes the case
+so no `BLOCK_END` follows:
 
 ```
 READ i0, 1             ; acc = variant tag
-BR_TABLE 3             ; cases 0..2 valid; acc≥3 → implicit default
+BR_TABLE 3             ; cases 0..2 valid; acc >= 3 selects the default case
   CALL_CODEC codec_0, o0, 0
   RETURN
   CALL_CODEC codec_1, o0, 1
   RETURN
   CALL_CODEC codec_2, o0, 2
   RETURN
-TRAP ERR_BAD_TAG       ; implicit default (acc≥3, invalid tag), terminator
+  TRAP ERR_BAD_TAG     ; the default case: invalid tag, terminator
 ```
 
 `ERR_CHECKSUM`/`ERR_BAD_TAG` are codec-defined high error codes

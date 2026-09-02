@@ -9,15 +9,35 @@
 ## Control flow
 
 **One branching primitive, no offsets.** A conditional branch is a jump
-table with two targets, one possibly empty, so there is one construct
-(`BR_TABLE`) rather than branch-if plus switch. It carries a case count and
-no offsets or block lengths: the DSL forbids `goto`, so every branch target
-is already well-nested, and that structural constraint is exactly the
-entropy a generic `br + offset` would spend bits carrying. Lenient
-implicit-default semantics (`acc ≥ N` skips every case) let `if`,
-`if-else` and `switch` share the construct with no validate-then-dispatch
-preamble, and cost an `if`-without-`else` only `N=1` with no empty trailing
-block.
+table with two targets, so there is one construct (`BR_TABLE`) rather than
+branch-if plus switch. It carries a case count and no offsets or block
+lengths: the DSL forbids `goto`, so every branch target is already
+well-nested, and that structural constraint is exactly the entropy a
+generic `br + offset` would spend bits carrying.
+
+**The out-of-range outcome is a case, not a missing edge.** `BR_TABLE N`
+opens `N+1` blocks and `acc ≥ N` runs `case[N]` (isa-core.md §4.5). The
+earlier design had `acc ≥ N` skip every case instead, which saved a
+`BLOCK_END` on an `if`-without-`else` and cost everything else:
+
+- The dispatch was index-*exact*, so a two-way test had to be exactly 0 or
+  1. Every `if` therefore emitted its condition **complemented**, purely so
+  the true arm could sit at `case[0]` — a normalization step in the lowerer,
+  a table of inverted operators in the spec, and a second notion of truth
+  next to `LOOP`'s own lenient condition block.
+- The skip edge held no instructions, so nothing could be flushed onto it
+  and no value could cross the merge. A ternary had to reserve a slot ahead
+  of the dispatch, `STORE` into it from both arms and `LOAD` it back —
+  seven bytes — or the ISA needed a second, exhaustive dispatch opcode
+  beside the first.
+- A `switch` group had to be preceded by an explicit range test to reach
+  the next group, because "none of these" was not a place code could go.
+- `default:` had no home: the clause was emitted *after* the construct,
+  un-gated, so it also ran whenever a non-terminating case fell out.
+
+With `case[N]` present, all four disappear at once. The cost is one
+`BLOCK_END` on an `if`-without-`else`, and one on a `switch` with no
+`default:`.
 
 **`LOOP` opens two blocks.** A condition sub-block (always run, leaves a
 decision in `acc`) plus a body sub-block (run conditionally, then loops
@@ -35,6 +55,18 @@ opcode every loop uses.
 path would ever emit the opcode, and carrying one costs encoding space and
 validation surface for nothing. A loop that would `break` early folds the
 early-exit test into its condition block.
+
+**`FALLTHROUGH` costs a byte and saves a branch.** A dispatch case that
+continues into the next one is what C's `case 0: case 1: X` needs, and the
+table's own layout already puts the next case's body immediately after this
+one — so a backend implements it by *not* emitting the branch to the merge
+that a `BLOCK_END` close needs. It is the rare opcode that makes emitted
+code smaller than the construct it replaces.
+
+The restriction that it only reaches the physically next case is the same
+"no offsets" property that makes every other target structural: two labels
+cannot name one body unless they are adjacent in the table. The alternative
+is duplicating the body, which is a size decision, not an encoding one.
 
 **`TRAP` is one generic opcode, not a per-domain family.** Any consumer of
 this ISA needs a way to stop and report a reason: a codec validating a
@@ -59,33 +91,38 @@ comparison-fusion optimization defers a comparison's boolean to a CPU
 condition code and never materializes it on the edge that skips the branch
 body) by construction: rather than teach every backend to correctly
 compile a pattern nothing legitimate uses, the pattern is simply not valid
-input. The rule is total — acc is dead after the whole construct too, not
-just on entry to each case — for a structural reason rather than a
-conservative one: the standard phi discipline ("join requires an explicit
-flush on every incoming edge") cannot be honoured at a `BR_TABLE` join at
-all, because the implicit default is the one edge in this ISA that holds no
-instructions. There is nowhere to put the flush. Making the rule depend on
-whether `acc ≥ N` is reachable would be worse than useless as an interface:
-it turns the spec into "whatever range analysis this validator happens to
-implement", so a second conforming implementation could not be written from
-the spec at all.
+input. That is the *entry* rule, and it stays total. The **exit** rule is not:
+acc survives the merge iff every case reaching it leaves it live (§8.7).
+The standard phi discipline — "a join requires an explicit flush on every
+incoming edge" — is honourable here precisely because every edge into the
+merge is a case body, somewhere a backend can put the flush. A validator
+still decides it locally, from the cases' own exit liveness, never from a
+range analysis over the dispatch value: "whatever range analysis this
+implementation happens to do" would not be a spec a second implementation
+could be written from.
 
-The consequence for the one value-producing branch the DSL has — the
-ternary — is that its result travels in a TOS slot, not in acc (isa-core.md
-§8.7): `lower.ts` lifts each one out of the expression it sat in and emits
-it ahead of that expression as a `BR_TABLE 2` writing a slot reserved
-before the dispatch. The alternative would be a *declared* exhaustive
-dispatch — an opcode carrying "this dispatch is total, `acc ≥ N` traps" —
-so that the property is read off the instruction instead of inferred. (The
-out-of-range `trap()` §7.1 mentions already has a home without it: close
-every case with a terminator and the code after the construct *is* the
-default's, as docs/codec-extension.md §8.7's variant decoder does.) That was
-a legitimate §5.3 candidate while §5.3 still had codes to spend:
-`BR_TABLE` already takes three of the five local-flow codes, an exhaustive
-flavour needs two more, and the single-byte ranges are full. What it would
-buy is small either way — the slot discipline costs one `PUSH` for the whole
-construct and one `STORE` per arm — so it has not been taken; §5.3's
-`MISC_CF` escape is where it would go, at two bytes.
+So the one value-producing branch the DSL has — the ternary — rides acc
+across the merge: each arm simply ends with its value there. Only a ternary
+nested inside a larger expression still takes a slot, because something
+else runs between the merge and the consumer.
+
+**`BR_TABLE 0` has no encoding.** One always-taken block is a scoped block,
+not a branch — the bare block statement the DSL excludes below, and the one
+shape `N+1` blocks would otherwise make expressible by accident. Rejecting
+it at the encoding rather than in the validator costs nothing: `N = 1` has
+a dedicated single-byte code, and the extended form's operand is biased by
+2 (isa-core.md §5.4), so neither 0 nor 1 can be spelled there. That also
+makes the encoding canonical — before the bias, `N = 1` and `N = 2` each
+had two spellings a decoder accepted and an encoder had to choose between.
+
+**`N = 1` gets the dedicated code; `N = 2` gave one back.** `if`, `if-else`
+and the ternary all lower to `BR_TABLE 1`, which leaves `N = 2` meaning
+"a `switch` group with two labels" — no more special than three. Retiring
+its dedicated code freed exactly one core byte, and `FALLTHROUGH` took it:
+at one byte instead of two, sharing a case body costs the same as the empty
+gap slot it replaces. Local flow still spends five codes, and `MISC_CF`
+stays empty as the growth path for control flow the block structure cannot
+express.
 
 **Bare block statements are excluded from the DSL.** A `{ ... }` is only
 reachable as the direct body of `if`/`else`/`while`/`for`. `BLOCK_END` is

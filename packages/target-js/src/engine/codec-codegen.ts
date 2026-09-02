@@ -222,7 +222,8 @@ function translateStmt(s: Stmt<CodecExtInstr>, entryNode: TypeNode | undefined, 
             {
                 s.cases.forEach((body, i) =>
                 {
-                    b.block(`case ${i}: {`, () =>
+                    // The last arm is every other value (isa-core.md §4.5).
+                    b.block(i === s.cases.length - 1 ? "default: {" : `case ${i}: {`, () =>
                     {
                         translateStmts(body, entryNode, g, b)
                         if(!endsInTerminator(body)) b.line("break")

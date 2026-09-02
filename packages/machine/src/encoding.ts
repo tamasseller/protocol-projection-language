@@ -26,10 +26,12 @@ function leb128Bytes(n: number): number
 export function instrBytes<E extends { ext: string } = ExtOpPayload>(instr: RtlInstr<E>): number
 {
     if (instr.op === "CALL") return 2
-    if (instr.op === "BR_TABLE" || instr.op === "TRAP") return 2
+    if (instr.op === "TRAP") return 2
+    // §5.4: `#1` has its own code, everything else the extended form biased by 2.
+    if (instr.op === "BR_TABLE") return instr.imm === 1 ? 1 : 1 + leb128Bytes(instr.imm - 2)
     if (instr.op === "LOAD" || instr.op === "STORE") return 2
     if (instr.op === "PUSH") return 1
-    // §5.3's MISC_UNARY escape: opcode byte plus a sub-code.
+    // §5.3's escapes: opcode byte plus a sub-code.
     if (instr.op === "CLZ" || instr.op === "REVBITS") return 2
     if (instr.op === "CONST")
         return instr.imm >= 0 && instr.imm <= 15 ? 1 : 1 + leb128Bytes(instr.imm)

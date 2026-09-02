@@ -255,8 +255,8 @@ function analyzeProcedure(proc: RtlProc<CodecExtInstr>, procIndex: number, progr
         }
     }
 
-    /** Mirrors `validate.ts`'s own `walk` shape exactly (BR_TABLE's N cases,
-     *  LOOP's cond-then-body), threading a handle-type environment instead
+    /** Mirrors `validate.ts`'s own `walk` shape exactly (BR_TABLE's N+1
+     *  blocks, LOOP's cond-then-body), threading a handle-type environment instead
      *  of a TOS depth. Each branch/loop sub-block gets its own copy — no
      *  case or iteration's handle bindings are assumed to survive past it,
      *  matching every rule body actually written so far (a hoisted
@@ -276,7 +276,7 @@ function analyzeProcedure(proc: RtlProc<CodecExtInstr>, procIndex: number, progr
             if(instr.op === "BR_TABLE")
             {
                 let p = pc + 1
-                for(let k = 0; k < instr.imm; k++)
+                for(let k = 0; k <= instr.imm; k++)
                     ({nextPc: p} = walk(p, new Map(env), new Map(iterEnv)))
                 pc = p; continue
             }

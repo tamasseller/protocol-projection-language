@@ -103,15 +103,37 @@ describe("ternary — only one arm runs", () =>
         returns("u32 a = 1; return a ? 5 : (a ? trap(7) : trap(8));", 5))
 })
 
-describe("ternary — the reserved slot", () =>
+describe("ternary — where the value rides", () =>
 {
-    // isa-core.md §8.7: reserve before the dispatch, store at the end of
-    // every case. A slot pushed inside a case would be dropped again by
-    // that case's own BLOCK_END (§8.1).
-    test("the dispatch is preceded by the reserving PUSH, and both arms store that slot", () =>
+    // Every edge into a dispatch merge is a case body that establishes
+    // acc, so it survives (isa-core.md §8.7). No slot is involved at all.
+    test("a whole-expression ternary rides acc, with no slot", () =>
     {
         const ops = opsOf("u32 a = 7; return a > 3 ? 1 : 2;")
-        const dispatch = ops.indexOf("BR_TABLE 2")
+
+        assert.ok(ops.includes("BR_TABLE 1"), ops.join(" | "))
+        assert.equal(ops.filter(o => o.startsWith("STORE")).length, 0, ops.join(" | "))
+        assert.equal(ops.filter(o => o === "PUSH").length, 1, ops.join(" | ")) // `a`'s own declaration
+    })
+
+    test("an initializer rides acc too, and is pushed once at the end", () =>
+    {
+        const ops = opsOf("u32 a = 7; u32 b = a > 3 ? 11 : 22; return b;")
+        const dispatch = ops.indexOf("BR_TABLE 1")
+
+        assert.ok(dispatch > 0, ops.join(" | "))
+        assert.equal(ops[ops.length - 3], "PUSH", ops.join(" | ")) // b's slot, after the merge
+        assert.equal(ops.filter(o => o.startsWith("STORE")).length, 0, ops.join(" | "))
+    })
+
+    // Nested in a larger expression, acc cannot survive to the consumer —
+    // something else runs in between — so this one still takes a slot,
+    // reserved before the dispatch and stored at the end of every case (a
+    // slot pushed *inside* a case would be dropped by its own BLOCK_END).
+    test("a ternary inside a larger expression still takes a slot", () =>
+    {
+        const ops = opsOf("u32 a = 7; return (a > 3 ? 1 : 2) + a;")
+        const dispatch = ops.indexOf("BR_TABLE 1")
 
         assert.ok(dispatch > 0, ops.join(" | "))
         assert.equal(ops[dispatch - 1], "PUSH", ops.join(" | "))
@@ -120,8 +142,11 @@ describe("ternary — the reserved slot", () =>
         assert.deepEqual(stores, ["STORE 1", "STORE 1"], ops.join(" | "))
     })
 
-    test("the slot outlives the cases, so the value survives the merge", () =>
-        returns("u32 a = 7; u32 b = a > 3 ? 11 : 22; return b + 1;", 12))
+    test("either way the value survives the merge", () =>
+    {
+        returns("u32 a = 7; u32 b = a > 3 ? 11 : 22; return b + 1;", 12)
+        returns("u32 a = 7; return (a > 3 ? 11 : 22) + 1;", 12)
+    })
 })
 
 describe("ternary — inside control flow", () =>

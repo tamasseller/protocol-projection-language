@@ -128,9 +128,11 @@ function evalRaisedProgram(
 
                 case StmtKind.Dispatch:
                 {
+                    // The last arm is C's `default:` — every value at or
+                    // above `cases.length - 1` (isa-core.md §4.5).
                     const idx = evalExpr(s.test, slots)
-                    const chosen = idx >= 0 && idx < s.cases.length ? s.cases[idx] : undefined
-                    if(chosen) execStmts(chosen, slots) // no case: implicit fallthrough past the whole dispatch
+                    const last = s.cases.length - 1
+                    execStmts(s.cases[idx < last ? idx : last]!, slots)
                     break
                 }
 

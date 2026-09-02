@@ -124,11 +124,12 @@ describe("codec extension — union (TAG + CALL_CODEC's fused ENTER/instantiate)
             brTable(2),
             callCodecInstr(1, 0, 0), bare("BLOCK_END"), // case 0: "a"
             callCodecInstr(2, 0, 1), bare("BLOCK_END"), // case 1: "b"
-            // isa-core.md §8.7: acc is dead after a BR_TABLE however the
-            // cases ended — §4.5's implicit default reaches this merge too
-            // and holds no instructions to establish a value on. So the
-            // shared RETURN needs a producer of its own; it cannot return
-            // whichever case's CALL_CODEC result happened to run.
+            bare("BLOCK_END"),                          // case 2: no such variant
+            // isa-core.md §8.7: acc survives a merge only when every case
+            // reaching it leaves it live, and the empty default case
+            // doesn't. So the shared RETURN needs a producer of its own; it
+            // cannot return whichever case's CALL_CODEC result happened to
+            // run.
             CONST(0), bare("RETURN"),
         ]
     }

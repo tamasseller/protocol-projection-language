@@ -170,8 +170,9 @@ export function evalUnary(V: number, op: RtlInstr["op"]): number
 function skipConstruct<E extends { ext: string } = ExtOpPayload>(body: RtlInstr<E>[], pc: number): number
 {
     const opener = body[pc]
-    if(opener.op === "BR_TABLE") return skipBlocks(body, pc + 1, opener.imm)
-    return skipBlocks(body, pc + 1, 2) // LOOP: condition block + body block
+    if(opener.op === "BR_TABLE") return skipBlocks(body, pc + 1, opener.imm + 1)
+    // LOOP: condition block + body block.
+    return skipBlocks(body, pc + 1, 2)
 }
 
 /** Skip over `count` sibling blocks starting at `pc`; return the pc just
@@ -187,7 +188,7 @@ function skipBlocks<E extends { ext: string } = ExtOpPayload>(body: RtlInstr<E>[
             const i = body[p]
             if(i.op === "BR_TABLE" || i.op === "LOOP") { p = skipConstruct(body, p); continue }
             p++
-            if(i.op === "BLOCK_END" || i.op === "RETURN" || i.op === "TRAP") break
+            if(i.op === "BLOCK_END" || i.op === "FALLTHROUGH" || i.op === "RETURN" || i.op === "TRAP") break
         }
     }
     return p
@@ -361,21 +362,15 @@ function runProc<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E
                 requireAccLive("BR_TABLE")
                 const N = i.imm
 
-                // isa-core.md §8.7: acc is dead after the whole construct,
-                // and the implicit default (§4.5, `acc >= N` runs no case
-                // at all) is exactly why. Physically the dispatch value is
-                // still sitting in `acc` on this path — nothing below
-                // writes it — but that edge holds no instructions, so a
-                // join after the construct could never be given a value on
-                // every incoming edge. Rather than let one edge's accident
-                // define the rule, every edge out of the dispatch is dead.
-                if(acc >= N) { accLive = false; pc = skipBlocks(body, pc + 1, N); break }
+                // isa-core.md §4.5: N indexed cases plus the default case,
+                // so every value of acc selects one of the N+1 blocks.
+                const taken = acc >= N ? N : acc
 
-                // A selected case starts dead too, regardless of what was
-                // live going into the dispatch.
+                // A selected case is a split successor, so it starts dead
+                // regardless of what was live going into the dispatch.
                 accLive = false
-                pc = skipBlocks(body, pc + 1, acc) // skip cases before the selected one
-                ctrl.push({kind: "case", remaining: N - acc - 1, entryTos: tos})
+                pc = skipBlocks(body, pc + 1, taken) // skip cases before the selected one
+                ctrl.push({kind: "case", remaining: N - taken, entryTos: tos})
                 break
             }
 
@@ -383,6 +378,23 @@ function runProc<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E
                 ctrl.push({kind: "loopCond", loopPc: pc, entryTos: tos})
                 pc++
                 break
+
+            case "FALLTHROUGH": {
+                const top = ctrl.pop()
+                if(!top) throw new Error(`FALLTHROUGH at ${pc}: no open block`)
+                if(top.kind !== "case") throw new Error(`FALLTHROUGH at ${pc}: not closing a dispatch case`)
+                if(top.remaining === 0) throw new Error(`FALLTHROUGH at ${pc}: no next case to continue into`)
+
+                assert.ok(tos >= top.entryTos, `TOS underflow at FALLTHROUGH ${pc}: below block entry depth`)
+                tos = top.entryTos
+
+                // The next case's body starts right here, and it is a split
+                // successor like any other case, so it starts dead.
+                accLive = false
+                ctrl.push({kind: "case", remaining: top.remaining - 1, entryTos: top.entryTos})
+                pc++
+                break
+            }
 
             case "BLOCK_END": {
                 const top = ctrl.pop()
@@ -397,11 +409,9 @@ function runProc<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E
 
                 if(top.kind === "case")
                 {
-                    // Falling out of a case reaches the construct's merge
-                    // point, where isa-core.md §8.7 says acc is dead
-                    // however the case ended — matching the default edge,
-                    // which has no instructions to establish one.
-                    accLive = false
+                    // acc crosses the merge as this case left it: every
+                    // edge in is a case body, so there is no valueless one
+                    // to meet against (isa-core.md §8.7).
                     pc = skipBlocks(body, pc + 1, top.remaining) // past any sibling cases
                     break
                 }

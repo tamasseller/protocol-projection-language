@@ -289,8 +289,9 @@ point; choosing what to do with it is real target-codegen work.
 leaves, `grammer.pegjs`'s recursive-descent parser dominates wall-clock
 time; `tileExpr` is flat in tree width. Not investigated further.
 
-**The DSL has three limitations that follow from the ISA.** docs/dsl-limitations.md
+**The DSL has four limitations that follow from the ISA.** docs/dsl-limitations.md
 states each with what to write instead: no divide (write the helper), a
 `for` init's register outliving its name (C's own equivalence, minus the
-bare block this DSL excludes), and no spelling for a no-op `switch` case.
-The audit that found them also closed everything else it found.
+bare block this DSL excludes), a shared `switch` body needing adjacent
+labels, and no spelling for a no-op `switch` case. The audit that found them
+also closed everything else it found.

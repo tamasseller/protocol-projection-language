@@ -122,6 +122,11 @@ export type ControlOpcode =
     | "RETURN"
     | "BLOCK_END"
     | "LOOP"
+    | "FALLTHROUGH"
+
+/** The block closers: `BLOCK_END` leaves the construct, `FALLTHROUGH`
+ *  continues into the next case (§4.5). */
+export const BLOCK_CLOSERS: ReadonlySet<string> = new Set(["BLOCK_END", "FALLTHROUGH"])
 
 /** Move-class opcodes with a register operand — unfused local access, no
  *  ALU combining (§4.4). */
@@ -287,7 +292,8 @@ export const opStack = <E extends { ext: string } = ExtOpPayload>(op: BinaryOpco
 export const bare = <E extends { ext: string } = ExtOpPayload>(op: UnaryOpcode | ControlOpcode): RtlInstr<E> =>
     ({ op })
 
-/** `BR_TABLE #n` — open dispatch block with n cases. */
+/** `BR_TABLE #n` — open a dispatch with `n` indexed cases plus a default
+ *  case (isa-core.md §4.5: `n + 1` blocks in all). `n` is at least 1. */
 export const brTable = <E extends { ext: string } = ExtOpPayload>(n: number): RtlInstr<E> =>
     ({ op: "BR_TABLE", imm: n })
 
@@ -331,6 +337,72 @@ export interface RtlProc<E extends { ext: string } = ExtOpPayload>
 export interface RtlProgram<E extends { ext: string } = ExtOpPayload>
 {
     procedures: RtlProc<E>[]
+}
+
+/**
+ * Walk one block of a lowered fragment from `pc`, reporting where its own
+ * close is, whether that close *leaves* the block (`exits` — a `BLOCK_END`
+ * does, a terminator and a `FALLTHROUGH` do not), and whether any path can
+ * actually get there (`reachable`). Read off the emitted instructions
+ * rather than re-derived from the AST, so it cannot drift from what the
+ * lowering actually produced.
+ *
+ * A nested construct is skipped whole and always counts as continuing past
+ * itself, even when every one of its cases terminates: every consumer of
+ * the flat instruction stream counts blocks structurally, and none of them
+ * should have to prove reachability first. `reachable` is where that
+ * shows — a block whose close no path reaches still has one.
+ */
+function blockClose<E extends { ext: string } = ExtOpPayload>(body: readonly RtlInstr<E>[], pc: number): {next: number; exits: boolean; reachable: boolean}
+{
+    let reachable = true
+
+    while(pc < body.length)
+    {
+        const i = body[pc]!
+
+        if(i.op === "BR_TABLE" || i.op === "LOOP")
+        {
+            let p = pc + 1
+            let reaches = false
+
+            const blocks = i.op === "BR_TABLE" ? i.imm + 1 : 2
+
+            for(let k = 0; k < blocks; k++)
+            {
+                const arm = blockClose(body, p)
+                reaches = reaches || (arm.exits && arm.reachable)
+                p = arm.next
+            }
+
+            pc = p
+            reachable = reachable && reaches
+            continue
+        }
+
+        if(i.op === "BLOCK_END") return {next: pc + 1, exits: true, reachable}
+        if(i.op === "FALLTHROUGH" || i.op === "RETURN" || i.op === "TRAP") return {next: pc + 1, exits: false, reachable}
+
+        pc++
+    }
+
+    return {next: pc, exits: true, reachable}
+}
+
+/** Whether a complete block fragment still needs a closer of its own. */
+export function fallsThrough<E extends { ext: string } = ExtOpPayload>(fragment: readonly RtlInstr<E>[]): boolean
+{
+    return blockClose(fragment, 0).exits
+}
+
+/** Whether any path through a complete block fragment reaches its end.
+ *  False when every path already left through a terminator — including one
+ *  inside every case of a construct, which `fallsThrough` deliberately
+ *  does not look through. */
+export function reachesEnd<E extends { ext: string } = ExtOpPayload>(fragment: readonly RtlInstr<E>[]): boolean
+{
+    const close = blockClose(fragment, 0)
+    return close.exits && close.reachable
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

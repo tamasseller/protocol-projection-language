@@ -125,7 +125,7 @@ describe("jit-armv6m program frame (design.md §1.1)", () =>
         // through the mixer: nothing else here would catch one side widening
         // it as signed.
         const vector = Uint8Array.from([0x00, 0x00, 0x01, 0x00, 0x80, 102])
-        assert.equal(programFrameHash(vector), 0xdc7d)
+        assert.equal(programFrameHash(vector), 0x369c)
     })
 
     test("the unframed envelope still round-trips on its own", () =>

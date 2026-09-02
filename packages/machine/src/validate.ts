@@ -30,6 +30,18 @@ import type { Extension, ExtOpEffect } from "./extension"
 
 // ─────────────────────────────────────────────────────────────────────────────
 
+/** How a block ended: `"end"` leaves the construct, `"fall"` continues into
+ *  the next case (§4.5's `FALLTHROUGH`), `"terminated"` leaves the
+ *  procedure. */
+type Close = "end" | "fall" | "terminated"
+
+interface WalkResult
+{
+    nextPc: number
+    close: Close
+    exitAccLive: boolean
+}
+
 export interface ProcedureStats
 {
     /** Max TOS depth reached anywhere in this procedure's own frame —
@@ -139,12 +151,12 @@ function walkProcedure<E extends { ext: string } = ExtOpPayload>(
      *  below) — it must not append to `callSites` a second time for the
      *  same call site, so it's threaded through every recursive `walk`
      *  call and gates that one push. Nothing else needs gating: `walk`'s
-     *  own structural shape (which `pc`s it visits, `terminated`,
+     *  own structural shape (which `pc`s it visits, `close`,
      *  `nextPc`) never depends on `accLive`, only whether `requireAcc`
      *  throws does — so a probe walk always visits exactly the same
      *  instructions a committed walk of the same sub-block would, and
      *  `peak = Math.max(...)` below can't come out differently either. */
-    function walk(pc: number, entryTos: number, entryAccLive: boolean, commit: boolean = true): { nextPc: number; terminated: boolean; exitAccLive: boolean }
+    function walk(pc: number, entryTos: number, entryAccLive: boolean, commit: boolean = true): WalkResult
     {
         let tos = entryTos
         let accLive = entryAccLive
@@ -165,9 +177,10 @@ function walkProcedure<E extends { ext: string } = ExtOpPayload>(
             const instr: RtlInstr<E> = body[pc]!
             peak = Math.max(peak, tos)
 
-            if(instr.op === "BLOCK_END") return { nextPc: pc + 1, terminated: false, exitAccLive: accLive }
-            if(instr.op === "RETURN") { requireAcc("RETURN"); return { nextPc: pc + 1, terminated: true, exitAccLive: accLive } }
-            if(instr.op === "TRAP") return { nextPc: pc + 1, terminated: true, exitAccLive: accLive }
+            if(instr.op === "BLOCK_END") return { nextPc: pc + 1, close: "end", exitAccLive: accLive }
+            if(instr.op === "FALLTHROUGH") return { nextPc: pc + 1, close: "fall", exitAccLive: accLive }
+            if(instr.op === "RETURN") { requireAcc("RETURN"); return { nextPc: pc + 1, close: "terminated", exitAccLive: accLive } }
+            if(instr.op === "TRAP") return { nextPc: pc + 1, close: "terminated", exitAccLive: accLive }
 
             if(instr.op === "PUSH") { requireAcc("PUSH"); tos++; pc++; continue }
 
@@ -234,34 +247,45 @@ function walkProcedure<E extends { ext: string } = ExtOpPayload>(
                 if(effect.readsAcc) requireAcc(`EXT ${instr.ext}`)
                 if(effect.writesAcc) accLive = true
 
-                if(effect.terminates) return { nextPc: pc + 1, terminated: true, exitAccLive: accLive }
+                if(effect.terminates) return { nextPc: pc + 1, close: "terminated", exitAccLive: accLive }
                 pc++; continue
             }
 
             if(instr.op === "BR_TABLE")
             {
+                if(instr.imm < 1) fail(pc, `BR_TABLE ${instr.imm}: a dispatch has at least one indexed case (isa-core.md §4.5)`)
                 requireAcc("BR_TABLE")
                 let p = pc + 1
-                for(let k = 0; k < instr.imm; k++)
+                let reaching: boolean | undefined
+
+                // N indexed cases plus the default case (isa-core.md §4.5).
+                const blocks = instr.imm + 1
+                for(let k = 0; k < blocks; k++)
                 {
                     // isa-core.md §8.7: a split clobbers acc unconditionally
                     // — each case is a split successor, so it starts dead
                     // regardless of what was live going into the dispatch.
-                    p = walk(p, tos, false, commit).nextPc
+                    const arm = walk(p, tos, false, commit)
+                    p = arm.nextPc
+
+                    if(arm.close === "fall")
+                    {
+                        if(k === blocks - 1) fail(p - 1, `FALLTHROUGH closing the default case: there is no next case to continue into`)
+                        continue
+                    }
+                    if(arm.close === "terminated") continue
+
+                    reaching = reaching === undefined ? arm.exitAccLive : (reaching && arm.exitAccLive)
                 }
                 pc = p
-                // And acc is dead *after* the whole construct too, however
-                // the cases end (isa-core.md §8.7). Carrying a value past
-                // the merge would need every incoming edge to establish it,
-                // and §4.5's implicit default (`acc >= N` runs no case at
-                // all) is the one edge in this ISA that holds no
-                // instructions — pure fall-through from the split point,
-                // with nowhere to put the value. So this is a local
-                // property of the opcode: no case's exit liveness is
-                // consulted, and nothing here ever has to reason about
-                // whether `acc >= N` can actually happen. Same treatment
-                // LOOP's exit gets below.
-                accLive = false
+                // The dispatch is total, so every edge into the merge is a
+                // case body that can establish acc, and it survives when
+                // all the ones reaching the merge do (isa-core.md §8.7).
+                // When none does, the merge is unreachable — the construct
+                // still *structurally* closes into it, so that nothing
+                // walking the flat stream has to prove reachability to
+                // count blocks, but nothing is live there.
+                accLive = reaching ?? false
                 continue
             }
 
@@ -275,7 +299,7 @@ function walkProcedure<E extends { ext: string } = ExtOpPayload>(
                 // it always starts dead, regardless of what the condition
                 // itself leaves behind.
                 const cond = walk(pc + 1, tos, accLive, commit)
-                if(cond.terminated) fail(pc, `LOOP's condition sub-block must close with BLOCK_END, not a terminator`)
+                if(cond.close !== "end") fail(pc, `LOOP's condition sub-block must close with BLOCK_END, not ${cond.close === "fall" ? "FALLTHROUGH" : "a terminator"}`)
                 // That BLOCK_END is the loop's own continue/exit dispatch
                 // (§4.5), and a dispatch reads acc (§8.7) — same
                 // requirement BR_TABLE's own requireAcc above imposes,
@@ -284,7 +308,8 @@ function walkProcedure<E extends { ext: string } = ExtOpPayload>(
                 if(!cond.exitAccLive)
                     fail(cond.nextPc - 1, `LOOP condition sub-block's BLOCK_END: read of acc after a write-back-in-place combo or a CFG split clobbered it (isa-core.md §8.7's acc-clobbering convention)`)
                 const body_ = walk(cond.nextPc, tos, false, commit)
-                if(!body_.terminated && body_.exitAccLive !== accLive)
+                if(body_.close === "fall") fail(body_.nextPc - 1, `LOOP's body sub-block must close with BLOCK_END, not FALLTHROUGH`)
+                if(body_.close !== "terminated" && body_.exitAccLive !== accLive)
                 {
                     // A real back-edge exists, and it feeds the condition
                     // sub-block a different entry value than the external
@@ -355,8 +380,8 @@ function walkProcedure<E extends { ext: string } = ExtOpPayload>(
     // [RETURN]}` valid with no defined result: vm.ts seeds such a frame's
     // acc to 0, while jit-armv6m emits no entry flush and returns whatever
     // the caller left in ACC_REG.
-    const { nextPc, terminated } = walk(0, proc.argCount, proc.argCount >= 1)
-    if(!terminated) fail(nextPc, `BLOCK_END with no open block (procedure bodies close only via RETURN/TRAP)`)
+    const { nextPc, close } = walk(0, proc.argCount, proc.argCount >= 1)
+    if(close !== "terminated") fail(nextPc, `${close === "fall" ? "FALLTHROUGH" : "BLOCK_END"} with no open block (procedure bodies close only via RETURN/TRAP)`)
     if(nextPc !== body.length) fail(nextPc, `unreachable instruction(s) after the procedure's terminator`)
 
     return { localPeak: peak, callSites }

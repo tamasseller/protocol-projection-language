@@ -298,7 +298,7 @@ describe("validateProgram — §8.5 header/block well-formedness", () =>
         const program: RtlProgram = {
             procedures: [{
                 argCount: 0,
-                body: [CONST(0), brTable(1), CONST(1), bare("BLOCK_END"), CONST(2), bare("RETURN")],
+                body: [CONST(0), brTable(1), CONST(1), bare("BLOCK_END"), CONST(3), bare("BLOCK_END"), CONST(2), bare("RETURN")],
             }],
         }
         const stats = validateProgram(program)
@@ -360,21 +360,36 @@ describe("validateProgram — §16 item 2: acc-clobbering convention enforcement
         assert.throws(() => validateProgram(program), /read of acc/)
     })
 
-    test("a case that clobbers acc merges safely with a sibling that doesn't, since the whole construct is treated as poisoned afterward", () =>
+    test("a case that clobbers acc merges with a sibling that doesn't, as long as nothing reads the merge", () =>
     {
         const program: RtlProgram = {
             procedures: [{
                 argCount: 0,
                 body: [
                     CONST(5), PUSH(),
-                    brTable(2),
+                    brTable(1),
                     CONST(2), opRegWriteback("ADD", 0), bare("BLOCK_END"), // case 0: fresh producer (§8.7: case starts acc-dead), then poisons it again
                     CONST(1), bare("BLOCK_END"),                            // case 1: leaves acc live
-                    CONST(9), bare("RETURN"),                                // merge point: never reads the pre-merge acc, so this is fine either way
+                    CONST(9), bare("RETURN"),                                // merge point: establishes acc itself, so the meet never matters
                 ],
             }],
         }
         assert.doesNotThrow(() => validateProgram(program))
+
+        // Reading it is what the meet rejects (§8.7).
+        const reading: RtlProgram = {
+            procedures: [{
+                argCount: 0,
+                body: [
+                    CONST(5), PUSH(),
+                    brTable(1),
+                    CONST(2), opRegWriteback("ADD", 0), bare("BLOCK_END"),
+                    CONST(1), bare("BLOCK_END"),
+                    bare("RETURN"),
+                ],
+            }],
+        }
+        assert.throws(() => validateProgram(reading), /read of acc/)
     })
 })
 
@@ -419,14 +434,12 @@ describe("validateProgram — §8.7 acc liveness across control flow", () =>
         assert.throws(() => validateProgram(program), /read of acc/)
     })
 
-    test("code after a whole BR_TABLE reading acc is rejected even when every sibling case re-establishes it", () =>
+    test("code after a whole BR_TABLE reading acc is accepted when every case re-establishes it", () =>
     {
-        // An AND-across-siblings model has no edge to AND in for §4.5's
-        // implicit default, and that edge holds no instructions at all — it
-        // is pure fall-through from the dispatch, so nothing can establish a
-        // value on it. §8.7 is therefore unconditional: acc is dead after
-        // the construct however the cases ended. Making it conditional on whether `acc >= N` is reachable
-        // would put a range analysis in the interface.
+        // §4.5's dispatch is total, so the meet is over case bodies alone —
+        // there is no valueless edge to meet against, and the merge carries
+        // whatever they all left. Deciding it still needs no range analysis:
+        // which case runs never enters into it.
         const program: RtlProgram = {
             procedures: [{
                 argCount: 0,
@@ -436,23 +449,25 @@ describe("validateProgram — §8.7 acc liveness across control flow", () =>
                     brTable(2),
                     CONST(1), bare("BLOCK_END"), // case 0: fresh producer
                     CONST(2), bare("BLOCK_END"), // case 1: fresh producer
-                    bare("RETURN"),               // merge point: dead anyway — the default edge reaches here too
+                    CONST(3), bare("BLOCK_END"), // the default case: fresh producer
+                    bare("RETURN"),               // merge point: live on every incoming edge
                 ],
             }],
         }
-        assert.throws(() => validateProgram(program), /read of acc/)
+        assert.doesNotThrow(() => validateProgram(program))
     })
 
-    test("an if-then's skip edge kills acc for the code after it (BR_TABLE 1, the shape jit-armv6m's comparison fusion cannot materialize)", () =>
+    test("an if-then's empty case kills acc for the code after it (the shape jit-armv6m's comparison fusion cannot materialize)", () =>
     {
         // The minimal case, and the one fuzz/harness.cpp reported as an
         // assert inside the translator's own acc fusion state machine: the
-        // body re-establishes acc, the skip edge cannot, so the RETURN is
-        // invalid input rather than something a backend has to compile.
+        // body re-establishes acc, the empty case an `if` without `else`
+        // lowers to cannot, so the RETURN is invalid input rather than
+        // something a backend has to compile.
         const program: RtlProgram = {
             procedures: [{
                 argCount: 1,
-                body: [brTable(1), CONST(0), bare("BLOCK_END"), bare("RETURN")],
+                body: [brTable(1), bare("BLOCK_END"), CONST(0), bare("BLOCK_END"), bare("RETURN")],
             }],
         }
         assert.throws(() => validateProgram(program), /read of acc/)

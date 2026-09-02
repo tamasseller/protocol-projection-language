@@ -86,15 +86,13 @@ export const enum StmtKind
      *  flushed by `killAcc()` before it would otherwise be silently
      *  dropped. */
     ExprStmt = "exprStmt",
-    /** One BR_TABLE, raised whole: `cases.length` arms, selected by
-     *  `test === i`; `test >= cases.length` falls through with none taken —
-     *  if/if-else/switch are all this same shape at the RTL level
+    /** One BR_TABLE, raised whole: `cases.length - 1` arms selected by
+     *  `test === i`, and a final arm — `cases[cases.length - 1]` — taken by
+     *  every other value, exactly C's `default:` (isa-core.md §4.5). The
+     *  dispatch is total, so there is no un-gated code after it.
+     *  if/if-else/ternary/switch are all this same shape at the RTL level
      *  (isa-rationale.md), and nothing here recovers which DSL surface form
-     *  produced it (nor does a target backend need to know). A trailing
-     *  `default:` clause isn't part of this node: it's un-gated fallthrough
-     *  code that already falls out of the enclosing statement list as
-     *  whatever comes right after this one — isa-core.md's switch lowering
-     *  appends it outside the BR_TABLE entirely, not as a guarded arm. */
+     *  produced it (nor does a target backend need to know). */
     Dispatch = "dispatch",
     /** One LOOP: `cond` statements compute `test`, evaluated before every
      *  iteration (including the first); `body` runs while `test` is
@@ -155,6 +153,13 @@ export function raiseProc<E extends { ext: string } = ExtOpPayload>(proc: RtlPro
 
 type PendingAcc<E extends { ext: string } = ExtOpPayload> = {expr: Expr<E>; pure: boolean}
 
+/** One raised block and how it left: `"end"` reaches the enclosing
+ *  construct's merge, `"fall"` runs into the next case (isa-core.md §4.5),
+ *  `"terminated"` reaches nothing. `trailing` is the acc value it left, on
+ *  the two closes that leave one. */
+type Arm<E extends { ext: string } = ExtOpPayload> =
+    {stmts: Stmt<E>[]; trailing?: PendingAcc<E>; close: "end" | "fall" | "terminated"}
+
 class Raiser<E extends { ext: string } = ExtOpPayload>
 {
     private pc = 0
@@ -194,6 +199,12 @@ class Raiser<E extends { ext: string } = ExtOpPayload>
         return {expr: {kind: ExprKind.Const, value: 0}, pure: true}
     }
 
+    // A merge slot has to be one nothing else in this body can name. TOS
+    // only ever grows by PUSH, and every register operand is a literal
+    // index, so both bounds are readable straight off the instruction
+    // stream — no interference analysis needed.
+    private mergeNext: number
+
     constructor(
         private readonly body: readonly RtlInstr<E>[],
         argCount: number,
@@ -203,6 +214,46 @@ class Raiser<E extends { ext: string } = ExtOpPayload>
     {
         this.tos = argCount
         this.peak = argCount
+
+        let named = 0
+        let pushes = 0
+        for(const i of body)
+        {
+            if(i.op === "PUSH") pushes++
+            if("target" in i) named = Math.max(named, i.target + 1)
+        }
+        this.mergeNext = Math.max(argCount + pushes, named)
+    }
+
+    /** A fresh slot for a value that depends on which arm of a dispatch ran
+     *  — the phi the ISA spells as "every arm leaves it in acc", which
+     *  nothing in `Stmt` can express directly. */
+    private mergeSlot(): number
+    {
+        const slot = this.mergeNext++
+        this.peak = Math.max(this.peak, slot + 1)
+        return slot
+    }
+
+    /** Whether anything after a dispatch's merge can still read the value
+     *  its arms left in acc — asked of the one instruction sitting at the
+     *  merge, since acc is either read or overwritten there. A body that
+     *  simply ends reads nothing; a `BLOCK_END`/`FALLTHROUGH` hands the
+     *  value outward, which counts as a read. Conservative in the right
+     *  direction: a wrong "yes" costs a dead store the target compiler
+     *  folds away, a wrong "no" would lose a value. */
+    private mergeValueIsRead(): boolean
+    {
+        const next = this.body[this.pc]
+        if(next === undefined) return false
+
+        switch(next.op)
+        {
+            case "CONST": case "LOAD": case "TRAP": return false
+            case "CALL": return (this.program.procedures[next.calleeIndex]?.argCount ?? 0) > 0
+            case "EXT": return this.extension?.effects?.[next.ext]?.readsAcc === true
+            default: return true
+        }
     }
 
     get peakSlots(): number {return this.peak}
@@ -279,6 +330,19 @@ class Raiser<E extends { ext: string } = ExtOpPayload>
         return stmts
     }
 
+    /** A case that fell through runs the next one's statements too — the
+     *  arms of a `Dispatch` are independent, so the only way to say that
+     *  here is to say it twice. Afterwards every arm's `stmts` is the array
+     *  the `Dispatch` node itself carries, so appending to one still lands
+     *  in that arm and only that arm. */
+    private foldFallthrough(arms: Arm<E>[]): Stmt<E>[][]
+    {
+        for(let k = arms.length - 2; k >= 0; k--)
+            if(arms[k]!.close === "fall") arms[k]!.stmts = [...arms[k]!.stmts, ...arms[k + 1]!.stmts]
+
+        return arms.map(a => a.stmts)
+    }
+
     /**
      * Raise straight-line + nested-construct statements until this block's
      * own close: an explicit BLOCK_END (consumed, not itself emitted — it's
@@ -297,17 +361,17 @@ class Raiser<E extends { ext: string } = ExtOpPayload>
      * when every path through it already terminates (e.g. a bare
      * `if(c) return a; else return b;` with nothing following), there is
      * genuinely nothing left to read once both branches are raised.
-     * Returns the trailing acc value on a BLOCK_END close (needed by
-     * LOOP's condition sub-block as `test`) — undefined on a RETURN/TRAP
-     * or true-end close, since none of those three leave a usable value.
+     * `close` says which of the three it was, and the trailing acc value
+     * comes back with the two that leave one — a RETURN/TRAP or true-end
+     * close reaches nothing and carries nothing.
      */
-    private blockBody(): {stmts: Stmt<E>[]; trailing?: PendingAcc<E>}
+    private blockBody(): Arm<E>
     {
         const stmts: Stmt<E>[] = []
         for(;;)
         {
             const i = this.body[this.pc]
-            if(i === undefined) return {stmts}
+            if(i === undefined) return {stmts, close: "terminated"}
 
             switch(i.op)
             {
@@ -358,42 +422,89 @@ class Raiser<E extends { ext: string } = ExtOpPayload>
                     stmts.push({kind: StmtKind.Return, value: this.readAcc()})
                     this.acc = undefined
                     this.pc++
-                    return {stmts}
+                    return {stmts, close: "terminated"}
                 }
 
                 case "TRAP":
                     this.killAcc(stmts)
                     stmts.push({kind: StmtKind.Trap, code: i.imm})
                     this.pc++
-                    return {stmts}
+                    return {stmts, close: "terminated"}
 
                 case "BLOCK_END":
                 {
                     const trailing = this.acc
                     this.pc++
-                    return {stmts, trailing}
+                    return {stmts, trailing, close: "end"}
+                }
+
+                case "FALLTHROUGH":
+                {
+                    const trailing = this.acc
+                    this.pc++
+                    return {stmts, trailing, close: "fall"}
                 }
 
                 case "BR_TABLE":
                 {
-                    const n = i.imm
                     const prev = this.acc
                     if(!prev) throw new Error(`raise: BR_TABLE with no acc value at pc ${this.pc}`)
-                    // unknownAcc(), not undefined: an arm's own body may
-                    // open with a bare RETURN/TRAP reading whatever's "in
-                    // acc" with nothing else setting it first (e.g.
-                    // delta-leb128.ts's `if (left == 0) { return; }`) — the
-                    // same "can't track across a branch, but known
-                    // meaningless" case unknownAcc()'s own doc comment
-                    // describes, not a real crash-worthy state.
-                    this.acc = this.unknownAcc()
                     this.pc++
 
-                    const cases: Stmt<E>[][] = []
-                    for(let k = 0; k < n; k++)
-                        cases.push(this.withBlock(() => this.closedBlock()))
+                    const arms: Arm<E>[] = []
+                    for(let k = 0; k <= i.imm; k++)
+                    {
+                        // unknownAcc(), not undefined: an arm's own body may
+                        // open with a bare RETURN/TRAP reading whatever's "in
+                        // acc" with nothing else setting it first (e.g.
+                        // delta-leb128.ts's `if (left == 0) { return; }`) — the
+                        // same "can't track across a branch, but known
+                        // meaningless" case unknownAcc()'s own doc comment
+                        // describes, not a real crash-worthy state.
+                        this.acc = this.unknownAcc()
+                        arms.push(this.withBlock(() => this.blockBody()))
+                    }
 
+                    // A case that fell through ends where the case it ran
+                    // into ends, so that one's close and value are what
+                    // reach the merge from it. Its own trailing value is
+                    // dropped where it stands (§4.5: the next case starts
+                    // with acc dead), which for an impure one still means
+                    // keeping the side effect.
+                    const reaching = arms.map(a => a)
+                    for(let k = arms.length - 2; k >= 0; k--)
+                        if(reaching[k]!.close === "fall")
+                            reaching[k] = {stmts: reaching[k]!.stmts, close: reaching[k + 1]!.close, trailing: reaching[k + 1]!.trailing}
+
+                    for(const a of arms)
+                        if(a.close === "fall" && a.trailing && !a.trailing.pure)
+                            a.stmts.push({kind: StmtKind.ExprStmt, value: a.trailing.expr})
+
+                    const cases = this.foldFallthrough(arms)
                     stmts.push({kind: StmtKind.Dispatch, test: prev.expr, cases})
+
+                    const merging = reaching.filter(a => a.close === "end")
+                    if(merging.length > 0 && merging.every(a => a.trailing) && this.mergeValueIsRead())
+                    {
+                        // isa-core.md §8.7: every arm reaching the merge
+                        // leaves acc live, so the merge carries a value —
+                        // a phi, spelled here as one slot every arm writes.
+                        const slot = this.mergeSlot()
+                        reaching.forEach((a, k) =>
+                        {
+                            if(a.close === "end") cases[k]!.push({kind: StmtKind.Assign, slot, value: a.trailing!.expr})
+                        })
+                        this.setAcc(slotExpr(slot), true)
+                    }
+                    else
+                    {
+                        reaching.forEach((a, k) =>
+                        {
+                            if(a.close === "end" && a.trailing && !a.trailing.pure)
+                                cases[k]!.push({kind: StmtKind.ExprStmt, value: a.trailing.expr})
+                        })
+                        this.acc = this.unknownAcc()
+                    }
                     continue
                 }
 

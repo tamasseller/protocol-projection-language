@@ -58,8 +58,8 @@ for (const [i, op] of UNARY.entries())
 rows.push({ byte: 96, instr: bare("BLOCK_END") })
 rows.push({ byte: 97, instr: bare("LOOP") })
 rows.push({ byte: 98, instr: brTable(1) })
-rows.push({ byte: 99, instr: brTable(2) })
-rows.push({ byte: 100, instr: brTable(3) })
+rows.push({ byte: 99, instr: bare("FALLTHROUGH") })
+rows.push({ byte: 100, instr: brTable(2) })
 rows.push({ byte: 101, instr: call(REG) })
 rows.push({ byte: 102, instr: bare("RETURN") })
 rows.push({ byte: 103, instr: trap(0) })
@@ -71,16 +71,14 @@ rows.push({ byte: 108, instr: CONST(EXT_IMM) })
 for (let k = 0; k <= 15; k++)
     rows.push({ byte: 109 + k, instr: CONST(k) })
 
-// §5.3's three escapes. Only MISC_UNARY has assigned sub-codes so far;
-// FALLTHROUGH (MISC_CF #0) is assigned by the spec but no consumer
-// implements it, so it is rejected exactly like a reserved one.
+// §5.3's three escapes. Only MISC_UNARY has assigned sub-codes.
 const MISC_BYTES = [125, 126, 127]
 const miscRows: { byte: number; sub: number; instr: RtlInstr }[] = [
     { byte: 126, sub: 0, instr: bare("REVBITS") },
     { byte: 126, sub: 1, instr: bare("CLZ") },
 ]
 const miscRejected: [number, number, RegExp][] = [
-    [125, 0, /FALLTHROUGH is assigned but not implemented/],
+    [125, 0, /sub-code 0 is reserved/],
     [125, 1, /sub-code 1 is reserved/],
     [126, 2, /sub-code 2 is reserved/],
     [127, 0, /sub-code 0 is reserved/],
@@ -178,12 +176,20 @@ describe("Bytecode codec — small/extended boundary cases", () =>
         assert.deepEqual(encodeInstr(opImm("ADD", 0)), [4, 0])
     })
 
-    test("BR_TABLE: N=1 and N=2 stay dedicated, N=0 and N=3 switch to extended", () =>
+    test("BR_TABLE: N=1 is dedicated, N>=2 is the extended form biased by 2", () =>
     {
         assert.deepEqual(encodeInstr(brTable(1)), [98])
-        assert.deepEqual(encodeInstr(brTable(2)), [99])
-        assert.deepEqual(encodeInstr(brTable(0)), [100, 0])
-        assert.deepEqual(encodeInstr(brTable(3)), [100, 3])
+        assert.deepEqual(encodeInstr(brTable(2)), [100, 0])
+        assert.deepEqual(encodeInstr(brTable(3)), [100, 1])
+        assert.deepEqual(encodeInstr(brTable(130)), [100, 128, 1])
+    })
+
+    test("BR_TABLE 0 has no encoding at all (isa-core.md §4.5)", () =>
+    {
+        assert.throws(() => encodeInstr(brTable(0)), /not encodable/)
+        // And nothing decodes to it either: the bias starts the extended
+        // form at 2, so N=0 and N=1 are unreachable there.
+        assert.deepEqual(decodeInstr(Uint8Array.from([100, 0]), 0).instr, brTable(2))
     })
 
     test("TRAP: code=0 stays dedicated, any other code switches to extended", () =>
@@ -359,6 +365,20 @@ describe("Bytecode codec — program framing (isa-core.md §5.5)", () =>
         assert.equal(decoded.next, bytes.length)
     })
 
+    test("a terminator does not close a LOOP's condition sub-block (isa-core.md §8.5)", () =>
+    {
+        // §7.2 lets a LOOP's *body* close with a bare terminator, but its
+        // condition needs BLOCK_END. Counting one there would close the
+        // loop a sub-block early and run the walk into whatever follows
+        // this procedure; leaving the frame open makes it a decode error.
+        const bytes = encodeBody([
+            bare("LOOP"), CONST(1), bare("RETURN"),
+            CONST(0), bare("RETURN"),
+        ])
+        assert.throws(() => decodeProgram(Uint8Array.from([1, 0, ...bytes])),
+            /ran off the end of the buffer/)
+    })
+
     test("a BR_TABLE case closed by a bare terminator (isa-core.md §8.5) still counts against N and self-delimits correctly", () =>
     {
         // Mirrors compiler/src/blocks.cpp's resolveCaseClose: a bare
@@ -370,9 +390,9 @@ describe("Bytecode codec — program framing (isa-core.md §5.5)", () =>
                 {
                     argCount: 0,
                     body: [
-                        CONST(0), brTable(2),
+                        CONST(0), brTable(1),
                         CONST(111), bare("RETURN"),    // case[0]: bare-terminator close — not the whole construct
-                        CONST(222), bare("BLOCK_END"), // case[1]: ordinary close — the construct's own real end
+                        CONST(222), bare("BLOCK_END"), // case[1] (the default): ordinary close — the construct's own real end
                         CONST(333), bare("RETURN"),    // the procedure's own real end
                     ],
                 },

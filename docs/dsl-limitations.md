@@ -43,14 +43,38 @@ Against isa-rationale.md's phrasing: a bare block is excluded because its
 *natural* lowering has no `BLOCK_END`, not because one could not be
 synthesized — `if (1) { … }` is that synthesis.
 
-## A `switch` case cannot be spelled as a no-op
+## A shared `switch` body needs adjacent labels
 
-An empty case body is rejected: in C it means fallthrough into the next
-case, and no opcode reaches one case's code from another (§4.5). Omitting
-the label instead sends that value to the default. So with a default
-present, "this label does nothing" has no spelling.
+`case 0: case 1: X` works — the empty label's case is a lone `FALLTHROUGH`
+(isa-core.md §4.5), which continues into the case physically next in the
+table. `case 0: case 5: X` does not:
 
-The dispatch is not the limitation — an empty case *slot* is exactly a
-no-op, and gap-filling emits them. What is missing is an unambiguous
-syntax: an empty statement (`case 3: ;`) would give one, and would still
-leave `case 0: case 1: X` rejected.
+```
+switch(x) { case 0: case 5: return 1; default: return 9; }
+  → Empty body for case 0: it can only share the body of case 1, which this
+    switch does not have — repeat the statements under each label instead
+```
+
+The table's slots *are* the label values, so the case following label 0 is
+label 1's, and between 0 and 5 sit gap fillers — each a copy of the
+`default:` clause, since `BR_TABLE`'s index is exact below `N` and a gap
+cannot share `case[N]`'s code. Falling into one would run the default
+rather than the shared body.
+
+That copying is also why a substantial `default:` clause stops the lowerer
+merging runs across a gap at all: a gap costs one copy of it per missing
+label, against roughly seven bytes for a second table (`lowerSwitch`'s
+`CHAIN_LINK_BYTES`). With no `default:` clause a gap filler is a lone
+`BLOCK_END` and runs up to six apart still merge.
+
+Write the statements under each label. Two labels far apart rarely share a
+body in practice, and where they do, the alternative would be for the
+lowerer to duplicate the body — a size decision it makes nowhere else.
+
+## A `switch` case still cannot be spelled as a no-op
+
+Distinct from the above: "this label does nothing, and does not share the
+next one's body" has no syntax, because an empty body now *means* sharing.
+Omitting the label sends that value to the default instead, so with a
+default present there is no way to say it. An empty statement
+(`case 3: ;`) would give one.

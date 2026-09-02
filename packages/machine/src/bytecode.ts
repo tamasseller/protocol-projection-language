@@ -103,11 +103,6 @@ const MISC_CF = 125
 const MISC_UNARY = 126
 const MISC_BINARY = 127
 
-/** Sub-code 0 of `MISC_CF`. Assigned by §5.3 and decodable, but no consumer
- *  implements its semantics yet, so it is rejected rather than accepted with
- *  a meaning nothing agrees on. */
-const MISC_CF_FALLTHROUGH = 0
-
 const MISC_NAMES: Record<number, string> =
     { [MISC_CF]: "MISC_CF", [MISC_UNARY]: "MISC_UNARY", [MISC_BINARY]: "MISC_BINARY" }
 
@@ -170,10 +165,13 @@ export function encodeInstr<E extends { ext: string } = ExtOpPayload>(instr: Rtl
     {
         case "BLOCK_END": return [96]
         case "LOOP": return [97]
+        case "FALLTHROUGH": return [99]
         case "BR_TABLE":
+            // §5.4: the extended operand is biased by 2, so `#1` has only
+            // its own code and `#0` has no encoding at all (§4.5).
             if (instr.imm === 1) return [98]
-            if (instr.imm === 2) return [99]
-            return [100, ...encodeLeb128(instr.imm)]
+            if (instr.imm < 1) throw new Error(`encodeInstr: BR_TABLE ${instr.imm} is not encodable (isa-core.md §4.5: N >= 1)`)
+            return [100, ...encodeLeb128(instr.imm - 2)]
         case "CALL":
             return [101, ...encodeLeb128(instr.calleeIndex)]
         case "RETURN": return [102]
@@ -247,8 +245,8 @@ export function decodeInstr<E extends { ext: string } = ExtOpPayload>(bytes: Uin
         case 96: return { instr: { op: "BLOCK_END" }, next: pos }
         case 97: return { instr: { op: "LOOP" }, next: pos }
         case 98: return { instr: { op: "BR_TABLE", imm: 1 }, next: pos }
-        case 99: return { instr: { op: "BR_TABLE", imm: 2 }, next: pos }
-        case 100: { const r = decodeLeb128(bytes, pos); return { instr: { op: "BR_TABLE", imm: r.value }, next: r.next } }
+        case 99: return { instr: { op: "FALLTHROUGH" }, next: pos }
+        case 100: { const r = decodeLeb128(bytes, pos); return { instr: { op: "BR_TABLE", imm: r.value + 2 }, next: r.next } }
         case 101: { const r = decodeLeb128(bytes, pos); return { instr: { op: "CALL", calleeIndex: r.value }, next: r.next } }
         case 102: return { instr: { op: "RETURN" }, next: pos }
         case 103: return { instr: { op: "TRAP", imm: 0 }, next: pos }
@@ -277,11 +275,8 @@ function decodeMisc<E extends { ext: string } = ExtOpPayload>(code: number, sub:
         if (op) return { instr: { op }, next: sub.next }
     }
 
-    const what = code === MISC_CF && sub.value === MISC_CF_FALLTHROUGH
-        ? `FALLTHROUGH is assigned but not implemented`
-        : `sub-code ${sub.value} is reserved`
-
-    throw new Error(`decodeInstr: ${MISC_NAMES[code]!} at offset ${offset}: ${what} (isa-core.md §5.3)`)
+    throw new Error(`decodeInstr: ${MISC_NAMES[code]!} at offset ${offset}: ` +
+        `sub-code ${sub.value} is reserved (isa-core.md §5.3)`)
 }
 
 /** Decode a full instruction stream from exactly `bytes` — no header, no
@@ -319,24 +314,23 @@ export function encodeProgram<E extends { ext: string } = ExtOpPayload>(program:
     ])
 }
 
-/** One frame of `decodeProcBody`'s own open-block tracking — mirrors
- *  `blocks.ts`'s `Frame` union in shape (case / loopCond / loopBody),
- *  repurposed here for boundary-finding instead of ARM backpatch
- *  bookkeeping: this decoder doesn't need to record more than which kind
- *  of block is open and, for a `case`, how many closers remain. */
-type ScanFrame = { kind: "case"; remaining: number } | { kind: "loopCond" } | { kind: "loopBody" }
+/** One frame of `decodeProcBody`'s own open-block tracking. Both openers
+ *  are a count of closers still to come: `N + 1` for a `BR_TABLE`'s cases
+ *  plus its default case (§4.5), two for a `LOOP`'s condition and body
+ *  sub-blocks. `dispatch` is not needed to *count* — the two close
+ *  identically — only to say what §8.5 lets close them. */
+type ScanFrame = { remaining: number; dispatch: boolean }
 
 /** Decode one procedure body starting at `offset`, stopping at the first
  *  terminator reached with *no* open block at all (§8.4 guarantees nothing
  *  wire-level follows it that still belongs to this procedure) — no
- *  separate length to bound the walk, unlike `decodeBody` above. Tracks
- *  open `LOOP`/`BR_TABLE` nesting by frame *kind*, not just a count,
- *  because §7.2 lets a `LOOP`'s own body block close via a bare
- *  `RETURN`/`TRAP` instead of `BLOCK_END`: that terminator pops its
- *  enclosing `loopBody` frame, same as a real closer would, but doesn't by
- *  itself end the body — the outer scope's own bytes (its cond-false exit
- *  path, say) may still follow. Only a terminator seen with the stack
- *  *already* empty — nothing open, nothing to pop — is the real end. */
+ *  separate length to bound the walk, unlike `decodeBody` above. §7.2 lets
+ *  a `LOOP`'s own body block close via a bare `RETURN`/`TRAP` instead of
+ *  `BLOCK_END`: that terminator closes its frame's last sub-block, same as
+ *  a real closer would, but doesn't by itself end the body — the outer
+ *  scope's own bytes (its cond-false exit path, say) may still follow. Only
+ *  a terminator seen with the stack *already* empty — nothing open, nothing
+ *  to close — is the real end. */
 function decodeProcBody<E extends { ext: string } = ExtOpPayload>(bytes: Uint8Array, offset: number, extension?: Extension<E>): { body: RtlInstr<E>[]; next: number }
 {
     const body: RtlInstr<E>[] = []
@@ -349,16 +343,17 @@ function decodeProcBody<E extends { ext: string } = ExtOpPayload>(bytes: Uint8Ar
         body.push(instr)
         pos = next
 
-        if (instr.op === "BR_TABLE") { stack.push({ kind: "case", remaining: instr.imm }); continue }
-        if (instr.op === "LOOP") { stack.push({ kind: "loopCond" }); continue }
+        if (instr.op === "BR_TABLE") { stack.push({ remaining: instr.imm + 1, dispatch: true }); continue }
+        if (instr.op === "LOOP") { stack.push({ remaining: 2, dispatch: false }); continue }
 
-        if (instr.op === "BLOCK_END")
+        if (instr.op === "BLOCK_END" || instr.op === "FALLTHROUGH")
         {
             const top = stack[stack.length - 1]
-            if (!top) throw new Error(`decodeProcBody: BLOCK_END with no open block at offset ${pos}`)
-            if (top.kind === "case") { top.remaining -= 1; if (top.remaining === 0) stack.pop() }
-            else if (top.kind === "loopCond") stack[stack.length - 1] = { kind: "loopBody" }
-            else stack.pop() // loopBody's own ordinary (BLOCK_END) closer
+            if (!top) throw new Error(`decodeProcBody: ${instr.op} with no open block at offset ${pos}`)
+            if (!top.dispatch && instr.op === "FALLTHROUGH")
+                throw new Error(`decodeProcBody: FALLTHROUGH closing a LOOP sub-block at offset ${pos}`)
+            top.remaining -= 1
+            if (top.remaining === 0) stack.pop()
             continue
         }
 
@@ -381,25 +376,18 @@ function decodeProcBody<E extends { ext: string } = ExtOpPayload>(bytes: Uint8Ar
             // always settles it.
             if (stack.length === 0) return { body, next: pos }
             const top = stack[stack.length - 1]!
-            if (top.kind === "loopBody")
-            {
-                stack.pop()
-            }
-            else if (top.kind === "case")
-            {
-                // §8.5/blocks.cpp's resolveCaseClose: a bare terminator
-                // closes a case exactly like a BLOCK_END would, counting
-                // against the same N case-closers — not only in the loopBody
-                // case. Mirrors the translator's closeCaseViaTerminator; miss
-                // it and a BR_TABLE whose non-last case closes this way
-                // corrupts the next procedure's boundary.
-                top.remaining -= 1
-                if (top.remaining === 0) stack.pop()
-            }
-            // top.kind === "loopCond": a bare terminator cannot legally
-            // close a LOOP's own condition sub-block (§8.5 requires
-            // BLOCK_END there) — leave it; malformed input surfaces as a
-            // later decode error instead of silently accepting it here.
+
+            // §8.5: a terminator closes a dispatch case exactly as a
+            // BLOCK_END would, counting against the same N + 1 closers, and
+            // it closes a LOOP's *body* sub-block — but never a LOOP's
+            // condition, which requires BLOCK_END. Leaving that frame open
+            // is what surfaces such input as a later decode error instead
+            // of silently accepting it here; counting it instead would let
+            // a malformed body run into the next procedure's bytes.
+            if (!top.dispatch && top.remaining === 2) continue
+
+            top.remaining -= 1
+            if (top.remaining === 0) stack.pop()
         }
     }
 }

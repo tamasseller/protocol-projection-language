@@ -277,10 +277,29 @@ bare discard to do.
 Two block openers, one universal closer, two terminators. No operand
 carries a branch offset; every target follows from static block nesting.
 
-**`BR_TABLE N`** dispatches on `acc`. `acc < N` executes `case[acc]`;
-`acc ≥ N` executes no case (the **implicit default**). Either way control
-falls through to after the construct. `N` is a literal case count.
-`if`/`if-else`/`switch` all lower to this (§7.1).
+**`BR_TABLE N`** opens **N+1** blocks and dispatches on `acc`: `acc < N`
+executes `case[acc]`, and any other value executes `case[N]`, the **default
+case**. Every value of acc therefore selects a case, so the dispatch is
+total — there is no edge that skips the construct, and a value can cross
+the merge (§8.7). `N` is a literal case count, at least 1; `BR_TABLE 0`
+would be a single always-taken block — a scoped block, not a branch — and
+has no encoding at all (§5.2). `if`/`if-else`/ternary/`switch` all lower to
+this (§7.1).
+
+The index is exact below `N` and lenient at or above it, which makes
+`BR_TABLE 1` a **truthy** two-way test: `acc = 0` takes `case[0]`, anything
+else takes `case[1]`. That is the convention `LOOP`'s condition block uses
+too (§7.2), so a comparison never has to be normalized to 0/1 before a
+dispatch, and it is the one dispatch shape the whole DSL needs apart from
+`switch`.
+
+**`FALLTHROUGH`** closes a dispatch case by continuing into the **next
+case's body** instead of leaving the construct. It resets TOS to the block's
+entry depth exactly as `BLOCK_END` does (§8.1), and like every case entry
+the case it continues into starts with acc dead. It is valid only as a
+dispatch case's closer — never a `LOOP` sub-block's — and never on `case[N]`,
+which has nothing to continue into. This is what C's `case 0: case 1: X`
+needs: the empty label's case is a lone `FALLTHROUGH`.
 
 **`LOOP`** opens **two** nested sub-blocks in fixed order, each closed by
 its own `BLOCK_END`:
@@ -297,10 +316,10 @@ Pre-test only: the condition block always runs at least once, so zero body
 iterations is possible. There is no bottom-test (`do-while`) form; §7.2
 gives the recovery idiom.
 
-**`BLOCK_END`** closes the innermost open block. Its meaning depends on
-what it closes: unconditional fall-through for a `BR_TABLE` case,
-conditional exit-or-continue for a `LOOP` condition block, unconditional
-back-edge for a `LOOP` body block. One opcode, three meanings,
+**`BLOCK_END`** closes the innermost open block, leaving the construct. Its
+meaning depends on what it closes: unconditional jump to the merge for a
+`BR_TABLE` case, conditional exit-or-continue for a `LOOP` condition block,
+unconditional back-edge for a `LOOP` body block. One opcode, three meanings,
 disambiguated purely by block nesting.
 
 **`RETURN`** ends the procedure; `acc` is the return value; the frame is
@@ -359,7 +378,7 @@ table.
 | `0-49` | Arithmetic (§4.1) | `op = code / 5`, `mode = code % 5` |
 | `50-89` | Comparison (§4.2) | `op = (code−50) / 4`, `mode = (code−50) % 4` |
 | `90-95` | Unary (§4.3) | `code − 90` selects `NEG, NOT, SXTB, SXTH, UXTB, UXTH` |
-| `96-100` | Local flow control | `code − 96` selects `BLOCK_END, LOOP, BR_TABLE#1, BR_TABLE#2, BR_TABLE-ext` |
+| `96-100` | Local flow control | `code − 96` selects `BLOCK_END, LOOP, BR_TABLE#1, FALLTHROUGH, BR_TABLE-ext` |
 | `101-104` | Global flow control | `code − 101` selects `CALL, RETURN, TRAP#0, TRAP-ext` |
 | `105-124` | Move/const (§4.4) | `code − 105` selects `PUSH, LOAD, STORE, CONST-ext, CONST#0..CONST#15` |
 | `125-127` | Escapes (§5.3) | `MISC_CF, MISC_UNARY, MISC_BINARY`, each with a sub-code |
@@ -392,7 +411,7 @@ does not run out.
 
 | Code | Escape | Assigned sub-codes |
 |---|---|---|
-| `125` | `MISC_CF` | `0` = `FALLTHROUGH` |
+| `125` | `MISC_CF` | none yet |
 | `126` | `MISC_UNARY` | `0` = `REVBITS`, `1` = `CLZ` |
 | `127` | `MISC_BINARY` | none yet |
 
@@ -403,17 +422,13 @@ it must reject the program, exactly as it rejects an extension byte no
 extension claims (§11.1). This is the one place where a well-formed-looking
 core byte can still be invalid.
 
-`MISC_BINARY` is deliberately empty. It is reserved for the general-purpose
-arithmetic the core should own rather than push onto a domain extension —
-`UDIV`/`IDIV`/`MOD`, a multiply-accumulate — none of which is specified
-here yet.
+`MISC_CF` and `MISC_BINARY` are both deliberately empty. `MISC_CF` is the
+growth path for control flow the block structure cannot express — a `break`
+or `continue` naming an enclosing block, say. `MISC_BINARY` is reserved for
+the general-purpose arithmetic the core should own rather than push onto a
+domain extension — `UDIV`/`IDIV`/`MOD`, a multiply-accumulate. Neither is
+specified here yet.
 
-`FALLTHROUGH` is assigned but **not implemented**: no lowering emits it and
-no consumer executes it, so a program containing one is rejected today, the
-same as a reserved sub-code. It is listed here because its meaning is
-settled — close a `BR_TABLE` case by continuing into the next case's body
-rather than leaving the construct, which is what `switch` fallthrough
-(§10.3) needs and what a jump-table target can express for free.
 
 ### 5.4 Trailing operands
 
@@ -421,8 +436,15 @@ rather than leaving the construct, which is what `switch` fallthrough
 |---|---|
 | Extended immediate (arithmetic/comparison ext form, `CONST` ext form) | unsigned LEB128, 1-5 bytes |
 | Register index (`LOAD`, `STORE`, both classes' `REG_ACC`/`REG_REG` combos) | unsigned LEB128 |
-| `BR_TABLE` extended case count, `TRAP` extended code, `CALL` procedure index | unsigned LEB128 |
+| `BR_TABLE` extended case count (biased: the operand is `N − 2`), `TRAP` extended code, `CALL` procedure index | unsigned LEB128 |
 | Escape sub-code (§5.3's `MISC_*`) | unsigned LEB128 |
+
+`BR_TABLE`'s extended operand is biased by 2, so the extended form covers
+`N ≥ 2` and nothing else: `N = 1` has only its dedicated code, `N = 0` has
+no encoding at all (§4.5), and no case count has two spellings. The bias is
+the whole reason the dedicated small form is `#1` alone — with `if`,
+`if-else` and the ternary all lowering to `BR_TABLE 1` (§7.1), `N = 2` is
+just a two-label `switch` group and no more special than `N = 3`.
 
 Register indices are LEB128 in every instruction that carries one: one
 rule, no special case for small frames. `CALL`'s `proc_idx` is a plain
@@ -513,17 +535,21 @@ which sees the whole body and can omit the `PUSH`. Cost: `walk`'s
 
 ### 7.1 `BR_TABLE` lowering forms
 
+The test is emitted as written — never complemented, never normalized to
+0/1 — because §4.5's index is truthy at `N = 1`: `acc = 0` is the *false*
+outcome and takes `case[0]`.
+
 | DSL construct | `N` | Case placement |
 |---|---|---|
-| `if-else` | 2 | then = `case[0]`, else = `case[1]`; default unreachable |
-| `if` (no else) | 1 | body = `case[0]`, reached when `acc = 0` (complementary comparison, §7.3); default = skip |
-| `switch` | span of one run of labels | a `case` label is a *value*: consecutive labels index the table directly (shifted by the run's base, so an out-of-range discriminant still lands on the default via unsigned wrap), a gap inside a run is an empty case, and runs too far apart to bridge chain behind range tests. Default is the natural home for an out-of-range `trap()` |
-| ternary | 2 | consequent = `case[0]`, alternate = `case[1]`, arm order as `if-else`; each arm ends by storing the slot §8.7 reserves ahead of the dispatch |
+| `if-else` | 1 | else = `case[0]`, then = `case[1]` |
+| `if` (no else) | 1 | `case[0]` is an empty block (a lone `BLOCK_END`), then = `case[1]` |
+| ternary | 1 | alternate = `case[0]`, consequent = `case[1]`, arm order as `if-else`; each arm ends with its value in acc, which crosses the merge (§8.7). A ternary nested inside a larger expression cannot — something else runs before the consumer — so that one takes the slot form instead |
+| `switch`, shared body | — | C's `case 0: case 1: X`: the empty label's case is a lone `FALLTHROUGH` (§4.5). It continues into the case physically next in the table, so the label sharing a body must be the next one — a non-adjacent label would land in a gap filler, which exits the construct |
+| `switch` | span of one run of labels | a `case` label is a *value*: consecutive labels index the table directly (shifted by the run's base, so an out-of-range discriminant lands past the span), a gap inside a run is an empty case, and runs too far apart to bridge chain through each other's default case. The `default:` clause is `case[N]` |
 
-"Default unreachable" for `if-else` is a statement about what this lowerer
-emits, not a guarantee validation checks or an implementation may assume:
-§4.5 is unconditional, so `acc ≥ 2` runs neither arm and an implementation
-that folds the third outcome into the `else` arm is wrong (§8.7).
+A `switch` chain needs no range test of its own: a group's `case[N]` *is*
+"none of these", so the next group's own dispatch goes straight in there,
+and the last group's `case[N]` holds the `default:` clause.
 
 ### 7.2 `LOOP` and the do-while gap
 
@@ -555,23 +581,6 @@ A `LOOP`'s body block may also be closed by a terminator instead of
 body once and exits via `RETURN`/`TRAP` or falls through, never taking the
 back-edge. This is a legitimate non-cyclic use of `LOOP` purely to host a
 pre-test.
-
-### 7.3 Complementary comparison
-
-`if`-without-`else` lowers to `BR_TABLE 1` with the body at `case[0]`,
-reached when `acc = 0`. To land there the lowerer emits the
-**complementary** comparison:
-
-| DSL condition | Emit | `acc = 0` when |
-|---|---|---|
-| `a < b` | `GE` | `a < b` |
-| `a <= b` | `GT` | `a <= b` |
-| `a > b` | `LE` | `a > b` |
-| `a >= b` | `LT` | `a >= b` |
-| `a == b` | `NE` | `a == b` |
-| `a != b` | `EQ` | `a != b` |
-
-Signedness suffix per the source type.
 
 ---
 
@@ -627,7 +636,8 @@ with no intervening control target.
 
 For every `CALL proc_idx`: the procedure must exist, and the TOS depth
 pushed since the callee's entry point must equal `max(arg_count - 1, 0)`
-(§6). Every `BR_TABLE` opener must have exactly `N` case-closers. Every
+(§6). Every `BR_TABLE` opener must have exactly `N + 1` case-closers (§4.5).
+`N = 0` is unencodable, so no opener has fewer than two. Every
 `LOOP` opener must have exactly two sub-block closers, the first always
 `BLOCK_END`, the second either `BLOCK_END` or a terminator. Every
 `BLOCK_END` must close some open block.
@@ -667,29 +677,31 @@ operand — an arithmetic/comparison combo, `STORE`, `PUSH`, `RETURN`,
 argument, or a `BR_TABLE`/`LOOP`-condition dispatch itself — is a
 validation error if acc is not live at that point.
 
-`BR_TABLE` and `LOOP` are this ISA's only two multi-successor-edge
-constructs. **A CFG split point clobbers acc unconditionally**: every
-successor edge — a `BR_TABLE` case, a `LOOP` body, a `LOOP` exit — starts
-with acc *not live*, regardless of what was live going into the split.
+`BR_TABLE` and `LOOP` are this ISA's multi-successor-edge constructs. **A
+CFG split point clobbers acc unconditionally**: every successor edge — any
+dispatch case, a `LOOP` body, a `LOOP` exit — starts with acc *not live*,
+regardless of what was live going into the split. That is the entry rule,
+and it is the same for both.
 
-**Acc is never live after a `BR_TABLE` or a `LOOP`**, however their cases
-or sub-blocks end. Carrying a value past either merge point would need
-every incoming edge to establish it, and `BR_TABLE`'s implicit default
-(§4.5, `acc ≥ N` runs no case at all) is the one edge in this ISA that
-holds no instructions: it is pure fall-through from the split point, so
-there is nowhere to put the value. A `LOOP`'s exit edge is a successor of
-the condition sub-block's own dispatch and dead for the same reason.
+At the exit they differ. **Acc is never live after a `LOOP`**: its exit edge
+is a successor of the condition sub-block's own dispatch, and no
+instructions sit on it, so there is nowhere to establish a value.
 
-That makes acc liveness a **local property of the opcode**: a validator
-decides it without inspecting the dispatch value, and never has to reason
-about whether `acc ≥ N` can actually happen. §7.1's "default unreachable"
-for `N = 2` describes what the DSL lowerer emits, not something validation
-establishes or an implementation may assume.
+**After a `BR_TABLE` acc is live iff every case that reaches the merge
+leaves it live.** §4.5's dispatch is total — `acc ≥ N` runs `case[N]`, not
+nothing — so every edge into the merge is a case body, somewhere
+instructions can actually go. A case ending in a terminator reaches nothing
+and constrains nothing; if no case reaches the merge, acc is dead there.
 
-A value-producing branch — a ternary — therefore carries its result in a
-TOS slot rather than in acc: reserve the slot before the `BR_TABLE` (not
-inside a case, where §8.1 drops it at that case's own `BLOCK_END`),
-`STORE` to it at the end of every case, and `LOAD` it after the construct.
+Either way acc liveness stays a **local property**: a validator decides it
+from the cases' own exit liveness, never from the dispatch value, and never
+has to reason about which case can actually run.
+
+So a value-producing branch — a ternary — rides acc across the merge and
+needs no slot: each case simply ends with the value in acc. Reserving a slot
+before the dispatch (not inside a case, where §8.1 drops it at that case's
+own `BLOCK_END`), storing to it at the end of every case and loading it
+after is seven bytes of plumbing that this rule removes outright.
 
 ---
 
@@ -727,8 +739,8 @@ optionally initialized. `//` and `/* */` comments.
 
 Everything below the surface syntax is a rewrite into what the tiler
 already covers: compound assignment into `a = a op e`, `!e` into `e == 0`,
-`a && b` into a conditional, a conditional into a `BR_TABLE` writing a slot
-(§8.7). Only a postfix `++`/`--` whose value is read needs a slot of its
+`a && b` into a conditional, a conditional into a `BR_TABLE` whose arms
+each leave the value in acc (§8.7). Only a postfix `++`/`--` whose value is read needs a slot of its
 own, for the value from before the step.
 
 ### 10.3 Excluded
@@ -745,10 +757,10 @@ own, for the value from before the step.
   real `BR_TABLE` case or `LOOP` sub-block, and always closes via a real
   `BLOCK_END` that resets TOS (§8.1). isa-rationale.md covers why this
   matters to register allocation.
-- **`switch` fallthrough.** A case's code is reachable only through the
-  dispatch, so one case cannot run into the next; an empty case body — C's
-  way of spelling a shared one — is rejected rather than silently lowered
-  as "do nothing for this label".
+- **`switch` fallthrough out of a non-empty case.** An empty case body is
+  fine — C's way of spelling a shared one, and `FALLTHROUGH` (§4.5) is
+  exactly that — but a case with statements always leaves the construct at
+  its end, never runs into the next.
 - **Octal literals.** A leading zero is rejected, not reinterpreted: this
   is a subset of C, so it may refuse a spelling, but must not disagree with
   C about what one means.
@@ -808,16 +820,16 @@ mechanism, out of scope here.
 | DSL construct | Lowers to |
 |---|---|
 | expression | instructions computing the value into `acc`, using TOS for intermediates as needed; operand addressing mode is an implementation choice |
-| `if (c) T` | `c` into `acc` (complementary comparison, §7.3); `BR_TABLE 1`, `T` at `case[0]` |
-| `if (c) T else E` | `c` into `acc ∈ {0,1}`, complementary; `BR_TABLE 2`, `T` at `case[0]`, `E` at `case[1]` (§7.1) |
-| `switch (v) { case k: … }` | `v` into `acc`; `BR_TABLE` over one run of labels, shifted by that run's base; further runs chain behind range tests off a slot holding `v`; out-of-range falls to the implicit default |
+| `if (c) T` | `c` into `acc`; `BR_TABLE 1`, an empty `case[0]`, `T` at `case[1]` |
+| `if (c) T else E` | `c` into `acc`; `BR_TABLE 1`, `E` at `case[0]`, `T` at `case[1]` (§7.1) |
+| `switch (v) { case k: … }` | `v` into `acc`; `BR_TABLE` over one run of labels, shifted by that run's base; `case[N]` holds either the next run's own dispatch (off a slot holding `v`) or the `default:` clause |
 | `while (c) B` | `LOOP`; condition block = `c` into `acc`; `BLOCK_END`; body block = `B`; `BLOCK_END` |
 | `for (init; c; inc) B` | `init`; `LOOP`; condition block = `c` (omitted ⇒ `1`); `BLOCK_END`; body block = `B` then `inc`; `BLOCK_END` |
 | `return e;` / `return;` | `e` into `acc` (or `CONST #0`); `RETURN` |
 | `trap(c);` | `TRAP #c` |
 | `u32 x = e;` | `e` into TOS: the push that computes it *is* the slot, and `x` names that index |
 | `u32 x;` | `CONST #0`, `PUSH` — the slot still has to exist, and `PUSH` needs a live value |
-| `c ? a : b` | a slot reserved by `PUSH`, then `BR_TABLE 2` storing it from each arm; the slot is the value (§8.7) |
+| `c ? a : b` | `BR_TABLE 1` with `b` at `case[0]` and `a` at `case[1]`, each arm leaving its value in acc (§8.7); nested inside a larger expression it takes a slot reserved by `PUSH` instead, stored from each arm |
 | `a op= e`, `++a`, `!e`, `a && b` | rewritten into the above before anything is emitted (§10.2) |
 | `a++` (value read) | `LOAD a`, `PUSH` — the pre-step value in a slot — then the step |
 
@@ -993,8 +1005,8 @@ Every trailing operand, where present, is unsigned LEB128 (§5.4).
 | `96` | `BLOCK_END` | none |
 | `97` | `LOOP` | none |
 | `98` | `BR_TABLE #1` | none |
-| `99` | `BR_TABLE #2` | none |
-| `100` | `BR_TABLE ext` | case count |
+| `99` | `FALLTHROUGH` | none |
+| `100` | `BR_TABLE ext` | case count − 2 |
 | `101` | `CALL` | procedure index |
 | `102` | `RETURN` | none |
 | `103` | `TRAP #0` | none |

@@ -6,12 +6,13 @@
  * are emitted ahead of the expression they sit in, leaving an ordinary
  * local reference behind:
  *
- *   a ? b : c   a split clobbers acc (isa-core.md §8.7), so a
- *               value-producing branch cannot hand its result over in acc
- *               at all — and nothing in the tiler can emit control flow.
- *               The slot is reserved *before* the dispatch, since one
- *               pushed inside a case is dropped again by that case's own
- *               `BLOCK_END` (§8.1).
+ *   a ? b : c   nothing in the tiler can emit control flow. One that *is*
+ *               the whole expression keeps its value in acc across the
+ *               merge (isa-core.md §8.7, `conditionalToAcc`); one nested
+ *               inside a larger expression cannot, since something else
+ *               runs before the consumer, so it writes a slot — reserved
+ *               *before* the dispatch, since one pushed inside a case is
+ *               dropped again by that case's own `BLOCK_END` (§8.1).
  *
  *   a++         the value is the one from *before* the step, so it has to
  *               be kept somewhere while `a` moves on. `PUSH` reserves the
@@ -20,6 +21,7 @@
 
 import type {Expression, ConditionalExpression, UpdateExpression, Identifier} from "./ast"
 import {recurseOver, mapOver} from "./ast"
+import type {PrimType} from "./ast"
 import type {ExtOpPayload, RtlInstr} from "./rtl"
 import {bare, brTable, PUSH, STORE} from "./rtl"
 import {RegAlloc} from "./scope"
@@ -83,10 +85,48 @@ function hoistPostfixStep<E extends { ext: string } = ExtOpPayload>(e: UpdateExp
     return {type: "Identifier", name}
 }
 
+/**
+ * A ternary whose value the site wants in acc (or pushed from it): every
+ * edge into a dispatch merge is a case body that establishes acc, so it
+ * survives (isa-core.md §8.7). No slot, no `PUSH` ahead of the test, no
+ * `STORE` per arm, no `LOAD` after — which is the whole difference between
+ * this and `hoistConditional`.
+ *
+ * Only valid where nothing runs between the merge and the consumer, so
+ * lower.ts calls it for a ternary that *is* the whole expression; one
+ * nested inside a larger one still goes to a slot.
+ */
+export function conditionalToAcc<E extends { ext: string } = ExtOpPayload>(e: ConditionalExpression, alloc: RegAlloc<E>, into?: PrimType): RtlInstr<E>[]
+{
+    const out: RtlInstr<E>[] = []
+    const test = tileExpression(hoist(e.test, alloc, out), alloc,
+        {demand: "acc", what: "ternary condition"})
+
+    return [
+        ...out,
+        ...test.fragment,
+        brTable(1),
+        ...accArm(e.alternate, new RegAlloc<E>(alloc), into),
+        ...accArm(e.consequent, new RegAlloc<E>(alloc), into),
+    ]
+}
+
+/** Like `ternaryArm`, but the arm's value stays in acc rather than being
+ *  stored — see `conditionalToAcc`. */
+function accArm<E extends { ext: string } = ExtOpPayload>(arm: Expression, scope: RegAlloc<E>, into?: PrimType): RtlInstr<E>[]
+{
+    const inner: RtlInstr<E>[] = []
+    const node = tileExpression(hoist(arm, scope, inner), scope, {demand: "acc", into, what: "ternary arm"})
+
+    return isTrapCall(arm)
+        ? [...inner, ...node.fragment]
+        : [...inner, ...node.fragment, bare("BLOCK_END")]
+}
+
 function hoistConditional<E extends { ext: string } = ExtOpPayload>(e: ConditionalExpression, alloc: RegAlloc<E>, out: RtlInstr<E>[]): Identifier
 {
     const test = tileExpression(hoist(e.test, alloc, out), alloc,
-        {demand: "acc", invert: true, what: "ternary condition"})
+        {demand: "acc", what: "ternary condition"})
 
     // The reserving PUSH carries the test value — arbitrary, since both
     // arms overwrite the slot, and `PUSH` leaves acc live for the dispatch.
@@ -96,9 +136,9 @@ function hoistConditional<E extends { ext: string } = ExtOpPayload>(e: Condition
     out.push(
         ...test.fragment,
         PUSH<E>(),
-        brTable(2),
-        ...ternaryArm(e.consequent, slot, new RegAlloc<E>(alloc)),
+        brTable(1),
         ...ternaryArm(e.alternate, slot, new RegAlloc<E>(alloc)),
+        ...ternaryArm(e.consequent, slot, new RegAlloc<E>(alloc)),
     )
 
     return {type: "Identifier", name}

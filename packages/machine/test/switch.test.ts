@@ -3,9 +3,9 @@
  *
  * `BR_TABLE` indexes by the discriminant (isa-core.md §4.5), so a run of
  * consecutive labels maps onto it directly and anything else does not.
- * `lowerSwitch` therefore groups the labels into runs and chains the
- * groups behind range tests — one dense group being the common case, and
- * the one that costs nothing extra.
+ * `lowerSwitch` therefore groups the labels into runs and puts each group
+ * in the previous one's default case — no range test needed, since
+ * `case[N]` already means "none of these".
  */
 
 import { describe, test } from "node:test"
@@ -98,19 +98,32 @@ describe("switch — grouping", () =>
         assert.ok(ops.includes("BR_TABLE 4"), ops.join(" | "))
     })
 
-    // The whole grouping rule: a gap costs one byte per missing label, a
-    // chain link costs CHAIN_LINK_BYTES (lower.ts). These two probes sit on
-    // either side of that line.
-    test("a gap of 7 is cheaper to fill than to branch around", () =>
+    // The whole grouping rule: a gap costs one copy of the default block
+    // per missing label, a second table costs CHAIN_LINK_BYTES (lower.ts).
+    // With no `default:` clause a gap filler is a lone BLOCK_END, so these
+    // two probes sit on either side of that line.
+    test("a gap of 6 is cheaper to fill than to start a second table", () =>
     {
-        const ops = opsOf("u32 x = 0; switch(x) { case 0: return 1; case 8: return 2; default: return 99; }")
+        const ops = opsOf("u32 x = 0; switch(x) { case 0: return 1; case 7: return 2; } return 0;")
         assert.equal(countOf(ops, "BR_TABLE"), 1, ops.join(" | "))
     })
 
-    test("a gap of 8 is not", () =>
+    test("a gap of 7 is not", () =>
     {
-        const ops = opsOf("u32 x = 0; switch(x) { case 0: return 1; case 9: return 2; default: return 99; }")
+        const ops = opsOf("u32 x = 0; switch(x) { case 0: return 1; case 8: return 2; } return 0;")
         assert.equal(countOf(ops, "BR_TABLE"), 2, ops.join(" | "))
+    })
+
+    // A gap runs the `default:` clause, and `BR_TABLE`'s index is exact
+    // below N — so a gap gets its own copy of it, and a substantial one
+    // makes filling never worth it.
+    test("a real default clause makes gaps expensive", () =>
+    {
+        const wide = opsOf("u32 x = 0; switch(x) { case 0: return 1; case 4: return 2; default: return 99; }")
+        assert.equal(countOf(wide, "BR_TABLE"), 2, wide.join(" | "))
+
+        const narrow = opsOf("u32 x = 0; switch(x) { case 0: return 1; case 2: return 2; default: return 99; }")
+        assert.equal(countOf(narrow, "BR_TABLE"), 1, narrow.join(" | "))
     })
 
     test("far-apart labels become a compare chain", () =>
@@ -122,9 +135,10 @@ describe("switch — grouping", () =>
         assert.equal(dispatch(cases, 7), 99)
         assert.equal(dispatch(cases, 0), 99)
 
-        // Three lone labels: a test each, and no table wider than one.
+        // Three lone labels: a one-case dispatch each, nested through
+        // each other's default case, and no table wider than one.
         const ops = opsOf(`u32 x = 1; switch(x) { ${cases} default: return 99; }`)
-        assert.equal(countOf(ops, "NE"), 2, ops.join(" | "))
+        assert.deepEqual(ops.filter(o => o.startsWith("BR_TABLE")), ["BR_TABLE 1", "BR_TABLE 1", "BR_TABLE 1"], ops.join(" | "))
     })
 
     test("clusters chain, and each cluster is a table", () =>
@@ -163,9 +177,15 @@ describe("switch — rejected shapes", () =>
         assert.throws(() => program("u32 x = 0; switch(x) { case 1: return 1; case 1: return 2; }"),
             /Duplicate switch case label 1/))
 
-    test("an empty case body, which would be a fallthrough in C", () =>
-        assert.throws(() => program("u32 x = 0; switch(x) { case 0: case 1: return 1; }"),
-            /Empty body for case 0/))
+    // `FALLTHROUGH` continues into the case physically next in the table
+    // (isa-core.md §4.5), so a shared body has to belong to the next label.
+    test("an empty case whose neighbour is not the next label", () =>
+    {
+        assert.throws(() => program("u32 x = 0; switch(x) { case 0: case 5: return 1; default: return 9; }"),
+            /Empty body for case 0: it can only share the body of case 1/)
+        assert.throws(() => program("u32 x = 0; switch(x) { case 0: return 1; case 5: default: return 9; }"),
+            /Empty body for case 5: it can only share the body of case 6/)
+    })
 
     test("a label that is not an integer literal", () =>
         assert.throws(() => program("u32 x = 0; u32 y = 1; switch(x) { case y: return 1; }"),
@@ -178,4 +198,56 @@ describe("switch — rejected shapes", () =>
     test("no cases at all", () =>
         assert.throws(() => program("u32 x = 0; switch(x) { default: return 2; }"),
             /at least one case/))
+})
+
+// C's `case 0: case 1: X` — one body, several labels. The empty label's
+// case is a lone `FALLTHROUGH`, which continues into the next case's body
+// instead of leaving the construct (isa-core.md §4.5).
+describe("switch — a shared case body", () =>
+{
+    const shared = "case 0: case 1: return 10; case 2: return 20;"
+
+    test("every sharing label reaches the body", () =>
+    {
+        assert.equal(dispatch(shared, 0), 10)
+        assert.equal(dispatch(shared, 1), 10)
+        assert.equal(dispatch(shared, 2), 20)
+        assert.equal(dispatch(shared, 7), 99)
+    })
+
+    test("the empty case is exactly one FALLTHROUGH", () =>
+    {
+        const ops = opsOf(`u32 x = 1; switch(x) { ${shared} default: return 99; }`)
+        const dispatch = ops.indexOf("BR_TABLE 3")
+
+        assert.ok(dispatch > 0, ops.join(" | "))
+        assert.equal(ops[dispatch + 1], "FALLTHROUGH", ops.join(" | "))
+        assert.equal(ops.filter(o => o === "FALLTHROUGH").length, 1, ops.join(" | "))
+    })
+
+    test("three labels can share one body", () =>
+    {
+        const three = "case 0: case 1: case 2: return 5;"
+        for(const x of [0, 1, 2]) assert.equal(dispatch(three, x), 5)
+        assert.equal(dispatch(three, 3), 99)
+    })
+
+    test("sharing works inside a compare chain too", () =>
+    {
+        const chained = "case 0: return 1; case 40: case 41: return 7;"
+        assert.equal(dispatch(chained, 0), 1)
+        assert.equal(dispatch(chained, 40), 7)
+        assert.equal(dispatch(chained, 41), 7)
+        assert.equal(dispatch(chained, 42), 99)
+    })
+
+    // A gap goes to the default, so a shared body must never be reachable
+    // through one — the labels either side of a gap are in different runs.
+    test("a gap next to a shared body still reaches the default", () =>
+    {
+        const withGap = "case 0: case 1: return 10; case 3: return 30;"
+        assert.equal(dispatch(withGap, 1), 10)
+        assert.equal(dispatch(withGap, 2), 99)
+        assert.equal(dispatch(withGap, 3), 30)
+    })
 })
