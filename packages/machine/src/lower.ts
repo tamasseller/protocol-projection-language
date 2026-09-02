@@ -24,7 +24,7 @@ import type {Procedure} from "./ir"
 import assert from "assert"
 import {RegAlloc} from "./scope"
 import {desugar} from "./desugar"
-import {lift, conditionalToAcc} from "./lift"
+import {lift, conditionalToAcc, assignedConditionalToAcc} from "./lift"
 import {tileExpression} from "./expr"
 import {instrBytes} from "./encoding"
 import type {TileRequest} from "./expr"
@@ -50,13 +50,17 @@ function lowerExpression<E extends { ext: string } = ExtOpPayload>(expr: Express
     const sugared = desugar(expr, req.demand !== "statement")
 
     // A ternary that *is* the whole expression rides acc across the merge
-    // (lift.ts) instead of writing a slot.
-    if(sugared.type === "ConditionalExpression" && (req.demand === "acc" || req.demand === "tos"))
+    // (lift.ts) instead of writing a slot, and so does one that is the whole
+    // right-hand side of an assignment.
+    const inAcc = sugared.type === "ConditionalExpression" && req.demand !== "statement"
+        ? conditionalToAcc(sugared, scope, req.into)
+        : req.into === undefined ? assignedConditionalToAcc(sugared, scope) : undefined
+
+    if(inAcc)
     {
-        const fragment = conditionalToAcc(sugared, scope, req.into)
         return req.demand === "tos"
-            ? {fragment: [...fragment, PUSH<E>()], tosDelta: 1}
-            : {fragment, tosDelta: 0}
+            ? {fragment: [...inAcc, PUSH<E>()], tosDelta: 1}
+            : {fragment: inAcc, tosDelta: 0}
     }
 
     const lifted = lift(sugared, scope)

@@ -111,6 +111,26 @@ export function conditionalToAcc<E extends { ext: string } = ExtOpPayload>(e: Co
     ]
 }
 
+/**
+ * `x = c ? a : b`: `conditionalToAcc`'s shape with the assignment's own
+ * `STORE` once after the merge, in place of the `PUSH`, the `STORE` per arm
+ * and the `LOAD` a slot costs. `STORE` leaves acc live, so a site wanting
+ * the assignment's value as well still gets it.
+ *
+ * Undefined for anything else, and for a target `into` the caller has to
+ * narrow to afterwards — the arms are already coerced to the variable's own
+ * type, and there is nowhere left to apply a second conversion.
+ */
+export function assignedConditionalToAcc<E extends { ext: string } = ExtOpPayload>(e: Expression, alloc: RegAlloc<E>): RtlInstr<E>[] | undefined
+{
+    if(e.type !== "AssignmentExpression" || e.operator !== "=" || e.right.type !== "ConditionalExpression") return undefined
+
+    const slot = alloc.resolve(e.left.name)
+    if(slot === undefined) return undefined
+
+    return [...conditionalToAcc(e.right, alloc, typeOfExpr(e, alloc)), STORE<E>(slot)]
+}
+
 /** Like `ternaryArm`, but the arm's value stays in acc rather than being
  *  stored — see `conditionalToAcc`. */
 function accArm<E extends { ext: string } = ExtOpPayload>(arm: Expression, scope: RegAlloc<E>, into?: PrimType): RtlInstr<E>[]

@@ -628,9 +628,18 @@ program image.
 
 ### 8.4 Dead-code rejection
 
-Any instruction unreachable on every control-flow path is a validation
-error, in particular anything following a terminator within the same block
-with no intervening control target.
+Nothing may follow a terminator within the same block with no intervening
+control target. The rule is structural — a consumer checks it with the
+nesting count it already tracks (§5.5's self-delimiting body). Code
+unreachable only for value reasons, such as the merge of a construct whose
+every case terminated or a case of a dispatch on a constant, is not a
+validation error: proving it would need a reachability analysis no
+consumer otherwise performs.
+
+A procedure body must end in a terminator of its own. A construct
+structurally continues into its merge whatever its cases do, so a body
+ending in one still needs an instruction at that merge to close on even
+when no path reaches it — `TRAP #0`, §4.5's reserved "unreachable".
 
 ### 8.5 Header and block well-formedness
 

@@ -109,11 +109,11 @@ interface WalkOutcome
  * realign with a real subsequent boundary — is not guaranteed to be
  * caught by this walk in isolation; only §8.5's structural checks
  * (index/arg-count/close-kind mismatches) happen to catch every case
- * actually tried in validate.test.ts. Dead code as the tail of a
- * procedure (by far the common case, and the only shape a correct
- * lowerer can produce — lower.ts's `closeBlock` was fixed to never leave
- * trailing dead code, ROADMAP.md item 3's own prerequisite) is always
- * caught, via the `nextPc !== body.length` check below. Hardening against
+ * actually tried in validate.test.ts. Dead code following the body's own
+ * terminator is always caught, via the `nextPc !== body.length` check
+ * below. §8.4 is structural, so an instruction unreachable only for value
+ * reasons is not a violation — in particular the `TRAP #0` that
+ * `closeProcBody` puts at a merge no path reaches. Hardening against
  * adversarially-crafted mid-stream dead code is not worth the extra
  * machinery for what this project is (a small utility tool, not a
  * defense against malicious bytecode — see the cryptographic-signing
