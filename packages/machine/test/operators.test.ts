@@ -164,6 +164,26 @@ describe("&& and ||", () =>
         returns("u32 i = 0; u32 z = 0; while(i < 3 || z) { i += 1; } return i;", 3)
     })
 
+    test("&& in an if without else nests instead of producing a value", () =>
+    {
+        // A's false edge lands on the empty arm either way, so the nested
+        // form duplicates nothing and materializes no 0/1. An `else`, or an
+        // `||`, has no such free edge.
+        assert.deepEqual(opsOf("u32 a = 1; u32 b = 1; if(a && b) { return 5; } return 0;"), [
+            "CONST #1", "PUSH", "CONST #1", "PUSH",
+            "LOAD 0", "BR_TABLE 1", "BLOCK_END",
+            "LOAD 1", "BR_TABLE 1", "BLOCK_END", "CONST #5", "RETURN", "BLOCK_END",
+            "CONST #0", "RETURN",
+        ])
+
+        // The right side still must not run when the left is false.
+        returns("u32 a = 0; u32 b = 0; if(a && (b = 1)) { return b; } return b;", 0)
+        returns("u32 a = 1; u32 b = 0; if(a && (b = 1)) { return b; } return b;", 1)
+
+        // An `else` keeps the value-producing form — nesting would copy it.
+        assert.ok(opsOf("u32 a = 1; u32 b = 1; if(a && b) { return 5; } else { return 6; }").includes("NE #0"))
+    })
+
     test("across a call", () =>
     {
         const isZero = proc(["x"], ir`return !x;`)

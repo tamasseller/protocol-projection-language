@@ -1,12 +1,13 @@
 /**
  * @ppl/machine/test — The conditional operator
  *
- * A ternary is the only expression that lowers to a CFG split, and a split
- * clobbers acc (isa-core.md §8.7) — so its result cannot travel in acc and
- * goes to a TOS slot reserved before the dispatch instead. Every case here
- * therefore validates the lowered body as well as running it: an arm that
- * left the value in acc, or a slot reserved inside a case, produces
- * bytecode the validator rejects rather than a wrong answer.
+ * A ternary is the only expression that lowers to a CFG split. One that is
+ * the whole expression rides acc across the merge (isa-core.md §8.7,
+ * `conditionalToAcc`); one nested inside a larger expression writes a TOS
+ * slot reserved before the dispatch. Every case here therefore validates the
+ * lowered body as well as running it: a slot reserved inside a case, or an
+ * arm leaving acc dead where the merge reads it, produces bytecode the
+ * validator rejects rather than a wrong answer.
  */
 
 import { describe, test } from "node:test"

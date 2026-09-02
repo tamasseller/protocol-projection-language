@@ -263,6 +263,20 @@ function closeBlock<E extends { ext: string } = ExtOpPayload>(fragment: RtlInstr
 
 function lowerIf<E extends { ext: string } = ExtOpPayload>(s: IfStatement, alloc: RegAlloc<E>): RtlInstr<E>[]
 {
+    // `if (A && B) S` with no `else` is `if (A) { if (B) S }`: A's false
+    // edge lands on the empty arm either way, so nothing is duplicated. No
+    // other short-circuit shape has that property — its exit lands on a
+    // branch body, which a second edge would have to copy.
+    if(!s.alternate && s.test.type === "LogicalExpression" && s.test.operator === "&&")
+    {
+        return lowerIf({
+            type: "IfStatement",
+            test: s.test.left,
+            consequent: {type: "IfStatement", test: s.test.right, consequent: s.consequent, alternate: null},
+            alternate: null,
+        }, alloc)
+    }
+
     // A scope snapshots its parent's numbering at construction, so the test
     // is lowered before either branch's: a ternary in it allocates a slot
     // one built earlier would renumber over.
