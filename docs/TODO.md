@@ -3,9 +3,6 @@
 
 # Current
 
-- JIT
-  - JIT bytecode reader interface — plan in jit-armv6m/docs/bytecode-reader.md; carries the extension interface simplification with it
-  
 - @ppl/machine
   - process improvements.md with regard to recent ISA revision
   - `switch` gap filling now copies the `default:` clause per gap; if that

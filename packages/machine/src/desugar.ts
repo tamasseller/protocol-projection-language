@@ -15,7 +15,10 @@
  *   +e          →  e                  identity; the promotion it carries in
  *                                      C is types.ts's job either way
  *   a && b      →  a ? (b != 0) : 0   short-circuit, via the one construct
- *   a || b      →  a ? 1 : (b != 0)   that already evaluates conditionally
+ *   a || b      →  a ? 1 : (b != 0)   that already evaluates conditionally;
+ *                                     the `!= 0` is dropped where the right
+ *                                     operand is a comparison, which §4.2
+ *                                     already guarantees is 0 or 1
  */
 
 import type {Expression, Identifier, AssignmentOperator, BinaryOperator, UpdateExpression} from "./ast"
@@ -28,6 +31,13 @@ const binary = (operator: BinaryOperator, left: Expression, right: Expression): 
 
 const assign = (left: Identifier, right: Expression): Expression =>
     ({type: "AssignmentExpression", operator: "=", left, right})
+
+const COMPARISONS: ReadonlySet<BinaryOperator> = new Set<BinaryOperator>(["==", "!=", "<=", ">=", "<", ">"])
+
+/** Normalising to 0/1 is a no-op on something isa-core.md §4.2 already
+ *  guarantees is 0 or 1. */
+const normalize = (e: Expression): Expression =>
+    e.type === "BinaryExpression" && COMPARISONS.has(e.operator) ? e : binary("!=", e, num(0))
 
 /** `a op= e` → `a = a op e`: the compound operator's own name, minus `=`. */
 const compoundOp = (op: AssignmentOperator): BinaryOperator =>
@@ -82,8 +92,8 @@ export function desugar(expr: Expression, valueUsed: boolean = true): Expression
             return {
                 type: "ConditionalExpression",
                 test: e.left,
-                consequent: e.operator === "&&" ? binary("!=", e.right, num(0)) : num(1),
-                alternate: e.operator === "&&" ? num(0) : binary("!=", e.right, num(0)),
+                consequent: e.operator === "&&" ? normalize(e.right) : num(1),
+                alternate: e.operator === "&&" ? num(0) : normalize(e.right),
             }
 
         default:

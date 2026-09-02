@@ -184,6 +184,23 @@ describe("&& and ||", () =>
         assert.ok(opsOf("u32 a = 1; u32 b = 1; if(a && b) { return 5; } else { return 6; }").includes("NE #0"))
     })
 
+    test("a comparison right operand is not normalized again", () =>
+    {
+        // isa-core.md §4.2 already guarantees a comparison is 0 or 1, so the
+        // `!= 0` the short-circuit desugar adds would be a second, and
+        // unfusable, materialization of the same value.
+        assert.ok(!opsOf("u32 a = 5; u32 b = 7; return a > 0 && b > 6;").includes("NE #0"))
+        assert.ok(!opsOf("u32 a = 5; u32 b = 7; return a > 0 || b > 6;").includes("NE #0"))
+
+        // Anything not already 0/1 still needs it.
+        assert.ok(opsOf("u32 a = 1; u32 b = 7; return a && b;").includes("NE #0"))
+
+        returns("u32 a = 5; u32 b = 7; return a > 0 && b > 6;", 1)
+        returns("u32 a = 5; u32 b = 7; return a > 0 && b > 9;", 0)
+        returns("u32 a = 0; u32 b = 7; return a > 0 || b > 6;", 1)
+        returns("u32 a = 0; u32 b = 7; return a > 0 || b > 9;", 0)
+    })
+
     test("across a call", () =>
     {
         const isZero = proc(["x"], ir`return !x;`)
