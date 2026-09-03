@@ -24,7 +24,7 @@ import type {Procedure} from "./ir"
 import assert from "assert"
 import {RegAlloc} from "./scope"
 import {desugar} from "./desugar"
-import {lift, conditionalToAcc} from "./lift"
+import {lift, conditionalToAcc, assignedConditionalToAcc} from "./lift"
 import {tileExpression} from "./expr"
 import {instrBytes} from "./encoding"
 import type {TileRequest} from "./expr"
@@ -50,13 +50,17 @@ function lowerExpression<E extends { ext: string } = ExtOpPayload>(expr: Express
     const sugared = desugar(expr, req.demand !== "statement")
 
     // A ternary that *is* the whole expression rides acc across the merge
-    // (lift.ts) instead of writing a slot.
-    if(sugared.type === "ConditionalExpression" && (req.demand === "acc" || req.demand === "tos"))
+    // (lift.ts) instead of writing a slot, and so does one that is the whole
+    // right-hand side of an assignment.
+    const inAcc = sugared.type === "ConditionalExpression" && req.demand !== "statement"
+        ? conditionalToAcc(sugared, scope, req.into)
+        : req.into === undefined ? assignedConditionalToAcc(sugared, scope) : undefined
+
+    if(inAcc)
     {
-        const fragment = conditionalToAcc(sugared, scope, req.into)
         return req.demand === "tos"
-            ? {fragment: [...fragment, PUSH<E>()], tosDelta: 1}
-            : {fragment, tosDelta: 0}
+            ? {fragment: [...inAcc, PUSH<E>()], tosDelta: 1}
+            : {fragment: inAcc, tosDelta: 0}
     }
 
     const lifted = lift(sugared, scope)
@@ -263,6 +267,20 @@ function closeBlock<E extends { ext: string } = ExtOpPayload>(fragment: RtlInstr
 
 function lowerIf<E extends { ext: string } = ExtOpPayload>(s: IfStatement, alloc: RegAlloc<E>): RtlInstr<E>[]
 {
+    // `if (A && B) S` with no `else` is `if (A) { if (B) S }`: A's false
+    // edge lands on the empty arm either way, so nothing is duplicated. No
+    // other short-circuit shape has that property — its exit lands on a
+    // branch body, which a second edge would have to copy.
+    if(!s.alternate && s.test.type === "LogicalExpression" && s.test.operator === "&&")
+    {
+        return lowerIf({
+            type: "IfStatement",
+            test: s.test.left,
+            consequent: {type: "IfStatement", test: s.test.right, consequent: s.consequent, alternate: null},
+            alternate: null,
+        }, alloc)
+    }
+
     // A scope snapshots its parent's numbering at construction, so the test
     // is lowered before either branch's: a ternary in it allocates a slot
     // one built earlier would renumber over.

@@ -1,12 +1,13 @@
 /**
  * @ppl/machine/test — The conditional operator
  *
- * A ternary is the only expression that lowers to a CFG split, and a split
- * clobbers acc (isa-core.md §8.7) — so its result cannot travel in acc and
- * goes to a TOS slot reserved before the dispatch instead. Every case here
- * therefore validates the lowered body as well as running it: an arm that
- * left the value in acc, or a slot reserved inside a case, produces
- * bytecode the validator rejects rather than a wrong answer.
+ * A ternary is the only expression that lowers to a CFG split. One that is
+ * the whole expression rides acc across the merge (isa-core.md §8.7,
+ * `conditionalToAcc`); one nested inside a larger expression writes a TOS
+ * slot reserved before the dispatch. Every case here therefore validates the
+ * lowered body as well as running it: a slot reserved inside a case, or an
+ * arm leaving acc dead where the merge reads it, produces bytecode the
+ * validator rejects rather than a wrong answer.
  */
 
 import { describe, test } from "node:test"
@@ -101,6 +102,18 @@ describe("ternary — only one arm runs", () =>
 
     test("an arm nested in an arm stays conditional", () =>
         returns("u32 a = 1; return a ? 5 : (a ? trap(7) : trap(8));", 5))
+
+    // One trapping arm is the useful "value or bail" shape, above. All of
+    // them is a ternary with no value at all, which §4.5 gives no edge into
+    // the merge — rejected here rather than left to surface as an acc
+    // liveness error, or as dead code the validator lets through.
+    test("a ternary whose arms all trap has no value to give", () =>
+    {
+        const noValue = /arms all trap/
+        assert.throws(() => lowerProc(ir`u32 c = 1; return c ? trap(1) : trap(2);`.body), noValue)
+        assert.throws(() => lowerProc(ir`u32 c = 1; u32 x = 0; x = c ? trap(1) : trap(2); return x;`.body), noValue)
+        assert.throws(() => lowerProc(ir`u32 c = 1; u32 x = c ? trap(1) : (c ? trap(2) : trap(3)); return x;`.body), noValue)
+    })
 })
 
 describe("ternary — where the value rides", () =>
@@ -219,4 +232,35 @@ describe("ternary — type", () =>
         assert.ok(opsOf(source).includes("UXTB"), opsOf(source).join(" | "))
         returns(source, 44)
     })
+})
+
+describe("ternary — as an assignment's right-hand side", () =>
+{
+    test("rides acc and stores once after the merge", () =>
+    {
+        assert.deepEqual(opsOf("u32 c = 1; u32 x = 0; x = c ? 10 : 20; return x;"), [
+            "CONST #1", "PUSH", "CONST #0", "PUSH",
+            "LOAD 0", "BR_TABLE 1", "CONST #20", "BLOCK_END", "CONST #10", "BLOCK_END", "STORE 1",
+            "LOAD 1", "RETURN",
+        ])
+        returns("u32 c = 1; u32 x = 0; x = c ? 10 : 20; return x;", 10)
+        returns("u32 c = 0; u32 x = 0; x = c ? 10 : 20; return x;", 20)
+    })
+
+    test("STORE leaves acc live, so the assignment still has a value", () =>
+        returns("u32 c = 1; u32 x = 0; return (x = c ? 10 : 20);", 10))
+
+    test("each arm is narrowed to the variable's own type", () =>
+        returns("u32 c = 1; u8 x = 0; x = c ? 300 : 20; return x;", 44))
+
+    test("the target is read before the store, not after", () =>
+        returns("u32 c = 1; u32 x = 5; x = c ? x + 1 : x - 1; return x;", 6))
+
+    test("one nested inside a larger right-hand side still writes a slot", () =>
+        assert.deepEqual(opsOf("u32 c = 1; u32 x = 0; x = (c ? 10 : 20) + 1; return x;"), [
+            "CONST #1", "PUSH", "CONST #0", "PUSH",
+            "LOAD 0", "PUSH", "BR_TABLE 1", "CONST #20", "STORE 2", "BLOCK_END", "CONST #10", "STORE 2", "BLOCK_END",
+            "CONST #1", "ADD 2", "STORE 1",
+            "LOAD 1", "RETURN",
+        ]))
 })

@@ -369,7 +369,7 @@ function decodeProcBody<E extends { ext: string } = ExtOpPayload>(bytes: Uint8Ar
             // tail after its last case) may still follow, exactly as they
             // would after an ordinary BLOCK_END close. A LOOP/BR_TABLE
             // with nothing at all following it is validator-rejected
-            // (§8.4: falling off the end is invalid) regardless of how its
+            // (§8.4: a body ends in a terminator) regardless of how its
             // last sub-block closes, so this function never has to tell
             // "really done" apart from "just closed one level" by itself —
             // the *next* terminator reached with the stack genuinely empty
