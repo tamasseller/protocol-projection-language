@@ -3,11 +3,6 @@
 
 # Current
 
-- JIT
-  - reader cost is +1.5-5% cold start (per-byte accessor call); LTO would recover it but breaks test/qemu's per-TU callgraph stack gate
-  - extension interface no longer cross-checks tosDelta or acc liveness after emit — an emitter disagreeing with its own extDescribe miscompiles silently
-  - fuzz/build_afl.sh runs coverage-guided now (afl++ 4.04c); needs afl-compiler-rt-32.o out of the i386 .deb, recipe in fuzz/README.md
-
 - @ppl/machine
   - process improvements.md with regard to recent ISA revision
   - `switch` gap filling now copies the `default:` clause per gap; if that
@@ -24,6 +19,7 @@
       - check for AI smells (and regular ones)
       - remove prose comments
     - test/fuzz/bench cleanup on both sides
+      - make proper frontend for fuzzer and benchmark tools in order to be able to poke at the thing ergonomically
 
 # PPL
 
