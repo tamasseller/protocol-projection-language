@@ -49,6 +49,10 @@ export interface ProcedureStats
      *  starting from `argCount` (isa-core.md §2.5's frame layout), never
      *  descending into any callee's own frame. */
     localPeak: number
+    /** Whether every `RETURN` leaves a value in acc. False for a procedure
+     *  whose result no caller may read — entry procedure included, where the
+     *  result escaping to the host is the host's to ignore. */
+    returnsValue: boolean
 }
 
 export interface ProgramStats
@@ -101,6 +105,11 @@ interface WalkOutcome
 {
     localPeak: number
     callSites: readonly CallSite[]
+    /** Whether every `RETURN` here leaves a value in acc — inferred, since
+     *  nothing on the wire declares it (§2.3's header carries `arg_count`
+     *  and nothing else). A procedure with no `RETURN` at all returns one
+     *  vacuously: there is no path for a caller to read the wrong thing on. */
+    returnsValue: boolean
 }
 
 /**
@@ -124,11 +133,14 @@ function walkProcedure<E extends { ext: string } = ExtOpPayload>(
     program: RtlProgram<E>,
     procIndex: number,
     effects: Readonly<Record<string, ExtOpEffect<E>>> | undefined,
+    calleeReturnsValue: (index: number) => boolean,
 ): WalkOutcome
 {
     const body = proc.body
     let peak = proc.argCount
     const callSites: CallSite[] = []
+    let liveReturn = false
+    let deadReturn = -1
 
     function fail(pc: number, message: string): never
     {
@@ -180,7 +192,15 @@ function walkProcedure<E extends { ext: string } = ExtOpPayload>(
 
             if(instr.op === "BLOCK_END") return { nextPc: pc + 1, close: "end", exitAccLive: accLive }
             if(instr.op === "FALLTHROUGH") return { nextPc: pc + 1, close: "fall", exitAccLive: accLive }
-            if(instr.op === "RETURN") { requireAcc("RETURN"); return { nextPc: pc + 1, close: "terminated", exitAccLive: accLive } }
+            if(instr.op === "RETURN")
+            {
+                // Not `requireAcc`: a procedure that establishes no value on
+                // *any* path is void, and the caller-side rule below is what
+                // keeps that sound. Only a procedure that does both is wrong.
+                if(accLive) liveReturn = true
+                else if(deadReturn < 0) deadReturn = pc
+                return { nextPc: pc + 1, close: "terminated", exitAccLive: accLive }
+            }
             if(instr.op === "TRAP") return { nextPc: pc + 1, close: "terminated", exitAccLive: accLive }
 
             if(instr.op === "PUSH") { requireAcc("PUSH"); tos++; pc++; continue }
@@ -205,7 +225,7 @@ function walkProcedure<E extends { ext: string } = ExtOpPayload>(
                 if(callee.argCount > 0) requireAcc(`CALL ${instr.calleeIndex}`)
                 if(commit) callSites.push({ calleeIndex: instr.calleeIndex, tos })
                 tos -= stackArgs
-                accLive = true // the callee's return value
+                accLive = calleeReturnsValue(instr.calleeIndex) // the callee's return value, if it leaves one
                 pc++; continue
             }
 
@@ -386,7 +406,60 @@ function walkProcedure<E extends { ext: string } = ExtOpPayload>(
     if(close !== "terminated") fail(nextPc, `${close === "fall" ? "FALLTHROUGH" : "BLOCK_END"} with no open block (procedure bodies close only via RETURN/TRAP)`)
     if(nextPc !== body.length) fail(nextPc, `unreachable instruction(s) after the procedure's terminator`)
 
-    return { localPeak: peak, callSites }
+    if(liveReturn && deadReturn >= 0)
+        fail(deadReturn, `RETURN: no value in acc, but another RETURN in this procedure leaves one — a procedure returns a value on every path or on none`)
+
+    return { localPeak: peak, callSites, returnsValue: liveReturn || deadReturn < 0 }
+}
+
+/**
+ * Every procedure walked, callees first.
+ *
+ * Whether a callee leaves a value decides acc liveness after its `CALL`, so
+ * a caller cannot be walked before its callees — and indices run the other
+ * way, since `lowerProgram` discovers a callee while lowering its caller.
+ * Hence the memoized recursion. A cycle is *not* reported here: §8.2 is
+ * `depthsOf`'s to enforce, and consumers that legitimately allow recursion
+ * (raise.ts, whose targets have a real call stack) still need the arities.
+ * Re-entry assumes a value, which is what the rule was before it was
+ * derived at all.
+ */
+function walkEveryProcedure<E extends { ext: string } = ExtOpPayload>(
+    program: RtlProgram<E>,
+    effects: Readonly<Record<string, ExtOpEffect<E>>> | undefined,
+): WalkOutcome[]
+{
+    const outcomes = new Map<number, WalkOutcome>()
+    const walking = new Set<number>()
+
+    function outcomeOf(index: number): WalkOutcome
+    {
+        const cached = outcomes.get(index)
+        if(cached !== undefined) return cached
+
+        const proc = program.procedures[index]
+        if(!proc) throw new Error(`CALL ${index}: no such procedure`)
+        if(walking.has(index)) return { localPeak: 0, callSites: [], returnsValue: true }
+
+        walking.add(index)
+        const outcome = walkProcedure(proc, program, index, effects, i => outcomeOf(i).returnsValue)
+        walking.delete(index)
+
+        outcomes.set(index, outcome)
+        return outcome
+    }
+
+    // Every procedure, not just those reachable from 0 — an unreachable one
+    // is still part of the image and still has to be well-formed.
+    return program.procedures.map((_, i) => outcomeOf(i))
+}
+
+/** Which procedures leave a value at every `RETURN` (isa-core.md §8.7),
+ *  without the rest of validation — for a consumer that raises programs
+ *  this validator would reject for reasons of its own. */
+export function returnArities<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E>, extension?: Extension<E>): boolean[]
+{
+    return walkEveryProcedure(program, extension?.effects).map(o => o.returnsValue)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -448,7 +521,15 @@ export function validateProgram<E extends { ext: string } = ExtOpPayload>(progra
     if(program.procedures.length === 0) throw new Error(`empty program`)
 
     const effects = extension?.effects
-    const perProcedure = program.procedures.map((proc, i) => walkProcedure(proc, program, i, effects))
+
+    /* Whether a callee leaves a value decides acc liveness after its
+     * `CALL`, so a caller cannot be walked before its callees. Indices run
+     * the other way — `lowerProgram` discovers a callee while lowering its
+     * caller, so callees land *after* — hence the same memoized,
+     * cycle-guarded recursion `depthsOf` uses below. §8.2 forbids recursion,
+     * so this terminates for every program that is going to validate at all;
+     * one that isn't is reported here rather than there. */
+    const perProcedure = walkEveryProcedure(program, effects)
 
     const memo = new Map<number, Depths>()
     for(let i = 0; i < program.procedures.length; i++)
@@ -456,7 +537,7 @@ export function validateProgram<E extends { ext: string } = ExtOpPayload>(progra
 
     const { totalDepth, maxCallDepth } = memo.get(0)!
     return {
-        procedures: perProcedure.map(p => ({ localPeak: p.localPeak })),
+        procedures: perProcedure.map(p => ({ localPeak: p.localPeak, returnsValue: p.returnsValue })),
         totalDepth,
         maxCallDepth,
     }

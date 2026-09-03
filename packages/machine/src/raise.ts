@@ -38,6 +38,7 @@
 
 import type {RtlInstr, RtlProc, RtlProgram, BinaryOpcode, UnaryOpcode, RegCombo, StackCombo, ExtOpPayload} from "./rtl"
 import type {Extension} from "./extension"
+import {returnArities} from "./validate"
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Output tree
@@ -132,7 +133,12 @@ const slotExpr = <E extends { ext: string } = ExtOpPayload>(index: number): Expr
 
 export function raiseProgram<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E>, extension?: Extension<E>): RaisedProc<E>[]
 {
-    return program.procedures.map(proc => raiseProc(proc, program, extension))
+    // §8.7's void-or-not is validate.ts's to decide — asking it here rather
+    // than inferring a second time is what keeps the two from disagreeing.
+    // Only the arities, not a full validation: a target with a real call
+    // stack raises recursive programs this ISA's §8.2 forbids.
+    const arities = returnArities(program, extension)
+    return program.procedures.map((proc, i) => raiseProc(proc, program, extension, arities[i]!))
 }
 
 /** Raise one procedure. `program` is needed even for a single procedure
@@ -140,9 +146,9 @@ export function raiseProgram<E extends { ext: string } = ExtOpPayload>(program: 
  *  (isa-core.md §4.6's last-arg-in-acc convention) — mirrors vm.ts's CALL
  *  case reaching into `program.procedures[calleeIndex]` for the same
  *  reason. */
-export function raiseProc<E extends { ext: string } = ExtOpPayload>(proc: RtlProc<E>, program: RtlProgram<E>, extension?: Extension<E>): RaisedProc<E>
+export function raiseProc<E extends { ext: string } = ExtOpPayload>(proc: RtlProc<E>, program: RtlProgram<E>, extension?: Extension<E>, returnsValue: boolean = true): RaisedProc<E>
 {
-    const raiser = new Raiser<E>(proc.body, proc.argCount, program, extension)
+    const raiser = new Raiser<E>(proc.body, proc.argCount, program, extension, returnsValue)
     const body = raiser.top()
     return {argCount: proc.argCount, peakSlots: raiser.peakSlots, body}
 }
@@ -210,6 +216,10 @@ class Raiser<E extends { ext: string } = ExtOpPayload>
         argCount: number,
         private readonly program: RtlProgram<E>,
         private readonly extension?: Extension<E>,
+        /** Whether this procedure's `RETURN`s carry a value at all
+         *  (isa-core.md §8.7) — a void one's does not, so a merge sitting
+         *  right before it is read by nothing. */
+        private readonly returnsValue: boolean = true,
     )
     {
         this.tos = argCount
@@ -250,6 +260,7 @@ class Raiser<E extends { ext: string } = ExtOpPayload>
         switch(next.op)
         {
             case "CONST": case "LOAD": case "TRAP": return false
+            case "RETURN": return this.returnsValue
             case "CALL": return (this.program.procedures[next.calleeIndex]?.argCount ?? 0) > 0
             case "EXT": return this.extension?.effects?.[next.ext]?.readsAcc === true
             default: return true

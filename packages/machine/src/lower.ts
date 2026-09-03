@@ -24,6 +24,8 @@ import type {Procedure} from "./ir"
 import assert from "assert"
 import {RegAlloc} from "./scope"
 import {desugar} from "./desugar"
+import {returnsValue} from "./signature"
+import type {ProcSignature} from "./types"
 import {lift, conditionalToAcc, assignedConditionalToAcc} from "./lift"
 import {tileExpression} from "./expr"
 import {instrBytes} from "./encoding"
@@ -76,11 +78,12 @@ function lowerExpression<E extends { ext: string } = ExtOpPayload>(expr: Express
  *  fragment that references another `Procedure`. */
 export function lowerProc<E extends { ext: string } = ExtOpPayload>(stmts: readonly Statement[], args: string[] = [], extension?: Extension<E>): RtlProc<E>
 {
-    const alloc = new RegAlloc<E>(undefined, () => undefined, extension)
+    const alloc = new RegAlloc<E>(undefined, () => undefined, extension, undefined,
+        returnsValue(stmts, "procedure") ? "u32" : "void")
 
     for(const arg of args) alloc.alloc(arg)
 
-    return { argCount: args.length, body: closeProcBody(lowerBlock(stmts, alloc)) }
+    return { argCount: args.length, body: closeProcBody(lowerBlock(stmts, alloc), alloc.returns ?? "u32") }
 }
 
 /**
@@ -101,6 +104,22 @@ export function lowerProgram<E extends { ext: string } = ExtOpPayload>(entry: Pr
 {
     const procedures: RtlProc<E>[] = []
     const indexOf = new Map<symbol, number>()
+    const signatures = new Map<symbol, ProcSignature>()
+
+    /** Declared where the author said so, deduced from the body's own
+     *  `return`s otherwise (signature.ts) — the C++14 `auto` rule, since an
+     *  `ir` fragment has no signature position to write one in. */
+    function signatureOf(target: Procedure): ProcSignature
+    {
+        const cached = signatures.get(target.id)
+        if(cached !== undefined) return cached
+
+        const returns = target.returns
+            ?? (returnsValue(target.fragment.body, `procedure '${target.name}'`) ? "u32" : "void")
+        const signature: ProcSignature = { argTypes: target.argTypes, returns }
+        signatures.set(target.id, signature)
+        return signature
+    }
 
     function resolve(target: Procedure): number
     {
@@ -128,10 +147,16 @@ export function lowerProgram<E extends { ext: string } = ExtOpPayload>(entry: Pr
                 throw new Error(`Call to '${name}' passes ${argCount} argument(s), but it takes ${callee.args.length}`)
 
             return resolve(callee)
-        }, extension)
-        for(const arg of target.args) alloc.alloc(arg)
+        }, extension, undefined, signatureOf(target).returns,
+        name =>
+        {
+            const callee = target.fragment.calls.get(name)
+            return callee && signatureOf(callee)
+        })
 
-        procedures[index] = { argCount: target.args.length, body: closeProcBody(lowerBlock(target.fragment.body, alloc)), header: target.header }
+        target.args.forEach((arg, i) => alloc.alloc(arg, target.argTypes[i]))
+
+        procedures[index] = { argCount: target.args.length, body: closeProcBody(lowerBlock(target.fragment.body, alloc), signatureOf(target).returns), header: target.header }
         return index
     }
 
@@ -148,12 +173,21 @@ export function lowerProgram<E extends { ext: string } = ExtOpPayload>(entry: Pr
  * is what goes there: isa-core.md §4.5 already reserves code 0 for
  * "unreachable", which is exactly what this is.
  *
- * A body that genuinely runs off its end is left alone, so it stays the
- * validation error it has always been rather than becoming a silent trap.
+ * A body that genuinely runs off its end returns nothing, which is exactly
+ * what a void procedure does — so it gets the `RETURN` C would have implied,
+ * and its callers get one less line of ceremony to write. One that owes a
+ * value has nothing to put there, and says so here rather than as an
+ * acc-liveness error further down.
  */
-function closeProcBody<E extends { ext: string } = ExtOpPayload>(body: RtlInstr<E>[]): RtlInstr<E>[]
+function closeProcBody<E extends { ext: string } = ExtOpPayload>(body: RtlInstr<E>[], returns: ProcSignature["returns"]): RtlInstr<E>[]
 {
-    return fallsThrough(body) && !reachesEnd(body) ? [...body, trap<E>(0)] : body
+    if(!fallsThrough(body)) return body
+    if(!reachesEnd(body)) return [...body, trap<E>(0)]
+
+    if(returns !== "void")
+        throw new Error(`procedure returns a value, but its body runs off the end without one`)
+
+    return [...body, bare<E>("RETURN")]
 }
 
 function lowerBlock<E extends { ext: string } = ExtOpPayload>(stmts: readonly Statement[], alloc: RegAlloc<E>): RtlInstr<E>[]
@@ -240,21 +274,22 @@ function lowerReturn<E extends { ext: string } = ExtOpPayload>(s: ReturnStatemen
 {
     if(s.argument)
     {
+        if(alloc.returns === "void")
+            throw new Error(`return with a value in a procedure that returns none — declare a return type, or drop the value`)
+
+        // The declared type is the callee's own to establish, exactly as in
+        // C: narrowing happens here, not at every call site.
         const {fragment} = lowerExpression(s.argument, alloc,
-            {demand: "acc", what: "return expression"})
+            {demand: "acc", into: alloc.returns, what: "return expression"})
         return [...fragment, bare("RETURN")]
     }
 
-    // A bare `return;` has no source-level value, but the bytecode-level
-    // RETURN opcode always reads acc regardless (isa-core.md §8.7 requires
-    // it live, and the calling convention has no void variant). Previously
-    // this relied on whatever residual value happened to precede it —
-    // harmless under the old permissive spec, but exactly the pattern
-    // §8.7 now rejects when the preceding code was a branch's own split
-    // (e.g. `if (x == 0) { return; }`'s no-else-if lowering). An explicit
-    // producer makes this correct regardless of what's live going in; the
-    // value itself is never observed by any caller of a void return.
-    return [CONST(0), bare("RETURN")]
+    // A procedure whose every `return` is bare is void (isa-core.md §8.7),
+    // and its RETURN needs no producer at all. One that returns a value
+    // elsewhere would be returning none here, which signature.ts already
+    // rejected at the definition — so the producer below is only for a
+    // fragment lowered without a deduced signature.
+    return alloc.returns === "void" ? [bare("RETURN")] : [CONST(0), bare("RETURN")]
 }
 
 /** Close a branch/case/loop-body fragment, unless it already closed itself

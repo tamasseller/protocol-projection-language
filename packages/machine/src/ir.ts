@@ -44,7 +44,7 @@
  */
 
 import { parse, SyntaxError as PegSyntaxError } from "./parser"
-import type { Statement } from "./ast"
+import type { PrimType, Statement } from "./ast"
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -97,8 +97,18 @@ export interface Procedure
      *  {@link ir}. Unique for the lifetime of the process. */
     readonly name: string
     /** Parameter names, in order — become `r0..r(argCount-1)` in the
-     *  callee's frame (isa-core.md §2.5). */
+     *  callee's frame (isa-core.md §2.5). An entry may carry a type,
+     *  `"u32 n"`, which narrows the argument at every call site and gives
+     *  the name that type inside the body; a bare `"n"` is `u32`, as every
+     *  parameter was before types existed here. */
     readonly args: readonly string[]
+    /** `args`' declared types, positionally — `undefined` where the entry
+     *  named no type. */
+    readonly argTypes: readonly (PrimType | undefined)[]
+    /** Declared return type, or `undefined` to deduce it from the body's
+     *  own `return`s (signature.ts). `"void"` says the procedure returns
+     *  nothing, which isa-core.md §8.7 makes a real distinction. */
+    readonly returns?: PrimType | "void"
     fragment: IrFragment
     /** Extension-owned header data (isa-core.md §2.3's extension fields —
      *  e.g. the codec extension's ABI-kind selector), carried through
@@ -111,9 +121,37 @@ let procCounter = 0
 
 /** Give an `IrFragment` the identity needed to be referenced (via
  *  `${...}`) as a call target from another `ir\`...\`` fragment. */
-export function proc(args: readonly string[], fragment: IrFragment, header?: unknown): Procedure
+/** What a `Procedure` may declare beyond its parameter list. `header` moved
+ *  here from its own positional slot when `returns` needed one too. */
+export interface ProcOptions
 {
-    return { type: "Procedure", id: Symbol(), name: `__proc${procCounter++}`, args, fragment, header }
+    returns?: PrimType | "void"
+    header?: unknown
+}
+
+const TYPE_NAMES: ReadonlySet<string> = new Set(["u32", "u16", "u8", "i32", "i16", "i8"])
+
+/** `"u32 n"` → `["n", "u32"]`, `"n"` → `["n", undefined]`. The type menu is
+ *  grammer.pegjs's own `TypeName`; anything else is a name, so a malformed
+ *  entry fails later as an unknown one rather than silently as a type. */
+function parseParam(entry: string): [string, PrimType | undefined]
+{
+    const parts = entry.trim().split(/\s+/)
+    return parts.length === 2 && TYPE_NAMES.has(parts[0]!)
+        ? [parts[1]!, parts[0] as PrimType]
+        : [entry, undefined]
+}
+
+function signature(args: readonly string[]): {names: string[]; argTypes: (PrimType | undefined)[]}
+{
+    const parsed = args.map(parseParam)
+    return { names: parsed.map(p => p[0]), argTypes: parsed.map(p => p[1]) }
+}
+
+export function proc(args: readonly string[], fragment: IrFragment, opts: ProcOptions = {}): Procedure
+{
+    const {names, argTypes} = signature(args)
+    return { type: "Procedure", id: Symbol(), name: `__proc${procCounter++}`, args: names, argTypes, fragment, header: opts.header, returns: opts.returns }
 }
 
 const UNDEFINED_FRAGMENT: IrFragment = undefined as unknown as IrFragment
@@ -130,9 +168,10 @@ const UNDEFINED_FRAGMENT: IrFragment = undefined as unknown as IrFragment
  * non-recursive fragment — the common case — where the eager one-call form
  * is simpler.
  */
-export function declareProc(args: readonly string[], header?: unknown): Procedure
+export function declareProc(args: readonly string[], opts: ProcOptions = {}): Procedure
 {
-    return { type: "Procedure", id: Symbol(), name: `__proc${procCounter++}`, args, fragment: UNDEFINED_FRAGMENT, header }
+    const {names, argTypes} = signature(args)
+    return { type: "Procedure", id: Symbol(), name: `__proc${procCounter++}`, args: names, argTypes, fragment: UNDEFINED_FRAGMENT, header: opts.header, returns: opts.returns }
 }
 
 /** Attach the parsed fragment to a `Procedure` minted via {@link declareProc}.

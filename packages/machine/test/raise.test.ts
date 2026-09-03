@@ -255,11 +255,20 @@ describe("raise: if/else (BR_TABLE)", () =>
     // always lowers its one arm as case 0, entered exactly when acc === 0
     // (lower.ts's inverted-test + brTable(1) convention), so this is a
     // genuine, provably-exact differential check, not just a smoke test.
-    test("bare early return as an arm's own first statement", () => assertRaisedReturn(`
-        u32 x = 0;
-        if (x == 0) { return; }
-        return 99;
-    `, 0))
+    test("bare early return as an arm's own first statement", () =>
+    {
+        // Void throughout: §8.7 wants every path to agree, so a bare
+        // `return;` beside a valued one is rejected at the definition. What
+        // is being probed is the raiser meeting a RETURN with no value to
+        // read, which is exactly what a void procedure's is.
+        const program: RtlProgram = { procedures: [lowerProc(ir`
+            u32 x = 0;
+            if (x == 0) { return; }
+            return;
+        `.body, [])] }
+        assert.ok(run(program).ok)
+        assert.doesNotThrow(() => raiseProgram(program))
+    })
 })
 
 describe("raise: loops (LOOP)", () =>
@@ -317,7 +326,7 @@ describe("raise: loops (LOOP)", () =>
         const program: RtlProgram = { procedures: [lowerProc(ir`
             u32 x = 0;
             while (x < 3) { return; }
-            return 99;
+            return;
         `.body, [])] }
         assert.doesNotThrow(() => raiseProgram(program))
     })

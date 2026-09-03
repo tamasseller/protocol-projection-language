@@ -103,33 +103,6 @@ export function codecRule<P extends TypePattern, Ctx>(
 }
 
 /**
- * Every codec-rule body is, by this library's own convention, a `void`
- * procedure — it either falls straight through or ends in an explicit
- * `trap(...)` for a real error case (docs/codec-extension.md §8.7's
- * exhaustive-decode pattern), never a meaningful return value. Repeating a
- * trailing `return;` in every single `produce()` — including genuine
- * one-liners like `unitRule` — is pure ceremony the machine-level ISA
- * itself won't drop (isa-core.md §2.3: a procedure body must end in a
- * terminator, full stop — see `lower.ts`/`validate.ts`/`vm.ts`, no
- * implicit-fallthrough exception for a "void" one). So this resolver
- * supplies the ceremony instead of every rule author: a fragment that
- * doesn't already end in `return`/`trap(...)` gets a bare `return;`
- * appended; one that already does (because the rule genuinely needs to,
- * e.g. to reject an out-of-range tag) is left exactly as written — never
- * double-terminated, never second-guessed. `produce` can just... stop
- * writing, once there's nothing left to say.
- */
-function ensureTerminated(fragment: IrFragment): IrFragment
-{
-    const last = fragment.body[fragment.body.length - 1]
-    const alreadyTerminated = last !== undefined && (
-        last.type === "ReturnStatement" ||
-        (last.type === "ExpressionStatement" && last.expression.type === "CallExpression" && last.expression.callee.name === "trap")
-    )
-    return alreadyTerminated ? fragment : ir`${fragment} return;`
-}
-
-/**
  * Build an on-demand, memoized, cycle-safe `SemanticType → Procedure`
  * resolver from an ordered rule list (first match wins — a caller's own
  * rules go first so they can preempt a default). `keyOf` controls
@@ -168,11 +141,11 @@ export function createCodecResolver<Ctx>(
         pattern: rule.pattern,
         fill: (placeholder, match, _node, ctx, resolve) =>
         {
-            defineProc(placeholder, ensureTerminated(rule.produce(match, ctx, resolve)))
+            defineProc(placeholder, rule.produce(match, ctx, resolve))
         },
     }))
 
-    return createResolver(adapted, (node) => declareProc([], node), keyOf).resolve
+    return createResolver(adapted, (node) => declareProc([], { header: node }), keyOf).resolve
 }
 
 /**

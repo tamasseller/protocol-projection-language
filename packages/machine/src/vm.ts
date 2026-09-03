@@ -210,7 +210,7 @@ type BlockFrame =
 /** Run one procedure to completion. All VM state is local to this call —
  *  a nested CALL is just a nested call to this function, against
  *  `program`'s procedure table. */
-function runProc<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E>, proc: RtlProc<E>, args: readonly number[], extension?: Extension<E>, maxSteps: number = MAX_STEPS, depth: number = 0): {acc: number; steps: number}
+function runProc<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E>, proc: RtlProc<E>, args: readonly number[], extension?: Extension<E>, maxSteps: number = MAX_STEPS, depth: number = 0): {acc: number; accLive: boolean; steps: number}
 {
     const body = proc.body
     const regs: number[] = [...args]
@@ -230,7 +230,11 @@ function runProc<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E
     // `number` (whatever it last held) so reading it while poisoned still
     // throws instead of silently returning a stale, bit-accurate-by-luck
     // value.
-    let accLive = true
+    // isa-core.md §4.6: a value arrives in acc only when the procedure takes
+    // an argument. Seeding this `true` regardless let a 0-argument body read
+    // acc the validator says is dead, and made a void procedure's result
+    // look established.
+    let accLive = args.length > 0
     let pc = 0
     let steps = 0
     const ctrl: BlockFrame[] = []
@@ -370,8 +374,11 @@ function runProc<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E
                 break
 
             case "RETURN":
-                requireAccLive("RETURN")
-                return {acc, steps}
+                // No `requireAccLive`: a procedure establishing no value on
+                // any path is void (validate.ts says the same statically),
+                // and `accLive` travelling out with the result is what keeps
+                // a caller from reading one that isn't there.
+                return {acc, accLive, steps}
 
             case "TRAP":
                 throw new Trap(i.imm, steps, depth)
@@ -469,7 +476,7 @@ function runProc<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E
 
                 const result = runProc(program, callee, callArgs, extension, maxSteps, depth + 1)
                 acc = result.acc
-                accLive = true
+                accLive = result.accLive
                 steps += result.steps
                 pc++
                 break
@@ -528,6 +535,11 @@ function runProc<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E
 export interface VmResult
 {
     acc: number
+    /** False when the entry procedure returned without establishing a value
+     *  — `acc` is then whatever this interpreter happened to hold, which a
+     *  different backend is free to disagree about. Read it before `acc`
+     *  wherever the entry procedure may be void. */
+    accLive: boolean
     ok: boolean
     trapCode: number | null
     /** How many frames below the entry procedure the trap fired, or null if
@@ -550,12 +562,12 @@ export function run<E extends { ext: string } = ExtOpPayload>(prog: RtlProgram<E
 
     try
     {
-        const {acc, steps} = runProc(prog, prog.procedures[0], args, extension, maxSteps, 0)
-        return {acc, ok: true, trapCode: null, trapDepth: null, steps}
+        const {acc, accLive, steps} = runProc(prog, prog.procedures[0], args, extension, maxSteps, 0)
+        return {acc, accLive, ok: true, trapCode: null, trapDepth: null, steps}
     }
     catch(e)
     {
-        if(e instanceof Trap) return {acc: 0, ok: false, trapCode: e.code, trapDepth: e.depth, steps: e.steps}
+        if(e instanceof Trap) return {acc: 0, accLive: false, ok: false, trapCode: e.code, trapDepth: e.depth, steps: e.steps}
         throw e
     }
 }

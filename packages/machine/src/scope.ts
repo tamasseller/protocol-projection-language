@@ -9,7 +9,7 @@
 
 import type {PrimType} from "./ast"
 import type {ExtOpPayload} from "./rtl"
-import type {TypeEnv} from "./types"
+import type {ProcSignature, TypeEnv} from "./types"
 import type {Extension} from "./extension"
 import {Rule, ruleset} from "./rules"
 
@@ -33,6 +33,8 @@ export class RegAlloc<E extends { ext: string } = ExtOpPayload> implements TypeE
         private _resolveCallee?: (name: string, argCount?: number) => number | undefined,
         private _extension?: Extension<E>,
         base?: number,
+        private _returns?: PrimType | "void",
+        private _signatureOf?: (name: string) => ProcSignature | undefined,
     )
     {
         this.next = base ?? _parent?.next ?? 0
@@ -58,6 +60,22 @@ export class RegAlloc<E extends { ext: string } = ExtOpPayload> implements TypeE
         return this._resolveCallee
             ?? this._parent?.resolveCallee
             ?? (() => undefined)
+    }
+
+    /** A callee's declared/deduced signature, inherited by nested scopes the
+     *  way `resolveCallee` is. */
+    signatureOf(name: string): ProcSignature | undefined
+    {
+        return (this._signatureOf ?? this._parent?.signatureOf.bind(this._parent))?.(name)
+    }
+
+    /** What the procedure being lowered returns — declared, or deduced from
+     *  its own `return`s (isa-core.md §8.7). Inherited by nested scopes the
+     *  way `extension` is; `undefined` where nothing resolved it, which
+     *  `lowerReturn` reads as the conservative "some value". */
+    get returns(): PrimType | "void" | undefined
+    {
+        return this._returns ?? this._parent?.returns
     }
 
     /** A nested scope has no `Extension` of its own — it inherits the

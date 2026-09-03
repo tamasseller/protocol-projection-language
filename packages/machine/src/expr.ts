@@ -41,7 +41,7 @@ export function tileExpression<E extends { ext: string } = ExtOpPayload>(expr: E
 {
     const typed = req.into !== undefined
         ? annotateInto(expr, scope, req.into)
-        : annotate(expr, scope)
+        : annotate(expr, scope, req.demand !== "statement")
 
     const east = typed as EastExpression<E>
     const node = req.demand === "statement"

@@ -112,7 +112,7 @@ describe("BR_TABLE — acc across the merge", () =>
             LOAD(0), opImm("GT_U", 3), brTable(1),
                 CONST(11), bare("BLOCK_END"),
                 CONST(1), PUSH(), opRegWriteback("ADD", 1), bare("BLOCK_END"),
-            bare("RETURN"),
+            PUSH(), CONST(0), bare("RETURN"),
         ]), /read of acc/))
 
     // A case that traps reaches no merge at all, so it constrains nothing.
@@ -136,7 +136,7 @@ describe("BR_TABLE — acc across the merge", () =>
             LOAD(0), opImm("EQ", 0), brTable(1),
                 trap(3),
                 trap(4),
-            bare("RETURN"),
+            PUSH(), CONST(0), bare("RETURN"),
         ]), /read of acc/))
 
     // Entry is unchanged: a case is a split successor, so it still starts

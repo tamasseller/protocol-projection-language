@@ -328,7 +328,7 @@ describe("validateProgram — §16 item 2: acc-clobbering convention enforcement
     test("RETURN reading acc right after a write-back-in-place (REG_REG) combo is rejected", () =>
     {
         const program: RtlProgram = {
-            procedures: [{ argCount: 0, body: [CONST(5), PUSH(), opRegWriteback("ADD", 0), bare("RETURN")] }],
+            procedures: [{ argCount: 0, body: [CONST(5), PUSH(), opRegWriteback("ADD", 0), PUSH(), CONST(0), bare("RETURN")] }],
         }
         assert.throws(() => validateProgram(program), /read of acc/)
     })
@@ -385,7 +385,7 @@ describe("validateProgram — §16 item 2: acc-clobbering convention enforcement
                     brTable(1),
                     CONST(2), opRegWriteback("ADD", 0), bare("BLOCK_END"),
                     CONST(1), bare("BLOCK_END"),
-                    bare("RETURN"),
+                    PUSH(), CONST(0), bare("RETURN"),   // the merge is dead, and PUSH is what reads it
                 ],
             }],
         }
@@ -411,7 +411,7 @@ describe("validateProgram — §8.7 acc liveness across control flow", () =>
                 body: [
                     bare("LOOP"),
                     CONST(1), bare("BLOCK_END"), // condition sub-block: establishes and reads acc fine
-                    bare("RETURN"),               // body: reads acc with no producer of its own
+                    PUSH(), CONST(0), bare("RETURN"), // body: reads acc with no producer of its own
                 ],
             }],
         }
@@ -427,7 +427,7 @@ describe("validateProgram — §8.7 acc liveness across control flow", () =>
                     bare("LOOP"),
                     LOAD(0), opImm("LT_U", 5), bare("BLOCK_END"),           // condition: r0 < 5
                     LOAD(0), opImm("ADD", 1), STORE(0), bare("BLOCK_END"), // body: r0 = r0 + 1
-                    bare("RETURN"),                                         // exit edge: reads acc (the LT_U result) with no producer of its own
+                    PUSH(), CONST(0), bare("RETURN"),                            // exit edge: reads acc (the LT_U result) with no producer of its own
                 ],
             }],
         }
@@ -467,7 +467,7 @@ describe("validateProgram — §8.7 acc liveness across control flow", () =>
         const program: RtlProgram = {
             procedures: [{
                 argCount: 1,
-                body: [brTable(1), bare("BLOCK_END"), CONST(0), bare("BLOCK_END"), bare("RETURN")],
+                body: [brTable(1), bare("BLOCK_END"), CONST(0), bare("BLOCK_END"), PUSH(), CONST(0), bare("RETURN")],
             }],
         }
         assert.throws(() => validateProgram(program), /read of acc/)
@@ -478,7 +478,7 @@ describe("validateProgram — §8.7 acc liveness across control flow", () =>
         const program: RtlProgram = {
             procedures: [{
                 argCount: 1,
-                body: [LOAD(0), opImm("EQ", 0), brTable(1), CONST(7), bare("BLOCK_END"), bare("RETURN")],
+                body: [LOAD(0), opImm("EQ", 0), brTable(1), CONST(7), bare("BLOCK_END"), PUSH(), CONST(0), bare("RETURN")],
             }],
         }
         assert.throws(() => validateProgram(program), /read of acc/)
@@ -494,7 +494,7 @@ describe("validateProgram — §8.7 acc liveness across control flow", () =>
                     CONST(1), bare("BLOCK_END"),
                     CONST(2), bare("BLOCK_END"),
                     CONST(3), bare("BLOCK_END"),
-                    bare("RETURN"),
+                    PUSH(), CONST(0), bare("RETURN"),
                 ],
             }],
         }
@@ -515,5 +515,75 @@ describe("validateProgram — §8.7 acc liveness across control flow", () =>
             }],
         }
         assert.doesNotThrow(() => validateProgram(program))
+    })
+})
+
+describe("validateProgram — §8.7: a procedure returns a value on every path or on none", () =>
+{
+    /** Returns nothing: a lone RETURN with acc never established. */
+    const voidProc: RtlProc = { argCount: 0, body: [bare("RETURN")] }
+
+    test("a procedure that establishes no value is void, not an error", () =>
+    {
+        const stats = validateProgram({ procedures: [voidProc] })
+        assert.equal(stats.procedures[0]!.returnsValue, false)
+    })
+
+    test("one that establishes a value on every path returns one", () =>
+    {
+        const stats = validateProgram({ procedures: [{ argCount: 0, body: [CONST(7), bare("RETURN")] }] })
+        assert.equal(stats.procedures[0]!.returnsValue, true)
+    })
+
+    test("doing both is the error — a caller cannot be told which path ran", () =>
+    {
+        const mixed: RtlProgram = {
+            procedures: [{
+                argCount: 1,
+                body: [
+                    LOAD(0), brTable(1),
+                    CONST(5), bare("RETURN"),   // case 0: returns a value
+                    bare("RETURN"),             // case 1: returns none
+                    trap(0),                    // the merge no case reaches
+                ],
+            }],
+        }
+        assert.throws(() => validateProgram(mixed), /returns a value on every path or on none/)
+    })
+
+    test("reading a void callee's result is rejected at the caller", () =>
+    {
+        const program: RtlProgram = {
+            procedures: [
+                { argCount: 0, body: [call(1), PUSH(), CONST(0), bare("RETURN")] },
+                voidProc,
+            ],
+        }
+        assert.throws(() => validateProgram(program), /read of acc/)
+    })
+
+    test("ignoring it is fine, and the caller is then void itself", () =>
+    {
+        const stats = validateProgram({
+            procedures: [{ argCount: 0, body: [call(1), bare("RETURN")] }, voidProc],
+        })
+        assert.equal(stats.procedures[0]!.returnsValue, false)
+    })
+
+    test("a callee that does return one keeps acc live across the CALL", () =>
+    {
+        const stats = validateProgram({
+            procedures: [
+                { argCount: 0, body: [call(1), PUSH(), CONST(0), bare("RETURN")] },
+                { argCount: 0, body: [CONST(3), bare("RETURN")] },
+            ],
+        })
+        assert.equal(stats.procedures[0]!.returnsValue, true)
+    })
+
+    test("a procedure that only traps returns a value vacuously — no path reads the wrong thing", () =>
+    {
+        const stats = validateProgram({ procedures: [{ argCount: 0, body: [trap(1)] }] })
+        assert.equal(stats.procedures[0]!.returnsValue, true)
     })
 })

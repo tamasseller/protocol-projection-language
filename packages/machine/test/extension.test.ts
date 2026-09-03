@@ -157,7 +157,7 @@ describe("Procedure/RtlProc header — opaque data, untouched by the core", () =
     test("carried through lowering unchanged", () =>
     {
         const header = { abiKind: "CODEC_ENCODER" }
-        const entry = proc([], ir`return 1;`, header)
+        const entry = proc([], ir`return 1;`, { header })
 
         const program = lowerProgram(entry)
         assert.equal(program.procedures[0]!.header, header)
@@ -209,7 +209,7 @@ describe("extension hook — acc liveness agrees between validate.ts and vm.ts",
     test("an opaque op does not revive acc — both halves still reject the read", () =>
     {
         const program: RtlProgram = {
-            procedures: [{ argCount: 0, body: [...prelude, extInstr("OPAQUE", []), bare("RETURN")] }],
+            procedures: [{ argCount: 0, body: [...prelude, extInstr("OPAQUE", []), PUSH(), CONST(0), bare("RETURN")] }],
         }
         const ext = accExtension()
         assert.throws(() => validateProgram(program, ext), /read of acc/)
@@ -261,10 +261,10 @@ describe("extension hook — killsAcc, an op that destroys acc", () =>
     test("a kill leaves acc dead — the RETURN after it is rejected by both halves", () =>
     {
         const program: RtlProgram = {
-            procedures: [{ argCount: 0, body: [CONST(1), extInstr("KILL", []), bare("RETURN")] }],
+            procedures: [{ argCount: 0, body: [CONST(1), extInstr("KILL", []), PUSH(), CONST(0), bare("RETURN")] }],
         }
         const ext = killAccExtension()
-        assert.throws(() => validateProgram(program, ext), /RETURN/)
+        assert.throws(() => validateProgram(program, ext), /read of acc/)
         assert.throws(() => run(program, ext), /read of acc/)
     })
 
@@ -298,7 +298,7 @@ describe("extension hook — killsAcc, an op that destroys acc", () =>
         ]
         const ext = killAccExtension()
 
-        assert.throws(() => validateProgram({ procedures: [{ argCount: 0, body: cases([bare("RETURN")]) }] }, ext), /RETURN/)
+        assert.throws(() => validateProgram({ procedures: [{ argCount: 0, body: cases([PUSH(), CONST(0), bare("RETURN")]) }] }, ext), /read of acc/)
         assert.doesNotThrow(() =>
             validateProgram({ procedures: [{ argCount: 0, body: cases([CONST(3), bare("RETURN")]) }] }, ext))
     })

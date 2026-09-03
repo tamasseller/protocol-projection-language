@@ -32,6 +32,19 @@ import {mapOver} from "./ast"
 export interface TypeEnv
 {
     typeOf(name: string): PrimType | undefined
+    /** The signature of a name this scope resolves to a procedure, or
+     *  `undefined` for a builtin, an extension call, or a scope with no
+     *  procedure table at all. */
+    signatureOf?(name: string): ProcSignature | undefined
+}
+
+/** What a call site needs to know about its callee: what to narrow each
+ *  argument to, and what the call is worth. `"void"` is isa-core.md §8.7's
+ *  distinction — such a call has no value to use. */
+export interface ProcSignature
+{
+    argTypes: readonly (PrimType | undefined)[]
+    returns: PrimType | "void"
 }
 
 const DEFAULT_TYPE: PrimType = "u32"
@@ -72,7 +85,7 @@ function coerce(value: Typed, target: PrimType): Expression
     return NARROWING.has(target) ? castTo(target, value.expr) : value.expr
 }
 
-function walk(node: Expression, env: TypeEnv): Typed
+function walk(node: Expression, env: TypeEnv, wantsValue: boolean = true): Typed
 {
     switch(node.type)
     {
@@ -136,10 +149,27 @@ function walk(node: Expression, env: TypeEnv): Typed
         }
 
         case "CallExpression":
-            // Procedure signatures are untyped for now, so a call's value
-            // is a plain word. Arguments are still annotated: each is an
-            // expression in its own right.
-            return {expr: mapOver(node, a => walk(a, env).expr), type: DEFAULT_TYPE}
+        {
+            // A callee this scope cannot place is a builtin or an extension
+            // call: still a plain word, and its arguments still annotated,
+            // each an expression in its own right.
+            const sig = env.signatureOf?.(node.callee.name)
+            if(sig === undefined) return {expr: mapOver(node, a => walk(a, env).expr), type: DEFAULT_TYPE}
+
+            if(sig.returns === "void" && wantsValue)
+                throw new Error(`Call to '${node.callee.name}' is used as a value, but the procedure returns none`)
+
+            // Each argument narrows to its parameter's own type, the same
+            // coercion a declaration applies to its initializer.
+            const args = node.arguments.map((a, i) =>
+            {
+                const t = sig.argTypes[i]
+                const v = walk(a, env)
+                return t !== undefined ? coerce(v, t) : v.expr
+            })
+
+            return {expr: {...node, arguments: args}, type: sig.returns === "void" ? DEFAULT_TYPE : sig.returns}
+        }
 
         // Reached only through `typeOfExpr`: lower.ts hoists every ternary
         // into a branch of its own before annotating what is left, so no
@@ -168,9 +198,9 @@ function walk(node: Expression, env: TypeEnv): Typed
 }
 
 /** Annotate one expression tree in place of itself. */
-export function annotate(expr: Expression, env: TypeEnv): Expression
+export function annotate(expr: Expression, env: TypeEnv, wantsValue: boolean = true): Expression
 {
-    return walk(expr, env).expr
+    return walk(expr, env, wantsValue).expr
 }
 
 /** The type an expression has, without rewriting it — for a caller that

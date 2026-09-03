@@ -15,7 +15,7 @@ import { describe, test } from "node:test"
 import assert from "node:assert/strict"
 
 import { run, evalBinary, evalUnary, UnspecifiedShiftAmount } from "../src/vm"
-import { bare, brTable, CONST, PUSH, opStack, opRegWriteback } from "../src/rtl"
+import { bare, brTable, call, CONST, PUSH, opStack, opRegWriteback } from "../src/rtl"
 import type { RtlProgram } from "../src/rtl"
 
 describe("run — §16 item 2: acc-clobbering convention enforcement", () =>
@@ -23,7 +23,7 @@ describe("run — §16 item 2: acc-clobbering convention enforcement", () =>
     test("RETURN reading acc right after a write-back-in-place (REG_REG) combo throws", () =>
     {
         const program: RtlProgram = {
-            procedures: [{ argCount: 0, body: [CONST(5), PUSH(), opRegWriteback("ADD", 0), bare("RETURN")] }],
+            procedures: [{ argCount: 0, body: [CONST(5), PUSH(), opRegWriteback("ADD", 0), PUSH(), CONST(0), bare("RETURN")] }],
         }
         assert.throws(() => run(program), /read of acc/)
     })
@@ -44,17 +44,19 @@ describe("run — §8.7 acc liveness across control flow", () =>
     test("a BR_TABLE case reading acc with no producer of its own throws at runtime", () =>
     {
         const program: RtlProgram = {
-            procedures: [{ argCount: 0, body: [brTable(1), bare("RETURN")] }],
+            procedures: [{ argCount: 0, body: [brTable(1), PUSH(), CONST(0), bare("RETURN")] }],
         }
         assert.throws(() => run(program), /read of acc/)
     })
 
     test("a BR_TABLE case with its own fresh producer runs fine, unaffected by the dispatch poisoning acc", () =>
     {
+        // The dispatch reads acc, so the procedure has to take an argument
+        // for one to be live there at all (isa-core.md §4.6).
         const program: RtlProgram = {
-            procedures: [{ argCount: 0, body: [brTable(1), CONST(7), bare("RETURN")] }],
+            procedures: [{ argCount: 1, body: [brTable(1), CONST(7), bare("RETURN")] }],
         }
-        const result = run(program)
+        const result = run(program, undefined, [0])
         assert.equal(result.ok, true)
         assert.equal(result.acc, 7)
     })
@@ -68,7 +70,7 @@ describe("run — §8.7 acc liveness across control flow", () =>
                     bare("LOOP"),
                     CONST(0), bare("BLOCK_END"), // condition: always exits
                     CONST(5), bare("RETURN"),    // body (never actually taken)
-                    bare("RETURN"),               // exit edge: reads acc with no producer of its own
+                    PUSH(), CONST(0), bare("RETURN"),  // exit edge: reads acc with no producer of its own
                 ],
             }],
         }
@@ -172,5 +174,37 @@ describe("evalUnary — §4.3 extend ops", () =>
     {
         for(const op of ["SXTB", "SXTH", "UXTB", "UXTH"] as const)
             assert.equal(evalUnary(evalUnary(0xdeadbeef, op), op), evalUnary(0xdeadbeef, op))
+    })
+})
+
+describe("run — a void entry procedure's result", () =>
+{
+    test("accLive says the result is not one, rather than the VM inventing a value", () =>
+    {
+        // Nothing establishes acc, so `acc` here is whatever this
+        // interpreter happened to hold — jit-armv6m returns whatever was in
+        // r0. `accLive` is what tells the two apart (isa-core.md §8.7).
+        const result = run({ procedures: [{ argCount: 0, body: [bare("RETURN")] }] })
+        assert.equal(result.ok, true)
+        assert.equal(result.accLive, false)
+    })
+
+    test("a value-returning entry reports accLive", () =>
+    {
+        const result = run({ procedures: [{ argCount: 0, body: [CONST(9), bare("RETURN")] }] })
+        assert.equal(result.accLive, true)
+        assert.equal(result.acc, 9)
+    })
+
+    test("a caller sees the callee's own liveness, not a blanket true", () =>
+    {
+        const result = run({
+            procedures: [
+                { argCount: 0, body: [call(1), bare("RETURN")] },
+                { argCount: 0, body: [bare("RETURN")] },
+            ],
+        })
+        assert.equal(result.ok, true)
+        assert.equal(result.accLive, false)
     })
 })

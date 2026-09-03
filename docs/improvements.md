@@ -1,8 +1,6 @@
 # Performance
 ## Lowerer
 
-5 Teach lowerReturn acc liveness (the lattice validate.ts already implements) — drops 10 of 12 CONST 0s per codec. Worth more than when written: §8.7's exit rule now carries acc past a BR_TABLE merge when every case reaching it leaves it live, where the old rule was "never live after a BR_TABLE", so more bare returns follow a live acc.
-
 ## JIT
 
 6 testAccNonzero flushes acc to r0 just to CMP it against 0, where the value's own producer could have set the flags in place. `Shape::ofFlags` is the representation for it — an arithmetic producer would leave `Flags(NE)` exactly as a comparison leaves its own condition. What is missing is the table of which producers leave usable flags, and the guarantee that nothing between such a producer and its branch disturbs them.

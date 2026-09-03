@@ -323,8 +323,8 @@ meaning depends on what it closes: unconditional jump to the merge for a
 unconditional back-edge for a `LOOP` body block. One opcode, three meanings,
 disambiguated purely by block nesting.
 
-**`RETURN`** ends the procedure; `acc` is the return value; the frame is
-popped.
+**`RETURN`** ends the procedure; `acc` is the return value, if the procedure
+establishes one at all (§8.7); the frame is popped.
 
 **`TRAP #code`** ends the procedure abnormally with an opaque error code
 (`0` is unreachable/panic by convention; the rest of the space is
@@ -683,10 +683,25 @@ argument (§4.6). A
 write-back-in-place combo (`REG_REG`/`PEEK_PEEK` — §4.1) invalidates it
 without re-establishing it, and so does an extension opcode declaring the
 destroying accumulator effect (§11.2). Every instruction that reads acc as an implicit
-operand — an arithmetic/comparison combo, `STORE`, `PUSH`, `RETURN`,
+operand — an arithmetic/comparison combo, `STORE`, `PUSH`,
 `NEG`/`NOT`/`CLZ`/`REVBITS`, a `CALL` whose callee takes at least one
 argument, or a `BR_TABLE`/`LOOP`-condition dispatch itself — is a
 validation error if acc is not live at that point.
+
+**`RETURN` is the exception, and defines what a void procedure is.** Acc
+being dead at a `RETURN` is not an error: it means this path returns no
+value. A procedure returns one **on every path or on none** — doing both is
+the error, since a caller cannot be told which path ran. Acc after a `CALL`
+is live only when the callee returns a value, and that is what keeps a
+caller from reading one that was never established. The property is derived,
+not declared: nothing in §2.3's header carries it, so every consumer infers
+it the same way from the body.
+
+A void procedure's result still travels in acc as far as the ABI is
+concerned (§4.6 is unchanged) — it is simply unspecified, and no validated
+program reads it. The exception is the entry procedure, whose result leaves
+for the host: a host reading it there reads whatever that implementation
+happened to leave behind, so `vm.ts`'s `run` reports `accLive` beside it.
 
 `BR_TABLE` and `LOOP` are this ISA's multi-successor-edge constructs. **A
 CFG split point clobbers acc unconditionally**: every successor edge — any
@@ -836,7 +851,8 @@ mechanism, out of scope here.
 | `switch (v) { case k: … }` | `v` into `acc`; `BR_TABLE` over one run of labels, shifted by that run's base; `case[N]` holds either the next run's own dispatch (off a slot holding `v`) or the `default:` clause |
 | `while (c) B` | `LOOP`; condition block = `c` into `acc`; `BLOCK_END`; body block = `B`; `BLOCK_END` |
 | `for (init; c; inc) B` | `init`; `LOOP`; condition block = `c` (omitted ⇒ `1`); `BLOCK_END`; body block = `B` then `inc`; `BLOCK_END` |
-| `return e;` / `return;` | `e` into `acc` (or `CONST #0`); `RETURN` |
+| `return e;` / `return;` | `e` into `acc`; `RETURN` (a void procedure needs no producer — §8.7) |
+| body running off its end | `RETURN`, when the procedure returns nothing (§8.7) — a body owing a value has none to put there, and is rejected |
 | `trap(c);` | `TRAP #c` |
 | `u32 x = e;` | `e` into TOS: the push that computes it *is* the slot, and `x` names that index |
 | `u32 x;` | `CONST #0`, `PUSH` — the slot still has to exist, and `PUSH` needs a live value |
