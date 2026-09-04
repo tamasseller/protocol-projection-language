@@ -29,4 +29,6 @@ This achieves C parity on the loop side, but DROP also allows implementation of 
 
 Full C switch semantics can be encoded relatively efficiently as well with full or partial fallthrough and gapfilling with DEFAULT. So the DSL can be changed to match C exactly there as well.  
 
-This pack removes afaik all the arbitrary restrictions compared to C99 regarding the things that are implemented. Still no struct, union, enum, typedef, pointers, arrays, etc... but those are absent by design.
+This pack removes afaik almost all the arbitrary structural restrictions compared to C99 regarding the things that are implemented. Still no struct, union, enum, typedef, pointers, arrays, etc... but those are absent by design.
+
+In-place (+= type) operator desugaring and multiple value declarations could be implemented lowerer side as well.
