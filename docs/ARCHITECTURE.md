@@ -213,7 +213,7 @@ layer without the others.
    own alongside them, and nothing in layer 1 privileges any of them.
 3. **Application.** A semantic schema (the project's one real asset) plus
    the choice of which layer-2 components to run over it. This layer owns
-   no generic machinery: see `example/src/compose.ts`.
+   no generic machinery: see [ppl-example](https://github.com/tamasseller/ppl-example)'s `src/compose.ts`.
 
 The test for which layer something belongs in: if it can be swapped for an
 alternative without the application noticing, it is a component; if
@@ -280,6 +280,6 @@ its whole walk, so no `produce` call ever branches on it.
 
 A **Projection** is the application-layer act of running chosen components,
 a type mapping or a codec or both, over one shared semantic schema to
-produce the artifacts a real system needs. `example/src/compose.ts` is
+produce the artifacts a real system needs. ppl-example's `src/compose.ts` is
 the reference shape: build the `TypeGraph` once, apply each package's
 Mapping to it, own nothing generic.

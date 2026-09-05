@@ -69,9 +69,11 @@ application prepends its own rules to preempt a default for one shape —
 that is the whole extension model, and nothing here privileges the
 built-in rules over yours.
 
-[example/](example) is a worked protocol: one schema, its binary codec, a
+[ppl-example](https://github.com/tamasseller/ppl-example) is a worked protocol: one schema, its binary codec, a
 JSON encoder and its TypeScript declarations, with the generated output
-committed so it can be read rather than imagined.
+committed so it can be read rather than imagined. It installs this package
+over its git URL, which makes it the one place `ppl` is exercised the way a
+consumer actually gets it.
 
 ## Layout
 

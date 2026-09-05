@@ -8,7 +8,7 @@
  * graph); `components/` is a set of independent, swappable codec libraries
  * built on that engine and privileged by none of it. An application chooses
  * which component libraries to run, and in what order, via `buildCodec`'s
- * `rules` argument — see `example/compose.ts`.
+ * `rules` argument — see ppl-example's `compose.ts`.
  */
 export * from "./engine/codec-extension"
 export * from "./engine/resolver"

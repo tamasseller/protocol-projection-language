@@ -2,7 +2,6 @@
 
 ## Hygiene
   - one package now (`src/core`, `src/codecs`, `src/target-js`); the layering is the import graph, so re-layering is a file move with no API impact
-  - example still lives in this repo on `file:..`; needs its own repo, then the dependency becomes the git URL
 
 ## Codec extension 
 

@@ -22,11 +22,11 @@ Thumbs.db
 # Logs
 *.log
 npm-debug.log*
-# Throwaway files written to disk purely so a generated module can be
-# require()'d back in a test — distinct from the example's own committed
-# generated/ output (example/generated/).
+
+# Throwaway modules a codegen test writes out and require()s back.
 **/test/.codegen-scratch/
 
-# The MOG repos being split out of this tree — their own git, not this one's.
+# Sibling repos checked out beside this one — their own git, not this one's.
 /mog-core/
 /mog-jit/
+/ppl-example/

@@ -263,7 +263,7 @@ describe("type tree wire — self-framing and errors", () =>
 
 describe("type tree wire — a realistic schema", () =>
 {
-    // Mirrors example/src/schema.ts's TelemetryPacket shape
+    // Mirrors ppl-example's schema.ts TelemetryPacket shape
     // (device id, timestamp struct, a capacitated list of readings whose
     // own type is a struct with a nested all-unit union, a status
     // bitfield) — the example is a separate consumer, not a dependency, so
