@@ -21,8 +21,8 @@ fi
 pkill -x fuzz_driver 2>/dev/null   # -x, exact name: never -f
 rm -rf "$OUT"; mkdir -p "$OUT"
 
-cd "$REPO/jit-armv6m/fuzz"
-PPL_FUZZ_CORPUS_OUT="$OUT" nohup timeout "$SECS" ./fuzz_driver seeds \
+cd "$REPO/mog-jit/fuzz"
+PPL_FUZZ_CORPUS_OUT="$OUT" nohup timeout "$SECS" src/driver/fuzz_driver seeds \
     > "$STATE/campaign.log" 2>&1 &
 echo $! > "$STATE/campaign.pid"
 echo "campaign started for ${SECS}s, log $STATE/campaign.log, exporting to $OUT"

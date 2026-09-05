@@ -1,20 +1,34 @@
 {
-  "private": true,
-  "name": "ppl-monorepo",
+  "name": "ppl",
   "version": "1.0.0",
-  "description": "Declarative Serialization Compiler — monorepo root",
-  "workspaces": [
-    "packages/core",
-    "packages/codecs",
-    "packages/target-cpp",
-    "packages/target-js",
-    "packages/example"
+  "description": "Protocol Projection Language — one semantic schema, projected into a wire codec, host-language types and accessors.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tamasseller/protocol-projection-language.git"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "docs",
+    "README.md"
   ],
   "scripts": {
-    "build": "npm run build --workspaces",
-    "test": "npm run test --workspaces",
-    "test:types": "npm run test:types --workspaces --if-present",
-    "clean": "rm -rf packages/*/dist packages/*/node_modules node_modules"
+    "build": "tsc",
+    "prepare": "npm run build",
+    "pretest": "npm run build",
+    "test": "ts-node --project tsconfig.test.json test/run.ts",
+    "test:types": "tsc --project tsconfig.test.json --noEmit",
+    "clean": "rm -rf dist node_modules"
+  },
+  "dependencies": {
+    "mog-core": "git+https://github.com/tamasseller/mog-core.git"
   },
   "devDependencies": {
     "@types/node": "^26.1.1",

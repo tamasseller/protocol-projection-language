@@ -136,7 +136,7 @@ procedural readability for runtime logic (`mog-core`, whose
 
 ## The semantic type system (the metamodel)
 
-`packages/core/src/metamodel.ts`. The source of truth for the *logical
+`src/core/metamodel.ts`. The source of truth for the *logical
 intent* of the data, strictly decoupled from physical constraints:
 bit-width, endianness, memory alignment and null-termination do not exist
 here.
@@ -192,25 +192,28 @@ signature can express "I encode any integer whose maximum fits in a byte."
 
 A Mapping is dispatch plus producer, so the same three-way split applies to
 every kind of Mapping here. The layers evolve at very different rates and
-belong in separate modules.
+belong in separate modules — `src/core`, `src/codecs`, `src/target-js`,
+one package. The boundary is the import graph, not npm: nothing published
+separately, nothing versioned separately, and no consumer that wants one
+layer without the others.
 
 1. **Core / platform.** The facilities that let semantic types and Mappings
    be *defined* at all, with no knowledge of any specific type shape or
-   wire format. `@ppl/core` holds the metamodel, `TypePattern`/`matchType`
-   and the structural predicate vocabulary, `runRuleset`'s rule dispatch,
-   `createResolver`'s on-demand cycle-safe resolution, and `reconcile`.
+   wire format. `core` holds the metamodel, `TypePattern`/`matchType`
+   and the structural predicate vocabulary, `createResolver`'s on-demand
+   cycle-safe rule dispatch, and `reconcile`.
    `mog-core` holds the protocol-agnostic IR, lowering and VM, plus the
    `Extension` hook that lets a domain add opcodes without `mog-core`
    knowing what a codec is. Changes here are rare and load-bearing.
 2. **Components.** The reusable Mappings built on layer 1: a target's
-   type-mapping rules (`@ppl/target-cpp`, `@ppl/target-js`), a wire
-   format's codec rules (`@ppl/codecs`'s default binary rules, plus opt-in
+   type-mapping rules (`target-js`), a wire format's codec rules
+   (`codecs`'s default binary rules, plus opt-in
    alternatives such as delta-LEB128 lists or a JSON pretty-printer). These
    are libraries, plural. An application picks one, several, or writes its
    own alongside them, and nothing in layer 1 privileges any of them.
 3. **Application.** A semantic schema (the project's one real asset) plus
    the choice of which layer-2 components to run over it. This layer owns
-   no generic machinery: see `packages/example/src/compose.ts`.
+   no generic machinery: see `example/src/compose.ts`.
 
 The test for which layer something belongs in: if it can be swapped for an
 alternative without the application noticing, it is a component; if
@@ -221,19 +224,27 @@ surfaced in.
 
 ### Type mapping
 
-A target's type mapping is a `Rule<C>[]` (`@ppl/core/projection.ts`) run
-via `runRuleset` against the semantic `TypeGraph`: one rule set per target,
-living in that target's own package, never in `@ppl/core`. `@ppl/core`
-supplies the dispatch engine and the predicate vocabulary; each target
-package is a component library built on it.
+A target's type mapping is a rule list resolved against the semantic
+`TypeGraph` by `src/core/projection.ts`'s `createResolver`: one rule set
+per target, living in that target's own directory, never in `core`.
+`core` supplies the dispatch engine and the predicate vocabulary; each
+target is a component library built on it.
+
+A rule gets a `resolve` callback for its children, and that is load-bearing
+rather than convenient: a struct's own declaration text has to embed its
+fields' refs *while being built*. A dispatch engine without it forces every
+target to answer "what does a child look like" some other way — and the one
+target that tried answered it with a hand-written per-kind switch that
+reimplemented the rule list and no rule could override, which is exactly
+the composability this layering claims to provide, silently absent.
 
 ### Codecs
 
 A wire-format codec is the same shape aimed at a different producer: each
 matched semantic type produces an `ir` fragment, a `Procedure` body for
-`mog-core`'s VM. `@ppl/codecs` supplies two things beyond what a type
-mapping gets from `@ppl/core`, both core-layer despite living in this
-package:
+`mog-core`'s VM. `codecs` supplies two things beyond what a type
+mapping gets from `core`, both core-layer despite living alongside the
+codec components:
 
 - **The codec `Extension`** (`engine/codec-extension.ts`): the opcode
   vocabulary (`ENTER`, `CALL_CODEC`, `READ`/`WRITE`, and the rest) that
@@ -241,14 +252,14 @@ package:
   itself; it makes encoding expressible. It lives here rather than in
   `mog-core` only because `mog-core` must stay protocol-agnostic.
 - **The on-demand resolver.** A struct can reference itself through a union
-  arm, and `runRuleset`'s single eager top-down pass cannot hand a
-  not-yet-finished child a reserved slot before a sibling embeds it into
-  its own instruction stream. The mint-then-recurse, memoized, cycle-safe
-  execution is `@ppl/core/projection.ts`'s `createResolver`, shared with
+  arm, so a dispatch pass has to be able to hand a not-yet-finished child a
+  reserved slot before a sibling embeds it into its own instruction stream.
+  The mint-then-recurse, memoized, cycle-safe
+  execution is `src/core/projection.ts`'s `createResolver`, shared with
   `target-js/engine/resolver.ts`'s `createTsResolver` (resolving
   `SemanticType -> TSTypeDecl` instead of `SemanticType -> Procedure`).
-  `@ppl/codecs/engine/resolver.ts`'s `createCodecResolver` is the codec
-  adapter over it, and can move no further out because it depends on
+  `src/codecs/engine/resolver.ts`'s `createCodecResolver` is the codec
+  adapter over it, and stays in `codecs` because it depends on
   `mog-core`'s `Procedure`/`declareProc`/`lowerProgram`. A rule's
   `produce` sees only its own match witness and a `resolve` callback keyed
   on a child's `SemanticType` identity: no `TypeNode`, no graph.
@@ -258,7 +269,7 @@ default length-prefixed, tag-hoisted binary encoding, plus the opt-in
 alternatives (`components/delta-leb128.ts`, `components/json.ts`) that
 compose alongside or instead of it. `buildCodec` (`engine/resolver.ts`)
 privileges none of them: it takes the rule set as a plain required
-argument, exactly as `runRuleset` does for a type mapping, so an
+argument, exactly as a type mapping's own resolver does, so an
 application is never stuck with an implicit default it cannot replace. For
 the binary rules, direction is which of two flat rule lists
 (`binaryEncodeRules`/`binaryDecodeRules`) gets passed in, not a value
@@ -269,6 +280,6 @@ its whole walk, so no `produce` call ever branches on it.
 
 A **Projection** is the application-layer act of running chosen components,
 a type mapping or a codec or both, over one shared semantic schema to
-produce the artifacts a real system needs. `packages/example/src/compose.ts` is
+produce the artifacts a real system needs. `example/src/compose.ts` is
 the reference shape: build the `TypeGraph` once, apply each package's
 Mapping to it, own nothing generic.

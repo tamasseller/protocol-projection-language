@@ -18,7 +18,7 @@ fi
 rm -f "$SOCK" "$STATE/oracle.log"
 
 cd "$REPO"
-nohup npx ts-node --transpile-only jit-armv6m/fuzz/oracle_server.ts "$SOCK" \
+nohup npx ts-node --transpile-only mog-jit/fuzz/ts/oracle_server.ts "$SOCK" \
     > "$STATE/oracle.log" 2>&1 &
 echo $! > "$STATE/oracle.pid"
 

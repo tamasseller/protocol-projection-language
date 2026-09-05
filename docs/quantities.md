@@ -1,7 +1,7 @@
 # Quantities
 
 **Status: design sketch, unimplemented.** ROADMAP.md §13's "target-side
-transformation (unit of measurement)". Nothing in `packages/` references
+transformation (unit of measurement)". Nothing in `src/` references
 any of this yet.
 
 ## 1. The gap
@@ -220,7 +220,7 @@ The ontology must not block the checking. In order:
 2. Range/precision checking through the transform.
 3. Wire encoding (§6), so it survives a codec image round-trip.
 4. Target consumption: branded numbers in `target-js`, a strong type or a
-   folded multiply in `target-cpp`.
+   folded multiply in a generated C++ target.
 5. `dimension`, then `log` / `table` / `formula`.
 
 **The risk is authorship, not algebra.** Optional unchecked metadata rots

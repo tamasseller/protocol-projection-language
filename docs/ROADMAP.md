@@ -34,7 +34,8 @@ against isa-core.md's opcode table, plus extension opcodes (byte ≥128, via
 ## 5. `mog-core` package - Done
 
 Generic, protocol-agnostic IR/lowering/VM/bytecode/extension-hook
-machinery in its own package. `@ppl/core` does not depend on it.
+machinery in its own repository, consumed here as an ordinary dependency.
+`core` does not depend on it.
 
 ## 6. Extension mechanism - Done
 
@@ -45,7 +46,7 @@ extension-header fields stay opaque and are carried through untouched.
 
 ## 7. Codec-specific extension - Done
 
-docs/codec-extension.md §1-§3 as `@ppl/codecs`'s own `Extension`:
+docs/codec-extension.md §1-§3 as `codecs`'s own `Extension`:
 `engine/opcodes.ts` (the 17 opcode mnemonics, single source of truth),
 `engine/codec-extension.ts` (`createCodecExtension` plus `codecRules()`,
 the `ir` DSL surface), `engine/resolver.ts` (`createCodecResolver` plus
@@ -53,7 +54,7 @@ the `ir` DSL surface), `engine/resolver.ts` (`createCodecResolver` plus
 `engine/wire.ts` (§6's byte encoding). Components: `binary-rules.ts`
 (default binary wire format, struct union-tag hoisting up to 128 variants),
 `delta-leb128.ts`, `json.ts` (encoder-only, proving direction is optional).
-Proven against `packages/example`'s independently-authored
+Proven against `example`'s independently-authored
 `TelemetryPacket` schema.
 
 **Known limit:** a truly self-referential type resolves at build time but
@@ -61,10 +62,10 @@ Proven against `packages/example`'s independently-authored
 bounded-stack-depth guarantee). Recursive types are not expressible under
 this ISA yet, hand-built or DSL-authored.
 
-`engine/` stays in `@ppl/codecs` rather than moving to `@ppl/core`:
-`@ppl/core` has zero dependencies and `target-cpp`/`target-js` depend on
-only it, so moving `codec-extension.ts` (built on
-`Extension`/`ExecState`/`ExtOpEffect`) there would drag `mog-core` in.
+`engine/` stays in `codecs` rather than moving to `core`: `core` reaches
+for nothing outside itself, so moving `codec-extension.ts` (built on
+`Extension`/`ExecState`/`ExtOpEffect`) there would put `mog-core` on the
+bottom layer's own import list.
 
 ## 8. Multi-procedure program envelope - Done
 
@@ -82,13 +83,13 @@ maximum compactness. `validateProgram`'s `ProgramStats` stays available to
 any caller that wants them. Same reasoning drops a procedure's own
 extension `header` from the wire (isa-core.md §5.5).
 
-The jit-armv6m target does want those stats, and takes them in a wrapper of
+The mog-jit target does want those stats, and takes them in a wrapper of
 its own (`jit-armv6m.ts`, the package's only target-specific module) rather
 than in the generic envelope: `max_call_depth`/`total_depth` prepended, plus
 a two-byte FNV-1a frame binding a program to the validator that produced it.
-jit-armv6m/docs/design.md §1.1.
+mog-jit/docs/design.md §1.1.
 
-## 9. Declared default values (`@ppl/core`) - Done
+## 9. Declared default values (`core`) - Done
 
 `metamodel.ts`. Motivated by codec-image.md §3.1/§3.3/§4: integer gets a
 third constructor parameter (`integer(min, max, default = 0)`, stored as
@@ -129,7 +130,7 @@ against it before any thunk dereferencing (a recursive type's name lives on
 the thunk). This also serves a case traits never did: an application author
 overriding where their own codec applies can say "the type declared as
 `Timestamp`, wherever it occurs" without spelling out its structural shape.
-`runRuleset`/`Rule.produce` dropped their `traits` parameter.
+the ruleset runner and its `produce` dropped their `traits` parameter.
 
 A type's own declared name and codec-image.md §6.3's field/variant names
 are different namespaces: field/variant names travel in the image because
@@ -147,15 +148,15 @@ recognize and specialize into a raw-buffer/DMA copy instead of a loop.
 `opcodes.ts`, `codec-extension.ts`, `validate-handles.ts`, `wire.ts` (the
 extension's last 9 codes, 128/128 now assigned) and `binary-rules.ts`.
 
-**Reconciliation** (docs/codec-image.md §2/§3), `packages/core/src/
+**Reconciliation** (docs/codec-image.md §2/§3), `src/core/
 reconcile.ts`: `reconcile(imageRoot, localRoot)` is a lock-step walk of two
 `TypeNode` graphs producing a bidirectional
 `"matched"`/`"image-only"`/`"local-only"` tree; `resolve(parent, edge,
 direction)` applies §3's rules (`bridge`/`drop`/`default`/`trap`/
 `"unreachable"`) to one edge. Split because the tree shape is
 direction-independent and only its interpretation is not. Target- and
-codec-independent, so it lives in `@ppl/core`;
-`packages/codecs/src/engine/codec-extension.ts` re-exports its `Direction` type.
+codec-independent, so it lives in `core`;
+`src/codecs/engine/codec-extension.ts` re-exports its `Direction` type.
 `Correspondence` carries no name of its own: struct fields and union
 variants are `{name, correspondence}` edges off `.children`, mirroring
 `type-graph.ts`'s `TypeEdge {step, target}` split, which is what preserves
@@ -164,26 +165,30 @@ same type object.
 
 ## 12. Real target codegens - In progress
 
-Depends on 7-10. `target-cpp` is still a rushed stub on the older
-`Rule<C>`/`runRuleset` primitive (`@ppl/core/projection.ts`); everything
-below is JS/TS.
+Depends on 7-10. Everything below is JS/TS: there is no C++ target. The
+old one was a rushed stub on the eager `runRuleset` primitive, which has
+since been deleted along with it: with no way to ask for a child's result,
+it had to answer that with a hand-written per-kind switch that no rule
+could override. A real C++ target gets written from scratch, on
+`createResolver` like every other projection.
 
 **JS/TS type codegen - done.** `target-js` rebuilt onto the same
-`{pattern, produce}`-with-swappable-rule-list shape `@ppl/codecs`
+`{pattern, produce}`-with-swappable-rule-list shape `codecs`
 established, split into `engine/` (`TsRule`/`createTsResolver`/
 `projectTSTypes`/`emitTSDeclarations`, no opinion on representation) and
-`components/` (concrete rule libraries), mirroring `@ppl/codecs`.
+`components/` (concrete rule libraries), mirroring `codecs`.
 `components/ts-emitter.ts` is the default mapping; `ts-alternative-rules.ts`
 adds opt-in alternatives an app author prepends for specific shapes:
 unit-as-`undefined`, integer-as-`bigint` past `Number`'s safe range,
 byte-list-as-`Uint8Array`, capacity-≤1-list-as-optional,
-general-union-as-class-hierarchy, struct-as-class. One `@ppl/core`
+general-union-as-class-hierarchy, struct-as-class. One `core`
 primitive fell out: `optional(T)`, sugar for
-`union({value: T, empty: unit}, "empty")`, the shape `target-cpp`'s
-`std::optional<T>` rule already matches, so a schema authored with
-`optional(T)` gets an idiomatic representation on both targets.
+`union({value: T, empty: unit}, "empty")`, so a schema authored with
+`optional(T)` gets an idiomatic representation rather than a bare union —
+and a `std::optional<T>` rule is the obvious match for it on a future C++
+target.
 
-**`resolveProcedureTypes` - done.** `packages/codecs/src/engine/
+**`resolveProcedureTypes` - done.** `src/codecs/engine/
 procedure-types.ts`. A raised `ENTER`'s `ref` operand is a bare positional
 index into a struct/union's field/variant table, meaningless to a backend
 without knowing which type the procedure handles. `createCodecResolver`
@@ -217,7 +222,7 @@ Not a gap today, since every real op's inputs are either popped operands or
 `readsAcc`'s single implicit one.
 
 **JS compiled-source codec codegen - done.** `generateJsCodecs`/
-`generateCodecModule` (`packages/target-js/src/engine/codec-module.ts`, on
+`generateCodecModule` (`src/target-js/engine/codec-module.ts`, on
 `engine/codec-codegen.ts`'s per-procedure tree walk,
 `engine/line-builder.ts`'s indenting output and `engine/codec-type-nav.ts`'s
 `TypeNode` helpers) turn a `buildCodec`-produced `RtlProgram` pair into
@@ -226,7 +231,7 @@ literal TypeScript: one `function` per procedure, real `if`/`while`/
 the RTL program and interpreting it. Built on `raise.ts` for control-flow
 shape and `resolveProcedureTypes`/`resolveHandleTypes` for turning a raised
 `ENTER`'s bare `ref` into a real field/variant name at generation time.
-`packages/target-js/src/runtime/codec-runtime.ts` holds the genuinely
+`src/target-js/runtime/codec-runtime.ts` holds the genuinely
 dynamic primitives the generated code calls (buffer position, byte
 read/write, the `(container, key)` indirection a decoder needs); schema-edge
 lookup and opcode dispatch resolve once at generation time. Scope is any
@@ -263,14 +268,15 @@ accessor) from the comparison list (kept image-side).
 baseline plus selectively-opted special representations) and the actual
 `raise.ts` pattern match recognizing `WRITE_SEQ`/`READ_SEQ` and emitting a
 raw-buffer/DMA version for a target that opted in. Item 11 built the snatch
-point; choosing what to do with it is real target-codegen work.
-`target-cpp` still needs the same rebuild `target-js` got.
+point; choosing what to do with it is real target-codegen work. A C++
+target is the other half, and starts from nothing.
 
 ## 13. Further ideas
 
-- Crypto extension: new handle space, OpenSSL-like API, covering CRCs,
-  fixed and variable length hashes (SHAKE) and AEAD, data I/O via stream
-  iterators.
+- Crypto primitives: docs/crypto.md (design sketch, unimplemented). A third
+  handle space with an OpenSSL-like lifecycle, covering CRCs, fixed and
+  variable length hashes (SHAKE), MACs, ciphers and AEAD, all bulk data I/O
+  through stream iterators.
 - Better DSL syntax for handle access: `stream[0].read`/`write`, or a
   declaration-like form that also lets the lowerer allocate handle indices.
 - Small-**value**-space merging binary codec, e.g. a union tag merged with a

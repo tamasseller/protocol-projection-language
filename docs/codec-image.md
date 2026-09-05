@@ -1,9 +1,9 @@
 # Codec Image
 
 > **Status:** implemented. §6 (type tree wire encoding) and §7 (container
-> layout) are `packages/codecs/src/engine/type-tree-wire.ts` and
+> layout) are `src/codecs/engine/type-tree-wire.ts` and
 > `engine/codec-image.ts` (ROADMAP.md item 10). §2/§3's reconciliation is
-> `packages/core/src/reconcile.ts` (item 11), and `target-js`'s
+> `src/core/reconcile.ts` (item 11), and `target-js`'s
 > `engine/bridging-codec-module.ts` is its first consuming codegen (item
 > 12). Builds on docs/codec-extension.md throughout:
 > `TypeNode`/`edges`/`Step` (§2.2/§2.4), `CALL_CODEC`'s `ref` addressing
@@ -65,7 +65,7 @@ own object model."
 
 ### 2.1 Matching key: name, not position
 
-`TypeGraph`'s `edges` (`@ppl/core/type-graph.ts`) are ordered: a struct's
+`TypeGraph`'s `edges` (`src/core/type-graph.ts`) are ordered: a struct's
 `Map<string, SemanticType>` iterates in declaration order, and
 `ENTER`/`CALL_CODEC`'s `ref` operand addresses that order positionally
 (codec-extension.md §2.4). That positional order is fixed forever for the
@@ -114,7 +114,7 @@ requiring the two trees to be isomorphic.
 
 ### 2.4 Implementation shape
 
-`packages/core/src/reconcile.ts`, target- and codec-independent the way
+`src/core/reconcile.ts`, target- and codec-independent the way
 `raise.ts` is target-independent in `mog-core`: it computes a mapping a
 target codegen consumes and knows nothing about any target language, wire
 byte or opcode. Two functions, deliberately separate:
@@ -325,7 +325,7 @@ constructs its own `integer(0, 255, d)` value, which already gets its own
 `TypeNode`. `struct()`/`union()` keep building a plain
 `Map<string, SemanticType>`.
 
-**What it is, per kind** (implemented in `@ppl/core/metamodel.ts`,
+**What it is, per kind** (implemented in `src/core/metamodel.ts`,
 ROADMAP.md item 9):
 
 - **Integer**: a third constructor parameter, `default = 0`
@@ -556,7 +556,7 @@ sharing, catching two independently-written `struct({a: u8, b: unit})` calls
 as well as genuine fan-in through one shared thunk. It is also fully
 opt-in: an encoder that never populates the map emits no `PUSH_REF` and
 still produces a correct, self-contained tree. Real schemas so far
-(`packages/example`'s `Timestamp` is defined once and used in one field)
+(`example`'s `Timestamp` is defined once and used in one field)
 have no fan-in at all, so §6.2's postorder form does the compactness work
 and `PUSH_REF` is a strictly optional refinement on top.
 
@@ -590,7 +590,7 @@ outside.
 
 ## Appendix - Worked Example
 
-A tiny struct rather than the real `packages/example` schema, whose own
+A tiny struct rather than the real `example` schema, whose own
 fields all happen to be present in every version considered so far and so
 cannot illustrate divergence.
 
@@ -664,7 +664,7 @@ the type author's call.
 - **List element-type evolution.** A list's one element edge reconciles by
   the same struct/union-field rules already given. **List capacity** is a
   different shape from an integer range: `ListType.capacity`
-  (`@ppl/core/metamodel.ts`) bounds the *host* container, while the image's
+  (`src/core/metamodel.ts`) bounds the *host* container, while the image's
   declared capacity only shows up baked into the wire count-prefix's byte
   width (`binary-rules.ts`'s `countPrefixWidth`, a component convention,
   not part of the core ISA). A real message's element count could exceed

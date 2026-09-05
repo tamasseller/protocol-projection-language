@@ -1,43 +1,22 @@
-# Done
-* name for the whole machine/isa/vm/jit thing, the technology as a whole (the part that is not PPL specific): **MOG** — Motor-Gerät, the powered-implement half of Unimog. A bounded core chassis with a standardized take-off, and the domain implement bolts on.**
-
-# Current
-
-# The move
-
-- Move mog-core and JIT to separate root repos, publish on github
-  - mog-core: done. Split with history, package renamed, pushed to
-    github.com/tamasseller/mog-core. Dependants reference the git URL.
-  - mog-core ships built `dist/` now: a git-URL install is a real checkout
-    under node_modules, where TypeScript source cannot be loaded at all.
-  - mog-jit: repo created and empty, jit-armv6m not moved yet.
-  - jit-armv6m's TS harnesses import `mog-core`; its docs still cite
-    `mog-core/docs/isa-core.md` by workspace-relative path.
-  - clean up 
-    - de-slop docs
-    - code readthrough
-      - check for AI smells (and regular ones)
-      - remove prose comments
-    - test/fuzz/bench cleanup on both sides
-      - make proper frontend for fuzzer and benchmark tools in order to be able to poke at the thing ergonomically
-
 # PPL
 
 ## Hygiene
-  - reorganize packages once the genuinely general purpose parts are moved out, consider real application usage patterns (could be developed via ).
+  - one package now (`src/core`, `src/codecs`, `src/target-js`); the layering is the import graph, so re-layering is a file move with no API impact
+  - example still lives in this repo on `file:..`; needs its own repo, then the dependency becomes the git URL
 
 ## Codec extension 
 
 - clarify stream iterator & object lifecycle: allocation side in docs/extension-surface.md §7-8
 - TS side DSL upgrades: design sketch in docs/extension-surface.md, nothing implemented
-- crypto extension on the remaining reserved opcodes (covers all sorts of well known, standardized coding schemes, crcs, hashes, encryption, aead, better not attempted in DSL and would be golden code - if not even tucked away in some secure element - under any normal circumstances anyway)
-  - how to handle/reference key material? could it/does it need to support environments where those are isolated somehow, how would it interact with higher level code? (for example DH is not a codec level issue but related along key material at least)
+- Crypto primitives (CRC, hash, MAC, cipher, AEAD) — design sketch in docs/crypto.md, nothing implemented.
+  - No reserved opcodes remain; needs the extension-level escape docs/crypto.md §2.1 proposes.
+  - Key material: host-bound key slot table, never an ISA value or an object handle (§5). Key establishment (DH) stays above this layer.
 
 - Quantities / units of measurement — design sketch in docs/quantities.md, nothing implemented.
 
 ## Target codegen
 
-- try to apply a core vs codec extension split, should be pretty easy i think, if done right core codegen could move into the mog-core repo
+- try to apply a core vs codec-extension split, should be pretty easy i think, if done right core codegen could move into the mog-core repo
 - js codegen total runtime stream and object accessor isolation -> it becomes slim core that basically always uses a runtime dep + bunch of rules that depend on the details of that runtime mainly.
 - c++ codegen the same way as the js works: the core should be almost identical to js + another bunch of specific rules
 

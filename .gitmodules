@@ -1,6 +1,0 @@
-[submodule "jit-armv6m/vendor/ultimate-makefile"]
-	path = jit-armv6m/vendor/ultimate-makefile
-	url = https://github.com/tamasseller/ultimate-makefile
-[submodule "jit-armv6m/vendor/1test"]
-	path = jit-armv6m/vendor/1test
-	url = https://github.com/tamasseller/1test

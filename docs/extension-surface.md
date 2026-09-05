@@ -2,7 +2,7 @@
 
 **Status: design sketch, unimplemented.** Decides where an extension's DSL
 ergonomics live. Conclusion: the TS metaprogramming layer; the DSL grammar
-stays frozen. Nothing in `packages/` implements the carriers of §5 yet.
+stays frozen. Nothing in `src/` implements the carriers of §5 yet.
 
 ## 1. The question
 
@@ -157,7 +157,7 @@ ir`
   anything runs. No DSL-level type system approaches that.
 - **`mog-core` untouched.** Grammar, AST, matcher, types, explain,
   scope all stay as they are, and isa-core.md §10.1's C-subset claim
-  survives. `ext_rawmem` (jit-armv6m/test/) gets its first DSL surface for
+  survives. `ext_rawmem` (mog-jit/support/ext-rawmem/) gets its first DSL surface for
   free: `pBuiltinCall` rules over `ld8`/`st8`, whose operand convention —
   address on the stack, value in acc — is the one assignmentRules already
   uses.

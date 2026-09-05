@@ -8,7 +8,7 @@
 > declarations, literal-only operands). Rationale is inline here, section by
 > section, rather than in a companion document.
 >
-> Lives in `@ppl/codecs` (`packages/codecs/src/engine/`), registered
+> Lives in `codecs` (`src/codecs/engine/`), registered
 > against `mog-core/src/extension.ts`'s `Extension` interface;
 > the generic core stays protocol-agnostic.
 
@@ -328,7 +328,7 @@ per-call-site bound evaluated over the monomorphized DAG.
 
 ## 6. Encoding
 
-`packages/codecs/src/engine/wire.ts`, the `Extension.codec` (`ExtCodec`)
+`src/codecs/engine/wire.ts`, the `Extension.codec` (`ExtCodec`)
 that `createCodecExtension` registers. `bytecode.ts`'s
 `encodeInstr`/`decodeInstr` delegate to it for every byte ≥128, as
 isa-core.md §5.1 requires. This section fixes the layout *rules*; `wire.ts`
@@ -358,7 +358,7 @@ fields of the handle's referenced type directly, escaping to an extended
 LEB128 form beyond that.
 
 `N = 4`, the same threshold §2.1/§2.2 use for "typically < 4" handle and
-iterator IDs. Every struct and union in `packages/example`'s
+iterator IDs. Every struct and union in `example`'s
 `TelemetryPacket` schema, the one real schema this project measures
 against, has ≤4 fields or variants. A wider corpus could justify raising
 `N` later; nothing about the compact/extended split requires it stay 4.
@@ -454,7 +454,7 @@ program's full instruction stream.
 
 ## 7. Static Validation
 
-`packages/codecs/src/engine/validate-handles.ts`. Documented here rather
+`src/codecs/engine/validate-handles.ts`. Documented here rather
 than in isa-core.md because these checks ride on handle provenance, a
 concept the generic core has no notion of.
 

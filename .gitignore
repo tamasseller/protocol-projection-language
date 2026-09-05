@@ -23,8 +23,8 @@ Thumbs.db
 *.log
 npm-debug.log*
 # Throwaway files written to disk purely so a generated module can be
-# require()'d back in a test (any package's test/ dir) — distinct from a
-# package's own committed generated/ output (e.g. packages/example/generated/).
+# require()'d back in a test — distinct from the example's own committed
+# generated/ output (example/generated/).
 **/test/.codegen-scratch/
 
 # The MOG repos being split out of this tree — their own git, not this one's.

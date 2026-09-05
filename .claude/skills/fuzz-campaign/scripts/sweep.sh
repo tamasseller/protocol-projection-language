@@ -28,8 +28,8 @@ if [ "$SAMPLE" -gt 0 ]; then
 fi
 
 cd "$REPO"
-TS_NODE_PROJECT=jit-armv6m/fuzz/tsconfig.json \
-    nohup npx ts-node --transpile-only jit-armv6m/fuzz/qemu_exec/qemu_exec.ts "$CORPUS" \
+TS_NODE_PROJECT=mog-jit/fuzz/tsconfig.json \
+    nohup npx ts-node --transpile-only mog-jit/fuzz/ts/qemu-exec.ts "$CORPUS" \
     > "$STATE/$LOG.log" 2>&1 &
 echo $! > "$STATE/sweep.pid"
 echo "sweep started, log $STATE/$LOG.log, corpus $(ls "$CORPUS" | wc -l) programs"

@@ -156,7 +156,7 @@ collections, generic types, recursive types, reusable abstractions. This is
 the IDL-analogous layer, with plenty of prior art (TypeScript, Protocol
 Buffers, OpenAPI, GraphQL, CORBA IDL), making it the least exploratory part
 of the design. The implemented form is in ARCHITECTURE.md and
-`packages/core/src/metamodel.ts`.
+`src/core/metamodel.ts`.
 
 **Object-to-wire mapping language.** Describes how semantic objects
 transform into and reconstruct from wire representations. Operational
@@ -167,7 +167,7 @@ structured enough for static analysis and efficient code generation. It
 must be independent of any particular serialization format: CBOR, TLV,
 JSON and custom binary protocols should be expressible as libraries or
 reusable codec definitions, not as dedicated compiler support. The
-implemented form is `mog-core`'s IR plus `@ppl/codecs`'s rule sets.
+implemented form is `mog-core`'s IR plus `codecs`'s rule sets.
 
 **Interaction between the two.** Intentionally separated, tightly coupled.
 The semantic layer defines *what* information exists; the mapping layer
