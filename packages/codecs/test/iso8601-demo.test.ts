@@ -31,7 +31,7 @@ import assert from "node:assert/strict"
 
 import { struct, u8, u32, buildTypeGraph } from "@ppl/core"
 import { pStruct, pInteger } from "@ppl/core"
-import { ir, declareProc, defineProc, validateProgram, run } from "@ppl/machine"
+import { ir, declareProc, defineProc, validateProgram, run } from "mog-core"
 
 import { buildCodec } from "../src/engine/resolver"
 import { createCodecExtension } from "../src/engine/codec-extension"

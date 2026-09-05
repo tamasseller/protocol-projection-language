@@ -9,7 +9,7 @@
 > section, rather than in a companion document.
 >
 > Lives in `@ppl/codecs` (`packages/codecs/src/engine/`), registered
-> against `packages/machine/src/extension.ts`'s `Extension` interface;
+> against `mog-core/src/extension.ts`'s `Extension` interface;
 > the generic core stays protocol-agnostic.
 
 ---
@@ -366,7 +366,7 @@ against, has ≤4 fields or variants. A wider corpus could justify raising
 ### 6.3 Effect declarations
 
 Every opcode above supplies the `ExtOpEffect` isa-core.md §11.2 requires
-(`packages/machine/src/extension.ts`) before it can be validated or
+(`mog-core/src/extension.ts`) before it can be validated or
 executed:
 
 | Class | `tosDelta` | `maxTransient` | `terminates` | call-shaped |
@@ -502,7 +502,7 @@ pre-validation and pre-sizes its resource tables from published stats
 alone. `computeHandlePeaks`/`computeStreamIteratorPeaks` were built and
 removed once it was clear no consumer wants pre-sized iterator/handle
 tables, leaving the numbers with no reader. The generic
-`@ppl/machine`-level figure this would have generalized,
+`mog-core`-level figure this would have generalized,
 `validateProgram`'s `ProgramStats`, is unaffected and still available. A
 future consumer needing codec-specific peaks can derive them the same way
 (walking `RtlProc.header`/`ExtInstr` directly) and keep them at its own

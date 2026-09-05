@@ -48,8 +48,8 @@
  * just never wired to grammar syntax; a future addition, not needed here).
  */
 
-import type { IrFragment, Procedure, RtlProgram } from "@ppl/machine"
-import { ir, declareProc, defineProc } from "@ppl/machine"
+import type { IrFragment, Procedure, RtlProgram } from "mog-core"
+import { ir, declareProc, defineProc } from "mog-core"
 import type { SemanticType, ListType, ListPattern, IntegerPattern } from "@ppl/core"
 import { concreteKindOf, derefType, SemanticTypeKinds, pList, pInteger } from "@ppl/core"
 import type { Direction } from "../engine/codec-extension"

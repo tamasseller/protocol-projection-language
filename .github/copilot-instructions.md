@@ -17,7 +17,7 @@ A two-phase, zero-allocation serialization compiler.
 3. **Run-time phase.** A tagged template literal (`` ir`...` ``) builds an
    AST of IR instructions, later compiled into bare-metal C++, into
    TypeScript source, or into a dense binary blob for an embedded VM
-   (`packages/machine/docs/isa-core.md`).
+   (`mog-core/docs/isa-core.md`).
 
 ## Hard constraints
 

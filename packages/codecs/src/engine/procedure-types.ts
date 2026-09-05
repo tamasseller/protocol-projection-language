@@ -40,15 +40,15 @@
  * caller can treat "`header` present" and "recovered via this module" as
  * fully interchangeable.
  *
- * This is what any codegen wanting to interpret a raised (`@ppl/machine`'s
+ * This is what any codegen wanting to interpret a raised (`mog-core`'s
  * raise.ts) `ENTER`'s `ref` operand as a real field *name* needs,
  * regardless of whether the program came from a fresh `buildCodec` call
  * or a deserialized image — one shared, target-independent primitive, not
  * something each consumer re-derives.
  */
 
-import type { RtlProgram, RtlInstr } from "@ppl/machine"
-import { isExtInstr } from "@ppl/machine"
+import type { RtlProgram, RtlInstr } from "mog-core"
+import { isExtInstr } from "mog-core"
 import type { SemanticType, TypeNode } from "@ppl/core"
 import { buildTypeGraph, SemanticTypeKinds } from "@ppl/core"
 import type { Correspondence, CorrespondenceEdge } from "@ppl/core"
@@ -59,7 +59,7 @@ import type { CodecExtInstr } from "./codec-ext-instr"
  *  codec-extension.md §2.4's "no per-instruction type_ref" design, edges
  *  already in declaration order, so no name lookup is needed to resolve
  *  `ref` itself. Exported: a JS codegen (target-js) walking a *raised*
- *  (`@ppl/machine`'s raise.ts) tree needs this exact navigation too, but
+ *  (`mog-core`'s raise.ts) tree needs this exact navigation too, but
  *  per raised-instruction rather than per-flat-RtlInstr — see
  *  {@link resolveHandleTypes}'s own doc comment for why that means it
  *  can't just call resolveHandleTypes itself and has to drive this
@@ -113,7 +113,7 @@ export function requireSlotNode(slotNodes: ReadonlyMap<number, TypeNode>, slot: 
  * Extracted as its own function (rather than inlined into
  * `resolveProcedureTypes`'s own walk) because a JS codegen (target-js)
  * needs this exact bookkeeping too, but interleaved with its own
- * per-instruction code emission over the *raised* (`@ppl/machine`'s
+ * per-instruction code emission over the *raised* (`mog-core`'s
  * raise.ts) tree rather than this flat `body` — it can't just call this
  * function once and reuse the result, since the result at any one point
  * depends on how far the scan has gotten (the same slot-reuse reason

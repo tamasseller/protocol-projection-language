@@ -6,7 +6,7 @@ import { describe, test } from "node:test"
 import assert from "node:assert/strict"
 
 import { list, struct, u8, u32, buildTypeGraph } from "@ppl/core"
-import { validateProgram, run } from "@ppl/machine"
+import { validateProgram, run } from "mog-core"
 
 import { buildDeltaLeb128ListCodec, deltaLeb128EncodeRule, deltaLeb128DecodeRule } from "../src/components/delta-leb128"
 import { buildCodec } from "../src/engine/resolver"

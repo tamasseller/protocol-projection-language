@@ -115,7 +115,7 @@ requiring the two trees to be isomorphic.
 ### 2.4 Implementation shape
 
 `packages/core/src/reconcile.ts`, target- and codec-independent the way
-`raise.ts` is target-independent in `@ppl/machine`: it computes a mapping a
+`raise.ts` is target-independent in `mog-core`: it computes a mapping a
 target codegen consumes and knows nothing about any target language, wire
 byte or opcode. Two functions, deliberately separate:
 

@@ -9,8 +9,8 @@
  * but moved here once it was clear nothing in either function below
  * touches anything beyond `@ppl/core`'s own `TypeNode`/`defaultValueOf` —
  * unlike `@ppl/codecs`'s own `engine/resolver.ts` (`createCodecResolver`),
- * which genuinely can't move (it depends on `@ppl/machine`'s `Procedure`/
- * `declareProc`/`lowerProgram`, and `@ppl/core` stays `@ppl/machine`-free
+ * which genuinely can't move (it depends on `mog-core`'s `Procedure`/
+ * `declareProc`/`lowerProgram`, and `@ppl/core` stays `mog-core`-free
  * on purpose), reconciling two semantic type trees by name is exactly the
  * kind of pure, structural, metamodel-level operation `@ppl/core` already
  * hosts elsewhere (`matchType`, `defaultValueOf`). `@ppl/codecs/engine/

@@ -2,7 +2,7 @@
  * @ppl/codecs — Static validation (docs/codec-extension.md §7.1): handle
  * type/bounds checking and cross-procedure delegation-type consistency
  *
- * `@ppl/machine`'s `validate.ts` stays codec-agnostic — no notion of
+ * `mog-core`'s `validate.ts` stays codec-agnostic — no notion of
  * handles/iterators, only TOS depth and the call graph. Everything here
  * rides on one extra piece of data it already carries through untouched:
  * `RtlProc.header`, each `CODEC`-ABI procedure's declared `o0` type (a
@@ -31,7 +31,7 @@
  * that blindly trusts pre-validation and needs to pre-size its resource
  * tables from the stats alone, without re-deriving them — turned out
  * nothing this project actually builds needs that. The one figure of this
- * shape that *is* a genuine `@ppl/machine`-level concern (`validateProgram`'s
+ * shape that *is* a genuine `mog-core`-level concern (`validateProgram`'s
  * own `ProgramStats`, isa-core.md §8.3's call-depth bound) already lives
  * there, generically, for any consumer that wants it; a target that
  * someday needs the codec-specific numbers too can derive them itself and
@@ -43,8 +43,8 @@
  * re-derivation of §8.1-§8.5).
  */
 
-import type {RtlProgram, RtlProc, RtlInstr} from "@ppl/machine"
-import {isExtInstr, isLoopOpcode} from "@ppl/machine"
+import type {RtlProgram, RtlProc, RtlInstr} from "mog-core"
+import {isExtInstr, isLoopOpcode} from "mog-core"
 import type {TypeNode} from "@ppl/core"
 import {SemanticTypeKinds} from "@ppl/core"
 import {assertNever} from "./opcodes"

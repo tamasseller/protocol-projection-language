@@ -28,8 +28,8 @@
  * it's absent, which is also exactly why `generateCodecModule` itself
  * needed no changes at all: it simply never populates that field.
  */
-import type {RtlProgram, RaisedProc} from "@ppl/machine"
-import {raiseProgram} from "@ppl/machine"
+import type {RtlProgram, RaisedProc} from "mog-core"
+import {raiseProgram} from "mog-core"
 import type {SemanticType, TypeNode} from "@ppl/core"
 import {buildTypeGraph} from "@ppl/core"
 import type {Direction, Correspondence} from "@ppl/core"

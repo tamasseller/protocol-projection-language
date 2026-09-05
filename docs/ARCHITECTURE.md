@@ -131,8 +131,8 @@ A custom DSL would need its own lexer, parser, type checker and IDE
 extension. Using TypeScript as an embedded DSL makes Node.js the
 compile-time engine and gets compile-time type unrolling and constraint
 validation from standard TS syntax. Tagged template literals keep C-like
-procedural readability for runtime logic (`packages/machine`, whose
-`ir` template is specified in `packages/machine/docs/isa-core.md` §10).
+procedural readability for runtime logic (`mog-core`, whose
+`ir` template is specified in `mog-core/docs/isa-core.md` §10).
 
 ## The semantic type system (the metamodel)
 
@@ -199,8 +199,8 @@ belong in separate modules.
    wire format. `@ppl/core` holds the metamodel, `TypePattern`/`matchType`
    and the structural predicate vocabulary, `runRuleset`'s rule dispatch,
    `createResolver`'s on-demand cycle-safe resolution, and `reconcile`.
-   `@ppl/machine` holds the protocol-agnostic IR, lowering and VM, plus the
-   `Extension` hook that lets a domain add opcodes without `@ppl/machine`
+   `mog-core` holds the protocol-agnostic IR, lowering and VM, plus the
+   `Extension` hook that lets a domain add opcodes without `mog-core`
    knowing what a codec is. Changes here are rare and load-bearing.
 2. **Components.** The reusable Mappings built on layer 1: a target's
    type-mapping rules (`@ppl/target-cpp`, `@ppl/target-js`), a wire
@@ -231,7 +231,7 @@ package is a component library built on it.
 
 A wire-format codec is the same shape aimed at a different producer: each
 matched semantic type produces an `ir` fragment, a `Procedure` body for
-`@ppl/machine`'s VM. `@ppl/codecs` supplies two things beyond what a type
+`mog-core`'s VM. `@ppl/codecs` supplies two things beyond what a type
 mapping gets from `@ppl/core`, both core-layer despite living in this
 package:
 
@@ -239,7 +239,7 @@ package:
   vocabulary (`ENTER`, `CALL_CODEC`, `READ`/`WRITE`, and the rest) that
   makes a codec body authorable as real `ir` text. It encodes nothing by
   itself; it makes encoding expressible. It lives here rather than in
-  `@ppl/machine` only because `@ppl/machine` must stay protocol-agnostic.
+  `mog-core` only because `mog-core` must stay protocol-agnostic.
 - **The on-demand resolver.** A struct can reference itself through a union
   arm, and `runRuleset`'s single eager top-down pass cannot hand a
   not-yet-finished child a reserved slot before a sibling embeds it into
@@ -249,7 +249,7 @@ package:
   `SemanticType -> TSTypeDecl` instead of `SemanticType -> Procedure`).
   `@ppl/codecs/engine/resolver.ts`'s `createCodecResolver` is the codec
   adapter over it, and can move no further out because it depends on
-  `@ppl/machine`'s `Procedure`/`declareProc`/`lowerProgram`. A rule's
+  `mog-core`'s `Procedure`/`declareProc`/`lowerProgram`. A rule's
   `produce` sees only its own match witness and a `resolve` callback keyed
   on a child's `SemanticType` identity: no `TypeNode`, no graph.
 

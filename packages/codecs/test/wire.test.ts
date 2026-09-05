@@ -2,7 +2,7 @@
  * @ppl/codecs/test — Wire-level encoding for the codec extension's opcodes
  * (engine/wire.ts, docs/codec-extension.md §6, ROADMAP.md item 7)
  *
- * Mirrors `@ppl/machine/test/bytecode.test.ts`'s own two-pronged approach:
+ * Mirrors `mog-core/test/bytecode.test.ts`'s own two-pronged approach:
  * a literal table of representative bytes (one row per band variant —
  * compact and extended, at each variant's own boundary), plus an
  * end-to-end round trip through a real, lowered codec program's
@@ -12,10 +12,10 @@
 import { describe, test } from "node:test"
 import assert from "node:assert/strict"
 
-import { encodeInstr, decodeInstr, encodeBody, decodeBody } from "@ppl/machine"
+import { encodeInstr, decodeInstr, encodeBody, decodeBody } from "mog-core"
 import { callCodecInstr, callCodecNextInstr, cloneRdInstr, cloneWrInstr, countInstr, enterInstr, enterNextInstr, hasNextInstr, loadValInstr, openListInstr, readInstr, readSeqInstr, seekInstr, storeValInstr, tagInstr, writeInstr, writeSeqInstr } from "../src/engine/codec-ext-instr"
 import type { CodecExtInstr } from "../src/engine/codec-ext-instr"
-import type { ExtInstrOf, Extension } from "@ppl/machine"
+import type { ExtInstrOf, Extension } from "mog-core"
 import { struct, union, unit, u8, list } from "@ppl/core"
 
 import { codecWireCodec } from "../src/engine/wire"

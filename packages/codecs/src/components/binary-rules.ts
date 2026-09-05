@@ -28,8 +28,8 @@
  * `structDecodeRule`, and `HOIST_MAX_VARIANTS` for the break-even point.
  */
 
-import type { IrFragment, Procedure } from "@ppl/machine"
-import { ir } from "@ppl/machine"
+import type { IrFragment, Procedure } from "mog-core"
+import { ir } from "mog-core"
 import type { SemanticType, UnionType, IntegerPattern, UnitPattern, StructFieldsMatch, TypeNode } from "@ppl/core"
 import { SemanticTypeKinds } from "@ppl/core"
 import { pInteger, pUnit, pList, pUnionFields, pStructFields, pStar } from "@ppl/core"

@@ -13,7 +13,7 @@ import { describe, test } from "node:test"
 import assert from "node:assert/strict"
 
 import { buildTypeGraph, i16, list, struct, u8, union, unit } from "@ppl/core"
-import { validateProgram, run } from "@ppl/machine"
+import { validateProgram, run } from "mog-core"
 
 import { buildCodec } from "../src/engine/resolver"
 import { createCodecExtension } from "../src/engine/codec-extension"

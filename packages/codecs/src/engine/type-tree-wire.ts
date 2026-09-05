@@ -38,7 +38,7 @@ import {
     union,
     unit,
 } from "@ppl/core"
-import { decodeLeb128, encodeLeb128 } from "@ppl/machine"
+import { decodeLeb128, encodeLeb128 } from "mog-core"
 
 // ── Opcodes ──────────────────────────────────────────────────────────────
 

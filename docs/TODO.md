@@ -5,9 +5,14 @@
 
 # The move
 
-- Move @ppl/machine and JIT to separate root repos, publish on github
-  - create repos, move source, apply branding
-  - untagle references (probably npm should reference git repo directly for now)
+- Move mog-core and JIT to separate root repos, publish on github
+  - mog-core: done. Split with history, package renamed, pushed to
+    github.com/tamasseller/mog-core. Dependants reference the git URL.
+  - mog-core ships built `dist/` now: a git-URL install is a real checkout
+    under node_modules, where TypeScript source cannot be loaded at all.
+  - mog-jit: repo created and empty, jit-armv6m not moved yet.
+  - jit-armv6m's TS harnesses import `mog-core`; its docs still cite
+    `mog-core/docs/isa-core.md` by workspace-relative path.
   - clean up 
     - de-slop docs
     - code readthrough
@@ -32,7 +37,7 @@
 
 ## Target codegen
 
-- try to apply a core vs codec extension split, should be pretty easy i think, if done right core codegen could move into the root machine repo
+- try to apply a core vs codec extension split, should be pretty easy i think, if done right core codegen could move into the mog-core repo
 - js codegen total runtime stream and object accessor isolation -> it becomes slim core that basically always uses a runtime dep + bunch of rules that depend on the details of that runtime mainly.
 - c++ codegen the same way as the js works: the core should be almost identical to js + another bunch of specific rules
 
@@ -68,5 +73,5 @@
 - document the whole ppl properly
   - brief rationale in the readme with problem statement, why prior-art is no match, how this package solves it maybe in the form of a mini tutorial 
   - write a case-study like doc about the example project, explain all the mechanisms that solve the challanges.
-  - create a definitive guide to all the important bits. It is supposed to give enough insight to a skilled reader to comprehend the operation of the whole system. Also fold in the root docs, some of those are early superseeded drafts, never touched since, but may contain important information and there's the specification of the extension of the (not yet named) ISA-machine-vm thing.
+  - create a definitive guide to all the important bits. It is supposed to give enough insight to a skilled reader to comprehend the operation of the whole system. Also fold in the root docs, some of those are early superseeded drafts, never touched since, but may contain important information and there's the specification of the extension of the MOG ISA.
   

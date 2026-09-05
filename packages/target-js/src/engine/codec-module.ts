@@ -27,8 +27,8 @@
  * calling `resolveProcedureTypes`, and passes `graph` straight through to
  * `projectTSTypes` too — one graph, shared everywhere in this call.
  */
-import type {RtlProgram, RaisedProc} from "@ppl/machine"
-import {raiseProgram} from "@ppl/machine"
+import type {RtlProgram, RaisedProc} from "mog-core"
+import {raiseProgram} from "mog-core"
 import type {SemanticType, TypeGraph, TypeNode} from "@ppl/core"
 import {buildTypeGraph} from "@ppl/core"
 import type {Direction, CodecExtInstr} from "@ppl/codecs"

@@ -42,8 +42,8 @@
  * (`{"variantName": <payload>}`).
  */
 
-import type { IrFragment, Procedure, RtlProgram } from "@ppl/machine"
-import { ir, declareProc, defineProc, lowerProgram } from "@ppl/machine"
+import type { IrFragment, Procedure, RtlProgram } from "mog-core"
+import { ir, declareProc, defineProc, lowerProgram } from "mog-core"
 import type { IntegerMatch, IntegerPattern, UnitPattern, SemanticType, ListMatch, StructFieldsMatch, UnionFieldsMatch } from "@ppl/core"
 import { concreteKindOf, SemanticTypeKinds, pInteger, pUnit, pList, pUnionFields, pStructFields, pStar } from "@ppl/core"
 import { codecRules } from "../engine/codec-extension"

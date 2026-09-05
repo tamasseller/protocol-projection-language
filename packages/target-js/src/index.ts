@@ -17,7 +17,7 @@
  * turns a `buildCodec`-produced `RtlProgram` pair (`@ppl/codecs`) into
  * literal `encode`/`decode` functions, one JS `function` per procedure
  * (the per-procedure tree walk itself lives in `engine/codec-codegen.ts`),
- * built on `@ppl/machine`'s `raise.ts` for control-flow shape and
+ * built on `mog-core`'s `raise.ts` for control-flow shape and
  * `@ppl/codecs`'s `resolveProcedureTypes` for field/variant names.
  * `runtime/codec-runtime.ts` is the small, genuinely-dynamic primitive set
  * (buffer position, byte read/write, container/key indirection) the

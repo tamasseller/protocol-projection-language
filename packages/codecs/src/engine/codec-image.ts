@@ -5,7 +5,7 @@
  * Three sections, concatenated with no framing between them at all — none
  * is needed, because each already knows its own length as it's produced:
  * the type tree (§6, self-framing via `END`), the encoder program, and the
- * decoder program (both via `@ppl/machine`'s item-8 program envelope,
+ * decoder program (both via `mog-core`'s item-8 program envelope,
  * self-framing via its own header table). Decode reads the three in order,
  * each consuming exactly its own bytes and handing back the next offset.
  *
@@ -15,8 +15,8 @@
  */
 
 import type { SemanticType } from "@ppl/core"
-import type { RtlProgram } from "@ppl/machine"
-import { decodeProgram, encodeProgram } from "@ppl/machine"
+import type { RtlProgram } from "mog-core"
+import { decodeProgram, encodeProgram } from "mog-core"
 import { codecWireCodec } from "./wire"
 import { decodeTypeTree, encodeTypeTree } from "./type-tree-wire"
 import type { CodecExtInstr } from "./codec-ext-instr"

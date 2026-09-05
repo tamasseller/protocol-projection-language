@@ -167,7 +167,7 @@ structured enough for static analysis and efficient code generation. It
 must be independent of any particular serialization format: CBOR, TLV,
 JSON and custom binary protocols should be expressible as libraries or
 reusable codec definitions, not as dedicated compiler support. The
-implemented form is `@ppl/machine`'s IR plus `@ppl/codecs`'s rule sets.
+implemented form is `mog-core`'s IR plus `@ppl/codecs`'s rule sets.
 
 **Interaction between the two.** Intentionally separated, tightly coupled.
 The semantic layer defines *what* information exists; the mapping layer

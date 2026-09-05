@@ -2,7 +2,7 @@
  * @ppl/codecs — Wire-level encoding for the codec extension's own opcodes
  * (docs/codec-extension.md §6, ROADMAP.md item 7)
  *
- * `Extension.codec` (`ExtCodec`, `@ppl/machine/extension.ts`) is the hook
+ * `Extension.codec` (`ExtCodec`, `mog-core/extension.ts`) is the hook
  * `bytecode.ts` needs for every `EXT` instruction byte ≥128;
  * `createCodecExtension` (codec-extension.ts) didn't populate it until now
  * — `codecWireCodec` here is that value, wired in there.
@@ -55,8 +55,8 @@
  * (codec-extension.ts), read from `acc` at runtime, not wire-encoded.
  */
 
-import type { ExtCodec, ExtInstrOf } from "@ppl/machine"
-import { encodeLeb128, decodeLeb128 } from "@ppl/machine"
+import type { ExtCodec, ExtInstrOf } from "mog-core"
+import { encodeLeb128, decodeLeb128 } from "mog-core"
 import { CODEC_OPCODES, assertNever } from "./opcodes"
 import type { CodecOpcode } from "./opcodes"
 import type { CodecExtInstr } from "./codec-ext-instr"

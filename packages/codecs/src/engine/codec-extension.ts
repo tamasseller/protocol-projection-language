@@ -1,9 +1,9 @@
 /**
  * @ppl/codecs — Codec extension (ROADMAP.md item 7, docs/codec-extension.md)
  *
- * Implements `@ppl/machine`'s `Extension` hook for all 17 opcodes
+ * Implements `mog-core`'s `Extension` hook for all 17 opcodes
  * `./opcodes.ts` names (§2/§3), plus `codecRules()`, their `ir\`...\`` DSL
- * surface. Lives here rather than `@ppl/machine` because that package must
+ * surface. Lives here rather than `mog-core` because that package must
  * stay protocol-agnostic; conceptually it's still core infrastructure, not
  * a codec itself. The wire-level `codec` byte layout (§6, ROADMAP.md item
  * 8) lives in `./wire.ts`, wired in below as `Extension.codec`.
@@ -19,9 +19,9 @@
  * that still reaches it through this file.
  */
 
-import type { Extension, ExecState, ExtOpEffect } from "@ppl/machine"
-import type { Rule } from "@ppl/machine"
-import { rule, leafNode, unaryNode, pBuiltinCall, pConst, pIdentifier, pRtl } from "@ppl/machine"
+import type { Extension, ExecState, ExtOpEffect } from "mog-core"
+import type { Rule } from "mog-core"
+import { rule, leafNode, unaryNode, pBuiltinCall, pConst, pIdentifier, pRtl } from "mog-core"
 import type { IntegerType, TypeNode, Direction } from "@ppl/core"
 import { kindOf, SemanticTypeKinds } from "@ppl/core"
 import type { CodecOpcode } from "./opcodes"
@@ -172,7 +172,7 @@ export const CODEC_EFFECTS: Readonly<Record<CodecOpcode, ExtOpEffect<CodecExtIns
     // codecRules()'s trailing pRtl("acc") demand (each rule's own doc
     // comment) — lowered as "compute it into acc, then this op, nothing in
     // between," never a stack push/pop, so tosDelta alone doesn't capture
-    // it. `readsAcc` (ExtOpEffect.readsAcc, @ppl/machine/extension.ts) is
+    // it. `readsAcc` (ExtOpEffect.readsAcc, mog-core/extension.ts) is
     // exactly this declaration; without it raise.ts's own reconstructed
     // tree loses the value entirely (found building the JS codegen on top
     // of raise.ts's output — run() itself was never affected, since it
@@ -241,7 +241,7 @@ export const CODEC_EFFECTS: Readonly<Record<CodecOpcode, ExtOpEffect<CodecExtIns
  *  are call-shaped rather than value-shaped: their first argument is the
  *  callee reference, matched with `pIdentifier()` — a pure structural check
  *  (matcher.ts:236-239) — and resolved via `resolveCallee`, exactly like a
- *  real procedure call (`callNode`, machine/rules.ts:395-411), never
+ *  real procedure call (`callNode`, mog-core's rules.ts), never
  *  touching the generic value-tiling path at all. Neither currently uses
  *  `pBuiltinCall`'s `pTail(...)` marker — both take a fixed number of
  *  operands today — but it's exactly what would carry `CALL_CODEC`'s

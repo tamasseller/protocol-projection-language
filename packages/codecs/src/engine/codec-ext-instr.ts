@@ -1,7 +1,7 @@
 /**
  * @ppl/codecs — The codec extension's structured `EXT` instruction shape
  *
- * `RtlInstr<E>`'s (`@ppl/machine`'s rtl.ts) `EXT` arm is parameterized by
+ * `RtlInstr<E>`'s (`mog-core`'s rtl.ts) `EXT` arm is parameterized by
  * `E` precisely so a concrete extension can replace the generic
  * `{ext, operands: readonly number[]}` payload with named fields — this is
  * that payload for the codec extension: one variant per `CodecOpcode`
@@ -19,7 +19,7 @@
  * every consumer independently re-deriving it via `!!operands[3]`).
  */
 
-import type { ExtInstrOf } from "@ppl/machine"
+import type { ExtInstrOf } from "mog-core"
 
 export type CodecExtInstr =
     | { ext: "ENTER"; dst: number; src: number; ref: number }

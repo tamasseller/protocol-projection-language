@@ -12,8 +12,8 @@ import assert from "node:assert/strict"
 
 import type { TypeNode } from "@ppl/core"
 import { struct, union, unit, u8, u32, list, buildTypeGraph } from "@ppl/core"
-import type { RtlProgram, RtlProc } from "@ppl/machine"
-import { bare, validateProgram } from "@ppl/machine"
+import type { RtlProgram, RtlProc } from "mog-core"
+import { bare, validateProgram } from "mog-core"
 import { callCodecInstr, enterInstr, enterNextInstr, loadValInstr, tagInstr } from "../src/engine/codec-ext-instr"
 import type { CodecExtInstr } from "../src/engine/codec-ext-instr"
 

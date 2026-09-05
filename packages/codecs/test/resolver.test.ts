@@ -16,7 +16,7 @@ import assert from "node:assert/strict"
 import { u8, struct, list } from "@ppl/core"
 import type { IntegerPattern } from "@ppl/core"
 import { pInteger, pList, pStructFields, pStar } from "@ppl/core"
-import { ir, lowerProgram, run, isCallInstr } from "@ppl/machine"
+import { ir, lowerProgram, run, isCallInstr } from "mog-core"
 
 import { createCodecResolver, codecRule } from "../src/engine/resolver"
 

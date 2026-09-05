@@ -27,7 +27,7 @@
 import {buildTypeGraph, TypeGraph} from "@ppl/core"
 import {projectCTypes, emitCHeader, CTypeDecl} from "@ppl/target-cpp"
 import {buildCodec, buildJsonEncoder, createCodecExtension, binaryEncodeRules, binaryDecodeRules, Handle, CodecExtInstr} from "@ppl/codecs"
-import {validateProgram, run, RtlProgram} from "@ppl/machine"
+import {validateProgram, run, RtlProgram} from "mog-core"
 import {projectTSTypes, emitTSDeclarations, tsTypeRules, TSTypeDecl, generateCodecModule} from "@ppl/target-js"
 
 import {TelemetryPacket} from "./schema"

@@ -17,10 +17,10 @@ import assert from "node:assert/strict"
 
 import type { TypeNode } from "@ppl/core"
 import { struct, union, unit, u8, i16, list, integer, buildTypeGraph } from "@ppl/core"
-import { ir, proc, lowerProgram, validateProgram, run, bare } from "@ppl/machine"
+import { ir, proc, lowerProgram, validateProgram, run, bare } from "mog-core"
 import { cloneRdInstr, cloneWrInstr, readSeqInstr, writeSeqInstr } from "../src/engine/codec-ext-instr"
 import type { CodecExtInstr } from "../src/engine/codec-ext-instr"
-import type { RtlProgram, RtlProc } from "@ppl/machine"
+import type { RtlProgram, RtlProc } from "mog-core"
 
 import { createCodecExtension, codecRules } from "../src/engine/codec-extension"
 import type { Handle } from "../src/engine/codec-extension"

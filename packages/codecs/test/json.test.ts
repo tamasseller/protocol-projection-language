@@ -6,7 +6,7 @@ import { describe, test } from "node:test"
 import assert from "node:assert/strict"
 
 import { struct, union, unit, list, i16, u8, buildTypeGraph } from "@ppl/core"
-import { validateProgram, run } from "@ppl/machine"
+import { validateProgram, run } from "mog-core"
 
 import { buildJsonEncoder } from "../src/components/json"
 import { createCodecExtension } from "../src/engine/codec-extension"

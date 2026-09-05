@@ -6,7 +6,7 @@
  * branches on (a raised loop carries `pre`, isa-core.md §4.5), and a
  * `DEFAULT`-closed dispatch case is the one `raise.ts` folds the *last*
  * arm into rather than the next. Both are checked the way every other
- * codegen test here is: against `@ppl/machine`'s own VM running the same
+ * codegen test here is: against `mog-core`'s own VM running the same
  * program.
  *
  * `generateProcedure` with no `entryNode` emits the GENERIC helper form —
@@ -16,8 +16,8 @@
 import {test} from "node:test"
 import * as assert from "node:assert/strict"
 
-import type {RtlProgram, RtlInstr} from "@ppl/machine"
-import {raiseProgram, run, validateProgram} from "@ppl/machine"
+import type {RtlProgram, RtlInstr} from "mog-core"
+import {raiseProgram, run, validateProgram} from "mog-core"
 import {generateProcedure} from "../src/engine/codec-codegen"
 import {loadGenerated} from "./load-generated"
 

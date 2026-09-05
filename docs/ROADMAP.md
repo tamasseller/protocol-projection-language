@@ -6,7 +6,7 @@ dependency chain.
 
 ## 1. Procedure identity and composition - Done
 
-`packages/machine/src/ir.ts`. `proc(args, fragment)` and
+`mog-core/src/ir.ts`. `proc(args, fragment)` and
 `declareProc`+`defineProc` give an `IrFragment` an identity, spliceable via
 `${proc}` interpolation; `ir()` resolves references by object identity.
 `body` (parsed AST) is lazy, so a non-standalone fragment such as a bare
@@ -31,7 +31,7 @@ worst case, not the loose sum of per-procedure maxima) from the same DFS.
 against isa-core.md's opcode table, plus extension opcodes (byte ≥128, via
 `Extension.codec`).
 
-## 5. `@ppl/machine` package - Done
+## 5. `mog-core` package - Done
 
 Generic, protocol-agnostic IR/lowering/VM/bytecode/extension-hook
 machinery in its own package. `@ppl/core` does not depend on it.
@@ -64,7 +64,7 @@ this ISA yet, hand-built or DSL-authored.
 `engine/` stays in `@ppl/codecs` rather than moving to `@ppl/core`:
 `@ppl/core` has zero dependencies and `target-cpp`/`target-js` depend on
 only it, so moving `codec-extension.ts` (built on
-`Extension`/`ExecState`/`ExtOpEffect`) there would drag `@ppl/machine` in.
+`Extension`/`ExecState`/`ExtOpEffect`) there would drag `mog-core` in.
 
 ## 8. Multi-procedure program envelope - Done
 
@@ -198,9 +198,9 @@ target-independent primitive for both the compiled-source codegen (fixed
 local schema) and the dynamic image-bridging path.
 
 **`raise.ts` verified.** `raiseProgram`/`raiseProc`
-(`packages/machine/src/raise.ts`) is the structural inverse of `lower.ts`:
+(`mog-core/src/raise.ts`) is the structural inverse of `lower.ts`:
 flat `RtlInstr[]` back to a `Stmt`/`Expr` tree both targets walk instead of
-independently re-deriving block structure. `packages/machine/test/
+independently re-deriving block structure. `mog-core/test/
 raise.test.ts` is a differential check, not a shape check: lower and `run()`
 through the real VM for ground truth, then raise and evaluate the same
 procedure through a tree-walking evaluator built on `vm.ts`'s exported

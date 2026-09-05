@@ -12,8 +12,8 @@ import { describe, test } from "node:test"
 import assert from "node:assert/strict"
 
 import { struct, union, unit, u8, list, buildTypeGraph } from "@ppl/core"
-import { ir, proc, lowerProgram, validateProgram, run } from "@ppl/machine"
-import type { RtlProgram } from "@ppl/machine"
+import { ir, proc, lowerProgram, validateProgram, run } from "mog-core"
+import type { RtlProgram } from "mog-core"
 
 import { createCodecExtension, codecRules } from "../src/engine/codec-extension"
 import type { Handle, Direction } from "../src/engine/codec-extension"

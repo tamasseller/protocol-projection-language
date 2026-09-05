@@ -32,7 +32,7 @@ one writes `__proc7`.
 
 **Declaration statements** pinning compile-time constants are redundant
 with `${}` interpolation — ir.ts:201 stringifies any interpolated value, so
-a TS carrier object splices today with no change to `@ppl/machine`. They
+a TS carrier object splices today with no change to `mog-core`. They
 also contradict §2 directly: nothing about them is computed in the layer
 that owns computation.
 
@@ -155,7 +155,7 @@ ir`
 - **Typed navigation.** `Handle.type` walks the same identity-safe
   `TypeGraph` the resolver already trusts, checked in the editor before
   anything runs. No DSL-level type system approaches that.
-- **`@ppl/machine` untouched.** Grammar, AST, matcher, types, explain,
+- **`mog-core` untouched.** Grammar, AST, matcher, types, explain,
   scope all stay as they are, and isa-core.md §10.1's C-subset claim
   survives. `ext_rawmem` (jit-armv6m/test/) gets its first DSL surface for
   free: `pBuiltinCall` rules over `ld8`/`st8`, whose operand convention —

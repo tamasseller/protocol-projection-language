@@ -2,13 +2,13 @@
  * @ppl/target-js — Compiled-source JS/TS codegen for a codec program: the
  * `RaisedProc` → JS backbone.
  *
- * Turns one raised procedure body (`@ppl/machine`'s `raise.ts`) into a
+ * Turns one raised procedure body (`mog-core`'s `raise.ts`) into a
  * real TypeScript `function` — real `if`/`while`/`switch`, direct calls
  * between the generated functions — instead of shipping the RTL program
  * itself and interpreting it via `run()` + `createCodecExtension` at every
  * encode/decode call. Built on two pieces from earlier work:
  *
- * - `@ppl/machine`'s `raise.ts`, for control-flow shape: every `BR_TABLE`/
+ * - `mog-core`'s `raise.ts`, for control-flow shape: every `BR_TABLE`/
  *   `LOOP` becomes a real `dispatch`/`loop` node once, so this module
  *   walks a tree instead of re-deriving block structure from a flat
  *   instruction stream itself.
@@ -80,8 +80,8 @@
  * threading through the `Accessor` projection.
  */
 
-import type {Stmt, Expr, RaisedProc, BinaryOpcode, UnaryOpcode} from "@ppl/machine"
-import {ExprKind, StmtKind} from "@ppl/machine"
+import type {Stmt, Expr, RaisedProc, BinaryOpcode, UnaryOpcode} from "mog-core"
+import {ExprKind, StmtKind} from "mog-core"
 import type {TypeNode} from "@ppl/core"
 import type {Direction, Correspondence} from "@ppl/core"
 import type {CodecExtInstr} from "@ppl/codecs"
@@ -93,7 +93,7 @@ import {prescan, translateExt, emitExtStmtIfApplicable, emitReturn, idxCounter, 
 
 // ─────────────────────────────────────────────────────────────────────────
 // Binary/unary op rendering — inline JS text, not a runtime evalBinary/
-// evalUnary call. `@ppl/machine`'s `vm.ts` (where those live) is an
+// evalUnary call. `mog-core`'s `vm.ts` (where those live) is an
 // interpreter designed as a testing oracle, not a production dependency —
 // generated code must not import it. `BinaryOpcode`/`UnaryOpcode` are
 // small, closed enumerations (never extended by a rule author), so each

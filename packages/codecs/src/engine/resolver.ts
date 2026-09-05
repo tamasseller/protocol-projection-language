@@ -50,8 +50,8 @@ import type { TypePattern, TypeMatch, TypeNode, MatchOf } from "@ppl/core"
 import type { SemanticType } from "@ppl/core"
 import { createResolver } from "@ppl/core"
 import type { ResolverRule } from "@ppl/core"
-import type { IrFragment, Procedure, RtlProgram } from "@ppl/machine"
-import { declareProc, defineProc, ir, lowerProgram } from "@ppl/machine"
+import type { IrFragment, Procedure, RtlProgram } from "mog-core"
+import { declareProc, defineProc, ir, lowerProgram } from "mog-core"
 import { codecRules } from "./codec-extension"
 import type { CodecExtInstr } from "./codec-ext-instr"
 
@@ -114,7 +114,7 @@ export function codecRule<P extends TypePattern, Ctx>(
  * `(node, ctx)` together.
  *
  * Cycle safety mirrors `lowerProgram`'s own
- * (`@ppl/machine/lower.ts:141-173`): mint the `Procedure`'s identity via
+ * (`mog-core/lower.ts:141-173`): mint the `Procedure`'s identity via
  * `declareProc` and cache it *before* recursing into `produce`, so a self-
  * or mutually-recursive type resolves to the reserved identity instead of
  * looping forever — now `createResolver`'s own concern, via

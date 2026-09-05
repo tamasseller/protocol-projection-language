@@ -18,8 +18,8 @@ import { resolveProcedureTypes, correspondenceChild, correspondenceElement, reso
 import type { CodecExtInstr } from "../src/engine/codec-ext-instr"
 import { struct, union, list, integer, u8, named, optional, buildTypeGraph, reconcile } from "@ppl/core"
 import type { SemanticType, ConcreteSemanticType, TypeNode, Correspondence } from "@ppl/core"
-import { encodeProgram, decodeProgram } from "@ppl/machine"
-import type { RtlProgram } from "@ppl/machine"
+import { encodeProgram, decodeProgram } from "mog-core"
+import type { RtlProgram } from "mog-core"
 
 /** A trivial extension good for nothing but its own `.codec` (wire
  *  encode/decode of EXT instructions) — encodeProgram/decodeProgram never

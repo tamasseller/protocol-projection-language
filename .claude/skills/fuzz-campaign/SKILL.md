@@ -100,7 +100,7 @@ TS_NODE_PROJECT=jit-armv6m/fuzz/tsconfig.json npx ts-node --transpile-only jit-a
 The hard part, and where the first campaign got one finding backwards.
 Before changing the translator to satisfy a validator-approved program:
 
-1. Read `packages/machine/docs/isa-core.md` **and
+1. Read `mog-core/docs/isa-core.md` **and
    `isa-rationale.md`** — the rationale often names the exact pattern and
    says whether it is meant to be legal. Skipping it is what made §2 of
    `jit-armv6m/docs/fuzzing-campaign.md` get fixed on the wrong side first.
@@ -125,7 +125,7 @@ syntactic property of the opcode.
 Every fixed finding gets both:
 - a seed in `make_seeds.ts` (so `qemu_exec.ts seeds` is a standing check), and
 - a unit test — `test/host/` for emission, the matching `test/qemu/test_*.cpp` for a
-  real executed result, `packages/machine/test/validate.test.ts` for a
+  real executed result, `mog-core/test/validate.test.ts` for a
   rejection.
 
 A seed asserting "which arm ran" must observe it through state a case

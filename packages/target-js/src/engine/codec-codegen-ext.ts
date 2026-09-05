@@ -23,8 +23,8 @@
  * anything else in this file (`finishStruct`/`finishList`/`unitValue`).
  */
 
-import type {Stmt, Expr} from "@ppl/machine"
-import {ExprKind, StmtKind} from "@ppl/machine"
+import type {Stmt, Expr} from "mog-core"
+import {ExprKind, StmtKind} from "mog-core"
 import type {TypeNode} from "@ppl/core"
 import {kindOf, concreteKindOf, SemanticTypeKinds} from "@ppl/core"
 import type {Direction, Correspondence, Resolution} from "@ppl/core"

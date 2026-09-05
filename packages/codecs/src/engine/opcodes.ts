@@ -10,7 +10,7 @@
  * class (`HAS_NEXT`/`CLONE_RD`/`CLONE_WR`/`SEEK`) and the bulk-array
  * transfer pair (`WRITE_SEQ`/`READ_SEQ`, ROADMAP.md item 11). A typo in
  * any one wouldn't be caught by anything otherwise (`ExtInstr.ext` is a
- * bare `string` — opaque to `@ppl/machine` by design, isa-core.md §5.1);
+ * bare `string` — opaque to `mog-core` by design, isa-core.md §5.1);
  * `CodecOpcode` lets `EFFECTS` be typed `Record<CodecOpcode, ExtOpEffect>`
  * (missing/misspelled key ⇒ compile error) and lets `exec`/
  * `validate-handles.ts`'s dispatches be checked exhaustively via
@@ -46,7 +46,7 @@ const CODEC_OPCODE_SET: ReadonlySet<string> = new Set(CODEC_OPCODES)
 
 /** Narrows a bare `ExtInstr.ext` string to `CodecOpcode` — the runtime
  *  counterpart of the compile-time union, needed once per dispatch site
- *  since `@ppl/machine` itself never knows this vocabulary. */
+ *  since `mog-core` itself never knows this vocabulary. */
 export function isCodecOpcode(ext: string): ext is CodecOpcode
 {
     return CODEC_OPCODE_SET.has(ext)

@@ -15,7 +15,7 @@ import assert from "node:assert/strict"
 
 import type { SemanticType, UnitPattern } from "@ppl/core"
 import { struct, union, unit, u8, u16, i8, i16, i32, list, pUnit, buildTypeGraph } from "@ppl/core"
-import { ir, validateProgram, run } from "@ppl/machine"
+import { ir, validateProgram, run } from "mog-core"
 
 import { buildCodec } from "../src/engine/resolver"
 import { createCodecExtension } from "../src/engine/codec-extension"

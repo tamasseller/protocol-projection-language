@@ -1,8 +1,8 @@
 /**
  * Differential test: `codec-codegen.ts`'s `binaryOpToJs`/`unaryOpToJs`
  * (inline JS text — production-safe, since generated code must not
- * depend on `@ppl/machine`'s `vm.ts`, an interpreter "designed as an
- * oracle for testing", not a runtime dependency) against `@ppl/machine`'s
+ * depend on `mog-core`'s `vm.ts`, an interpreter "designed as an
+ * oracle for testing", not a runtime dependency) against `mog-core`'s
  * own `evalBinary`/`evalUnary` (the oracle — fine to import here, this is
  * a test file, never embedded in generated output). Same shape as
  * `raise.ts`'s own test suite's differential check against these exact
@@ -13,8 +13,8 @@
 import {test} from "node:test"
 import * as assert from "node:assert/strict"
 
-import type {BinaryOpcode, UnaryOpcode} from "@ppl/machine"
-import {evalBinary, evalUnary, SHIFT_OPS} from "@ppl/machine"
+import type {BinaryOpcode, UnaryOpcode} from "mog-core"
+import {evalBinary, evalUnary, SHIFT_OPS} from "mog-core"
 import {binaryOpToJs, unaryOpToJs} from "../src/engine/codec-codegen"
 import {revBits} from "../src/runtime/codec-runtime"
 import {buildCodec, binaryEncodeRules, binaryDecodeRules} from "@ppl/codecs"
@@ -105,5 +105,5 @@ test("compiled codec output never references evalBinary/evalUnary (the test orac
 
     assert.ok(!source.includes("evalBinary"), "generated source must not call evalBinary")
     assert.ok(!source.includes("evalUnary"), "generated source must not call evalUnary")
-    assert.ok(!source.includes("@ppl/machine"), "generated source must not import @ppl/machine at all")
+    assert.ok(!source.includes("mog-core"), "generated source must not import mog-core at all")
 })

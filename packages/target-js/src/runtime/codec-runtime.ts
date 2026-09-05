@@ -1,7 +1,7 @@
 /**
  * @ppl/target-js — Runtime support for compiled codec functions
  *
- * `engine/codec-codegen.ts` turns a raised (`@ppl/machine`'s raise.ts)
+ * `engine/codec-codegen.ts` turns a raised (`mog-core`'s raise.ts)
  * codec program into real control flow — real `function`s, real `if`/
  * `while`, direct calls between the generated functions instead of an
  * index into a procedure table, every `ENTER`'s `ref` resolved to a real
@@ -378,7 +378,7 @@ export function writeSeqRaw(ctx: Ctx, iterIdx: number, src: ArrayBufferView): vo
  *  text; this is the one that gets a named call instead, the same way
  *  `evalUnary`'s own `MUL`/`CLZ` equivalents lean on `Math.imul`/
  *  `Math.clz32` rather than hand-rolling them inline. Byte-for-byte the
- *  same algorithm as `@ppl/machine`'s own `evalUnary`'s `REVBITS` case —
+ *  same algorithm as `mog-core`'s own `evalUnary`'s `REVBITS` case —
  *  verified against it directly by `binary-op-codegen.runtime.test.ts`,
  *  not just asserted to match by comment. */
 export function revBits(x: number): number

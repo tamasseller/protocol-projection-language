@@ -12,10 +12,10 @@ import { describe, test } from "node:test"
 import assert from "node:assert/strict"
 
 import { list, u8, union, unit, buildTypeGraph } from "@ppl/core"
-import { bare, brTable, CONST, STORE, LOAD, PUSH, opImm, validateProgram, run } from "@ppl/machine"
+import { bare, brTable, CONST, STORE, LOAD, PUSH, opImm, validateProgram, run } from "mog-core"
 import { callCodecInstr, callCodecNextInstr, countInstr, loadValInstr, openListInstr, readInstr, storeValInstr, tagInstr, writeInstr } from "../src/engine/codec-ext-instr"
 import type { CodecExtInstr } from "../src/engine/codec-ext-instr"
-import type { RtlProgram, RtlInstr } from "@ppl/machine"
+import type { RtlProgram, RtlInstr } from "mog-core"
 
 import { createCodecExtension } from "../src/engine/codec-extension"
 import type { Handle } from "../src/engine/codec-extension"

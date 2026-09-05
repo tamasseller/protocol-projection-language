@@ -14,7 +14,7 @@ import * as assert from "node:assert/strict"
 
 import type { SemanticType } from "@ppl/core"
 import { struct, union, unit, list, u8, integer, named, optional, buildTypeGraph, kindOf, SemanticTypeKinds } from "@ppl/core"
-import { run } from "@ppl/machine"
+import { run } from "mog-core"
 import { buildCodec, binaryEncodeRules, binaryDecodeRules, createCodecExtension } from "@ppl/codecs"
 
 import { generateCodecModule } from "../src/engine/codec-module"

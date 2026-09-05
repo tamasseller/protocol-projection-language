@@ -90,7 +90,7 @@ export type Transform =
     | {readonly op: "log"; readonly base: Rational; readonly factor: Rational; readonly reference: Rational}
     /** NTC / thermocouple curves. A2L's TAB_INTP / TAB_NOINTP. */
     | {readonly op: "table"; readonly points: readonly (readonly [number, number])[]; readonly interp: "none" | "linear"}
-    /** Escape hatch, as @ppl/machine IR rather than an unexecutable
+    /** Escape hatch, as mog-core IR rather than an unexecutable
      *  string (contrast A2L's FORM). Inverse must be declared. */
     | {readonly op: "formula"; readonly forward: ProcedureRef; readonly inverse: ProcedureRef}
 ```

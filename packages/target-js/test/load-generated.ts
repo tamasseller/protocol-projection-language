@@ -3,7 +3,7 @@
  * real
  *
  * `generateCodecModule`'s output imports real packages (`@ppl/target-js`'s
- * own runtime, `@ppl/machine`'s `evalBinary`/`evalUnary`) — `ts-check.ts`'s
+ * own runtime, `mog-core`'s `evalBinary`/`evalUnary`) — `ts-check.ts`'s
  * standalone compiler host can't resolve those (it only ever recognizes
  * one synthetic in-memory file plus lib.d.ts), so it isn't the right tool
  * here. This is: the source has to live at a real path under this package

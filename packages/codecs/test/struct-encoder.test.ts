@@ -6,7 +6,7 @@
  * §8.1's worked example. Hand-built `RtlProgram<CodecExtInstr>`s (no `ir`/lowering
  * pipeline involved — see codec-extension.ts's file header and
  * extension.test.ts's "a call-shaped op actually invokes its callee" test
- * in @ppl/machine for why: a codec procedure's target is a *reference* to
+ * in mog-core for why: a codec procedure's target is a *reference* to
  * another procedure, which only lowers safely from *callee* position, not
  * as a builtin-call argument). Proves the full mechanism for real: RTL →
  * `validateProgram` (folds `CALL_CODEC` into the call graph) → `run`
@@ -17,10 +17,10 @@ import { describe, test } from "node:test"
 import assert from "node:assert/strict"
 
 import { struct, u8, u16, u32, buildTypeGraph } from "@ppl/core"
-import { bare, validateProgram, run } from "@ppl/machine"
+import { bare, validateProgram, run } from "mog-core"
 import { callCodecInstr, loadValInstr, readInstr, storeValInstr, writeInstr } from "../src/engine/codec-ext-instr"
 import type { CodecExtInstr } from "../src/engine/codec-ext-instr"
-import type { RtlProgram, RtlInstr } from "@ppl/machine"
+import type { RtlProgram, RtlInstr } from "mog-core"
 
 import { createCodecExtension } from "../src/engine/codec-extension"
 import type { Handle } from "../src/engine/codec-extension"

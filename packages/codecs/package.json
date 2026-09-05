@@ -11,7 +11,7 @@
   },
   "dependencies": {
     "@ppl/core": "*",
-    "@ppl/machine": "*"
+    "mog-core": "git+https://github.com/tamasseller/mog-core.git"
   },
   "devDependencies": {
     "@types/node": "^26.1.1",
