@@ -1,0 +1,12 @@
+# The repos this workspace holds — each carries its own git.
+/ppl/
+/mog-core/
+/mog-jit/
+/ppl-example/
+
+# VS Code
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
