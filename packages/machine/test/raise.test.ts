@@ -137,11 +137,22 @@ function evalRaisedProgram(
                 }
 
                 case StmtKind.Loop:
+                    // `pre` is the whole difference between the two
+                    // openers (isa-core.md §4.5): the test sits ahead of
+                    // the body or after it.
                     for(;;)
                     {
-                        execStmts(s.cond, slots)
-                        if(evalExpr(s.test, slots) === 0) break
+                        if(s.pre)
+                        {
+                            execStmts(s.cond, slots)
+                            if(evalExpr(s.test, slots) === 0) break
+                        }
                         execStmts(s.body, slots)
+                        if(!s.pre)
+                        {
+                            execStmts(s.cond, slots)
+                            if(evalExpr(s.test, slots) === 0) break
+                        }
                     }
                     break
             }
@@ -271,8 +282,26 @@ describe("raise: if/else (BR_TABLE)", () =>
     })
 })
 
-describe("raise: loops (LOOP)", () =>
+describe("raise: loops (LOOP_PRE / LOOP_POST)", () =>
 {
+    test("do-while: the body runs even when the test is false from the start", () => assertRaisedReturn(`
+        u32 n = 0;
+        do { n = n + 1; } while (0);
+        return n;
+    `, 1))
+
+    test("do-while: iterates like the pre-test form once it runs at all", () => assertRaisedReturn(`
+        u32 sum = 0;
+        u32 i = 1;
+        do
+        {
+            sum = sum + i;
+            i = i + 1;
+        }
+        while (i <= 5);
+        return sum;
+    `, 15))
+
     test("while: sum 1 to 5", () => assertRaisedReturn(`
         u32 sum = 0;
         u32 i = 1;
@@ -370,6 +399,38 @@ describe("raise: switch (BR_TABLE with >2 cases, fallthrough)", () =>
             default: return 400;
         }
     `, 300))
+
+    // A gap inside the span is a lone DEFAULT, so raising it has to fold
+    // the *last* arm into that case rather than the next one.
+    for(const [x, expected] of [[0, 10], [1, 99], [2, 99], [3, 40], [7, 99]] as const)
+    {
+        test(`gap filled by DEFAULT, discriminant ${x}`, () => assertRaisedReturn(`
+            u32 x = ${x};
+            switch (x)
+            {
+                case 0:  return 10;
+                case 3:  return 40;
+                default: return 99;
+            }
+        `, expected))
+    }
+
+    // ...and the same fold from a case with a body of its own, which runs
+    // first and then continues into the default clause.
+    for(const [x, expected] of [[0, 1], [1, 12], [9, 10]] as const)
+    {
+        test(`non-empty case falling into a later default, discriminant ${x}`, () => assertRaisedReturn(`
+            u32 x = ${x};
+            u32 r = 0;
+            switch (x)
+            {
+                case 0:  r = 1; break;
+                case 1:  r = 2;
+                default: r = r + 10;
+            }
+            return r;
+        `, expected))
+    }
 })
 
 describe("raise: stack-bridging compound expressions (PEEK_PEEK/POP_ACC combos)", () =>

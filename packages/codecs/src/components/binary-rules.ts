@@ -132,7 +132,7 @@ const unionEncodeRule = codecRule(pUnionFields(pStar()), (match, _ctx: void, res
 {
     const width = unionTagWidth(match.variantMatches.length)
     const cases: IrFragment[] = match.variantMatches.map((v, k) =>
-        ir`case ${k}: call_codec(${resolve(v.type, undefined)}, 0, ${k});`)
+        ir`case ${k}: call_codec(${resolve(v.type, undefined)}, 0, ${k}); break;`)
 
     return ir`
         write(0, ${width}, tag(0));
@@ -144,7 +144,7 @@ const unionDecodeRule = codecRule(pUnionFields(pStar()), (match, _ctx: void, res
 {
     const width = unionTagWidth(match.variantMatches.length)
     const cases: IrFragment[] = match.variantMatches.map((v, k) =>
-        ir`case ${k}: call_codec(${resolve(v.type, undefined)}, 0, ${k});`)
+        ir`case ${k}: call_codec(${resolve(v.type, undefined)}, 0, ${k}); break;`)
 
     return ir`
         switch (read(0, ${width})) { ${cases} }
@@ -245,7 +245,7 @@ const structEncodeRule = codecRule(pStructFields(pStar()), (match, _ctx: void, r
             if(!hoist)
                 return ir`call_codec(${resolve(f.type, undefined)}, 0, ${fieldIndex});`
 
-            const cases = hoist.variantTypes.map((v, k) => ir`case ${k}: call_codec(${resolve(v, undefined)}, ${O_FIELD}, ${k});`)
+            const cases = hoist.variantTypes.map((v, k) => ir`case ${k}: call_codec(${resolve(v, undefined)}, ${O_FIELD}, ${k}); break;`)
             return ir`enter(${O_FIELD}, 0, ${fieldIndex}); switch (tag(${O_FIELD})) { ${cases} }`
         })}
     `
@@ -275,7 +275,7 @@ const structDecodeRule = codecRule(pStructFields(pStar()), (match, _ctx: void, r
                     enter(${O_FIELD}, 0, ${fieldIndex}); 
                     switch (${`(bitmap >> ${hoist.bitOffset}) & ${hoist.mask}`}) 
                     { 
-                        ${hoist.variantTypes.map((v, k) => ir`case ${k}: call_codec(${resolve(v, undefined)}, ${O_FIELD}, ${k});`)} 
+                        ${hoist.variantTypes.map((v, k) => ir`case ${k}: call_codec(${resolve(v, undefined)}, ${O_FIELD}, ${k}); break;`)} 
                     }
                 `)
                 : ir`call_codec(${resolve(f.type, undefined)}, 0, ${fieldIndex});`

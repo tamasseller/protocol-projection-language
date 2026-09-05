@@ -80,8 +80,13 @@ describe("switch — a label is a value", () =>
     })
 
     test("with no default, an unmatched value leaves the switch", () =>
-        assert.equal(run(program(
-            "u32 x = 9; u32 r = 0; switch(x) { case 0: r = 1; case 9: r = 2; } return r;")).acc, 2))
+    {
+        const source = (x: number) =>
+            `u32 x = ${x}; u32 r = 0; switch(x) { case 0: r = 1; break; case 9: r = 2; } return r;`
+
+        assert.equal(run(program(source(9))).acc, 2)
+        assert.equal(run(program(source(5))).acc, 0)
+    })
 })
 
 describe("switch — grouping", () =>
@@ -98,10 +103,10 @@ describe("switch — grouping", () =>
         assert.ok(ops.includes("BR_TABLE 4"), ops.join(" | "))
     })
 
-    // The whole grouping rule: a gap costs one copy of the default block
-    // per missing label, a second table costs CHAIN_LINK_BYTES (lower.ts).
-    // With no `default:` clause a gap filler is a lone BLOCK_END, so these
-    // two probes sit on either side of that line.
+    // The whole grouping rule: a gap costs `gapCost` bytes per missing
+    // label, a second table costs CHAIN_LINK_BYTES (lower.ts). With no
+    // `default:` clause a gap filler is a lone BLOCK_END — one byte — so
+    // these two probes sit on either side of that line.
     test("a gap of 6 is cheaper to fill than to start a second table", () =>
     {
         const ops = opsOf("u32 x = 0; switch(x) { case 0: return 1; case 7: return 2; } return 0;")
@@ -115,15 +120,41 @@ describe("switch — grouping", () =>
     })
 
     // A gap runs the `default:` clause, and `BR_TABLE`'s index is exact
-    // below N — so a gap gets its own copy of it, and a substantial one
-    // makes filling never worth it.
-    test("a real default clause makes gaps expensive", () =>
+    // below N — so a gap needs a case of its own. `DEFAULT` makes that two
+    // bytes rather than a copy of the clause, so the threshold just moves
+    // from 6 to 3 and stops depending on how big the clause is.
+    test("a default clause halves how wide a gap is worth filling", () =>
     {
-        const wide = opsOf("u32 x = 0; switch(x) { case 0: return 1; case 4: return 2; default: return 99; }")
-        assert.equal(countOf(wide, "BR_TABLE"), 2, wide.join(" | "))
-
-        const narrow = opsOf("u32 x = 0; switch(x) { case 0: return 1; case 2: return 2; default: return 99; }")
+        const narrow = opsOf("u32 x = 0; switch(x) { case 0: return 1; case 4: return 2; default: return 99; }")
         assert.equal(countOf(narrow, "BR_TABLE"), 1, narrow.join(" | "))
+
+        const wide = opsOf("u32 x = 0; switch(x) { case 0: return 1; case 5: return 2; default: return 99; }")
+        assert.equal(countOf(wide, "BR_TABLE"), 2, wide.join(" | "))
+    })
+
+    test("a big default clause no longer blocks merging — a gap is two bytes either way", () =>
+    {
+        const big = "default: { u32 a = 1; u32 b = 2; u32 c = 3; return a + b + c + 90; }"
+        const ops = opsOf(`u32 x = 0; switch(x) { case 0: return 1; case 4: return 2; ${big} }`)
+
+        assert.equal(countOf(ops, "BR_TABLE"), 1, ops.join(" | "))
+        assert.equal(countOf(ops, "DEFAULT"), 3, ops.join(" | "))
+    })
+
+    test("a filled gap reaches the default clause, chained or not", () =>
+    {
+        const cases = "case 0: return 10; case 3: return 13;"
+        for(const x of [1, 2])
+            assert.equal(dispatch(cases, x), 99)
+
+        // Two groups, so the gap's own DEFAULT lands in the *next* group's
+        // dispatch — which matches nothing either, and falls out to the
+        // real clause (isa-core.md §7.1).
+        const chained = "case 0: return 10; case 2: return 12; case 40: return 40; case 41: return 41;"
+        assert.equal(dispatch(chained, 1), 99)
+        assert.equal(dispatch(chained, 2), 12)
+        assert.equal(dispatch(chained, 40), 40)
+        assert.equal(dispatch(chained, 39), 99)
     })
 
     test("far-apart labels become a compare chain", () =>
@@ -178,13 +209,26 @@ describe("switch — rejected shapes", () =>
             /Duplicate switch case label 1/))
 
     // `FALLTHROUGH` continues into the case physically next in the table
-    // (isa-core.md §4.5), so a shared body has to belong to the next label.
-    test("an empty case whose neighbour is not the next label", () =>
+    // (isa-core.md §4.5), so a fallthrough's target has to be the next
+    // label by value — an empty body being just the degenerate case.
+    test("falling through to a label that is not the next value", () =>
     {
         assert.throws(() => program("u32 x = 0; switch(x) { case 0: case 5: return 1; default: return 9; }"),
-            /Empty body for case 0: it can only share the body of case 1/)
-        assert.throws(() => program("u32 x = 0; switch(x) { case 0: return 1; case 5: default: return 9; }"),
-            /Empty body for case 5: it can only share the body of case 6/)
+            /case 0 falls through into case 5, which is not the next value/)
+        assert.throws(() => program("u32 x = 0; switch(x) { case 5: x = 1; case 0: return 2; default: return 9; }"),
+            /case 5 falls through into case 0, which is not the next value/)
+    })
+
+    test("falling out of a default clause written before a case", () =>
+        assert.throws(() => program("u32 x = 0; switch(x) { default: x = 9; case 1: return x; }"),
+            /The default clause falls through into case 1/))
+
+    test("break anywhere but a switch case's own end", () =>
+    {
+        assert.throws(() => program("u32 x = 0; while (x) { break; } return x;"),
+            /break outside a switch case/)
+        assert.throws(() => program("u32 x = 0; switch(x) { case 0: if (x) { break; } return 1; }"),
+            /break outside a switch case/)
     })
 
     test("a label that is not an integer literal", () =>
@@ -249,5 +293,60 @@ describe("switch — a shared case body", () =>
         assert.equal(dispatch(withGap, 1), 10)
         assert.equal(dispatch(withGap, 2), 99)
         assert.equal(dispatch(withGap, 3), 30)
+    })
+})
+
+describe("switch — C fallthrough", () =>
+{
+    test("a non-empty case runs on into the next one", () =>
+    {
+        const source = (x: number) =>
+            `u32 x = ${x}; u32 r = 0; switch(x) { case 0: r = r + 1; case 1: r = r + 10; break; case 2: r = r + 100; } return r;`
+
+        assert.equal(run(program(source(0))).acc, 11)
+        assert.equal(run(program(source(1))).acc, 10)
+        assert.equal(run(program(source(2))).acc, 100)
+        assert.equal(run(program(source(3))).acc, 0)
+    })
+
+    test("a chain of them lands whole", () =>
+    {
+        const source = (x: number) =>
+            `u32 x = ${x}; u32 r = 0; switch(x) { case 0: r = r + 1; case 1: r = r + 2; case 2: r = r + 4; break; } return r;`
+
+        assert.equal(run(program(source(0))).acc, 7)
+        assert.equal(run(program(source(1))).acc, 6)
+        assert.equal(run(program(source(2))).acc, 4)
+    })
+
+    test("an empty body is just the degenerate case of it", () =>
+    {
+        const source = (x: number) => `u32 x = ${x}; switch(x) { case 0: case 1: return 7; default: return 9; }`
+
+        assert.equal(run(program(source(0))).acc, 7)
+        assert.equal(run(program(source(1))).acc, 7)
+        assert.equal(run(program(source(2))).acc, 9)
+    })
+
+    test("a case falls through into a default clause written after it", () =>
+    {
+        const source = (x: number) =>
+            `u32 x = ${x}; u32 r = 0; switch(x) { case 0: r = 1; break; case 1: r = 2; default: r = r + 10; } return r;`
+
+        assert.equal(run(program(source(0))).acc, 1)
+        assert.equal(run(program(source(1))).acc, 12)
+        assert.equal(run(program(source(5))).acc, 10)
+
+        assert.ok(opsOf(source(1)).includes("DEFAULT"), opsOf(source(1)).join(" | "))
+    })
+
+    test("the last case falling off the end leaves the switch", () =>
+    {
+        const source = (x: number) =>
+            `u32 x = ${x}; u32 r = 0; switch(x) { default: r = 9; break; case 0: r = 1; case 1: r = r + 2; } return r;`
+
+        assert.equal(run(program(source(0))).acc, 3)
+        assert.equal(run(program(source(1))).acc, 2)
+        assert.equal(run(program(source(7))).acc, 9)
     })
 })

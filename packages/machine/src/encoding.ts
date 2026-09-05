@@ -33,6 +33,9 @@ export function instrBytes<E extends { ext: string } = ExtOpPayload>(instr: RtlI
     if (instr.op === "PUSH") return 1
     // §5.3's escapes: opcode byte plus a sub-code.
     if (instr.op === "CLZ" || instr.op === "REVBITS") return 2
+    if (instr.op === "FALLTHROUGH" || instr.op === "DEFAULT") return 2
+    // §5.4: `#1..#4` have their own sub-codes, the rest is biased by 5.
+    if (instr.op === "DROP") return instr.imm <= 4 ? 2 : 2 + leb128Bytes(instr.imm - 5)
     if (instr.op === "CONST")
         return instr.imm >= 0 && instr.imm <= 15 ? 1 : 1 + leb128Bytes(instr.imm)
     if (!("combo" in instr)) return 1

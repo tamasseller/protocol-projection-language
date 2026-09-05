@@ -105,16 +105,6 @@ export class RegAlloc<E extends { ext: string } = ExtOpPayload> implements TypeE
         return idx
     }
 
-    /** Account for `n` slots this scope's own code pushed under names that
-     *  are now out of view — a `for` init's declarations, whose registers
-     *  live until the enclosing block ends even though C scopes the names
-     *  to the loop. Without this the next declaration here would number
-     *  over them. */
-    consume(n: number): void
-    {
-        this.next += n
-    }
-
     /** The declared type of `name`, through enclosing scopes the way
      *  `resolve` goes. Undefined for a procedure argument, which is a plain
      *  word — types.ts supplies that default. */

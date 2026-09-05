@@ -17,8 +17,9 @@ import { lowerProc, lowerProgram } from "../src/lower"
 import { validateProgram } from "../src/validate"
 import { run } from "../src/vm"
 import { format } from "../src/rtl"
+import type { RtlInstr } from "../src/rtl"
 
-const opsOf = (p: ReturnType<typeof lowerProgram>, i: number): string[] => p.procedures[i]!.body.map(format)
+const opsOf = (p: ReturnType<typeof lowerProgram>, i: number): string[] => p.procedures[i]!.body.map(instr => format(instr as RtlInstr))
 
 function runs(entry: ReturnType<typeof proc>, expected: number): void
 {

@@ -44,7 +44,7 @@
  */
 
 import type {RtlProgram, RtlProc, RtlInstr} from "@ppl/machine"
-import {isExtInstr} from "@ppl/machine"
+import {isExtInstr, isLoopOpcode} from "@ppl/machine"
 import type {TypeNode} from "@ppl/core"
 import {SemanticTypeKinds} from "@ppl/core"
 import {assertNever} from "./opcodes"
@@ -256,7 +256,7 @@ function analyzeProcedure(proc: RtlProc<CodecExtInstr>, procIndex: number, progr
     }
 
     /** Mirrors `validate.ts`'s own `walk` shape exactly (BR_TABLE's N+1
-     *  blocks, LOOP's cond-then-body), threading a handle-type environment instead
+     *  blocks, a loop's body-then-cond), threading a handle-type environment instead
      *  of a TOS depth. Each branch/loop sub-block gets its own copy — no
      *  case or iteration's handle bindings are assumed to survive past it,
      *  matching every rule body actually written so far (a hoisted
@@ -270,7 +270,7 @@ function analyzeProcedure(proc: RtlProc<CodecExtInstr>, procIndex: number, progr
             if(pc >= body.length) fail(procIndex, pc, `ran off the end without finding this block's own close`)
             const instr: RtlInstr<CodecExtInstr> = body[pc]!
 
-            if(instr.op === "BLOCK_END") return {nextPc: pc + 1, terminated: false}
+            if(instr.op === "BLOCK_END" || instr.op === "FALLTHROUGH" || instr.op === "DEFAULT") return {nextPc: pc + 1, terminated: false}
             if(instr.op === "RETURN" || instr.op === "TRAP") return {nextPc: pc + 1, terminated: true}
 
             if(instr.op === "BR_TABLE")
@@ -281,11 +281,11 @@ function analyzeProcedure(proc: RtlProc<CodecExtInstr>, procIndex: number, progr
                 pc = p; continue
             }
 
-            if(instr.op === "LOOP")
+            if(isLoopOpcode(instr.op))
             {
-                const cond = walk(pc + 1, new Map(env), new Map(iterEnv))
-                const body_ = walk(cond.nextPc, new Map(env), new Map(iterEnv))
-                pc = body_.nextPc; continue
+                const body_ = walk(pc + 1, new Map(env), new Map(iterEnv))
+                const cond = walk(body_.nextPc, new Map(env), new Map(iterEnv))
+                pc = cond.nextPc; continue
             }
 
             if(isExtInstr(instr)) {handleExt(instr, env, iterEnv, pc); pc++; continue}

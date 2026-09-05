@@ -567,19 +567,11 @@ question entirely by closing every case with `RETURN`.
 free to use the program's `i0`), invoked by value-arg `CALL` from codec
 bodies needing to emit a computed number (§8.6). Register 0 is `value`. A
 u32 always emits at least one byte, so the loop must run once even when the
-value starts at zero, hence the first-iteration-flag idiom (isa-core.md
-§7.2):
+value starts at zero — a post-test loop, which `LOOP_POST` is (isa-core.md
+§4.5). The body block comes first and the condition second (§7.2):
 
 ```
-CONST #1
-STORE r_first          ; force first pass
-LOOP
-  LOAD 0                ; condition block: acc = value
-  NE #0                 ; acc = (value != 0)
-  OR r_first            ; OR'd with the forced first-pass flag
-BLOCK_END               ; acc=0 → exit; acc≠0 → body
-  CONST #0
-  STORE r_first         ; clear; harmless if repeated
+LOOP_POST
   LOAD 0
   AND #0x7F
   STORE r_byte
@@ -588,7 +580,7 @@ BLOCK_END               ; acc=0 → exit; acc≠0 → body
   STORE 0               ; value >>= 7
   LOAD 0
   EQ #0                 ; acc = (value == 0): done after this byte?
-  BR_TABLE 2            ; case 0 (more): set continuation bit; case 1 (done): none
+  BR_TABLE 1            ; case 0 (more): set continuation bit; case 1 (done): none
     LOAD r_byte
     OR #0x80
     STORE r_byte
@@ -596,7 +588,10 @@ BLOCK_END               ; acc=0 → exit; acc≠0 → body
   BLOCK_END
   LOAD r_byte
   WRITE i0, 1
-BLOCK_END               ; back-edge → LOOP
+BLOCK_END               ; body closes, continuing into the condition
+  LOAD 0                ; condition block: acc = value
+  NE #0                 ; acc = (value != 0)
+BLOCK_END               ; acc≠0 → back-edge; acc=0 → exit
 RETURN
 ```
 
@@ -615,12 +610,12 @@ WRITE i0, 1            ; placeholder byte via original writer
 ; ...serialize rest of packet with original writer i0 (elided)...
 CONST #0
 STORE r_sum            ; r_sum = checksum accumulator
-LOOP
-  HAS_NEXT 1           ; condition block: does reader 1 have another byte?
-BLOCK_END              ; acc=0 → exit; acc≠0 → body
-  READ 1, 1            ; acc = next byte from reader
+LOOP_PRE
+  READ 1, 1            ; body block: acc = next byte from reader
   ADD r_sum            ; r_sum += byte (register combo, result → acc)
-BLOCK_END              ; back-edge
+BLOCK_END
+  HAS_NEXT 1           ; condition block: does reader 1 have another byte?
+BLOCK_END              ; acc≠0 → back-edge; acc=0 → exit
 LOAD r_sum
 WRITE 2, 1             ; emit checksum via parked writer fork
 RETURN
@@ -659,14 +654,14 @@ CALL_CODEC codec_u8, o0, base
 ; --- emit opt1 if present ---
 ENTER o1, o0, opt1
 COUNT o1
-BR_TABLE 2             ; case 0 (absent): skip; case 1 (present): emit
+BR_TABLE 1             ; case 0 (absent): skip; case 1 (present): emit
 BLOCK_END
   CALL_CODEC_NEXT codec_u8, o1
 BLOCK_END
 ; --- emit opt2 if present ---
 ENTER o1, o0, opt2
 COUNT o1
-BR_TABLE 2
+BR_TABLE 1
 BLOCK_END
   CALL_CODEC_NEXT codec_u8, o1
 BLOCK_END
@@ -689,7 +684,7 @@ COUNT                   ; acc = length (src=o0)
 STORE r_left            ; r_left = loop counter
 WRITE i0, 1             ; emit count byte (acc still holds count after STORE)
 EQ #0
-BR_TABLE 2
+BR_TABLE 1
 BLOCK_END               ; case 0 (non-empty): continue
   RETURN                ; case 1 (empty): done
 BLOCK_END
@@ -701,11 +696,8 @@ CALL leb128_encode      ; single arg, delivered via acc, no PUSH
 LOAD r_left
 SUB #1
 STORE r_left
-LOOP
-  LOAD r_left
-  NE #0                 ; condition block: more?
-BLOCK_END               ; acc=0 → exit; acc≠0 → body
-  ENTER_NEXT o1, o0     ; o1 = next element
+LOOP_PRE
+  ENTER_NEXT o1, o0     ; body block: o1 = next element
   LOAD_VAL o1
   STORE r_cur
   LOAD r_prev
@@ -716,7 +708,10 @@ BLOCK_END               ; acc=0 → exit; acc≠0 → body
   LOAD r_left
   SUB #1
   STORE r_left
-BLOCK_END               ; back-edge
+BLOCK_END
+  LOAD r_left
+  NE #0                 ; condition block: more?
+BLOCK_END               ; acc≠0 → back-edge; acc=0 → exit
 RETURN
 ```
 

@@ -15,7 +15,7 @@ import { describe, test } from "node:test"
 import assert from "node:assert/strict"
 
 import { run, evalBinary, evalUnary, UnspecifiedShiftAmount } from "../src/vm"
-import { bare, brTable, call, CONST, PUSH, opStack, opRegWriteback } from "../src/rtl"
+import { bare, brTable, call, CONST, PUSH, LOAD, STORE, opImm, opStack, opRegWriteback } from "../src/rtl"
 import type { RtlProgram } from "../src/rtl"
 
 describe("run — §16 item 2: acc-clobbering convention enforcement", () =>
@@ -61,15 +61,15 @@ describe("run — §8.7 acc liveness across control flow", () =>
         assert.equal(result.acc, 7)
     })
 
-    test("code immediately after a whole LOOP reading acc with no producer of its own throws at runtime (the loop-exit shape a fused comparison's un-materialized boolean used to break)", () =>
+    test("code immediately after a whole loop reading acc with no producer of its own throws at runtime (the loop-exit shape a fused comparison's un-materialized boolean used to break)", () =>
     {
         const program: RtlProgram = {
             procedures: [{
                 argCount: 0,
                 body: [
-                    bare("LOOP"),
-                    CONST(0), bare("BLOCK_END"), // condition: always exits
+                    bare("LOOP_PRE"),
                     CONST(5), bare("RETURN"),    // body (never actually taken)
+                    CONST(0), bare("BLOCK_END"), // condition: always exits
                     PUSH(), CONST(0), bare("RETURN"),  // exit edge: reads acc with no producer of its own
                 ],
             }],
@@ -77,15 +77,15 @@ describe("run — §8.7 acc liveness across control flow", () =>
         assert.throws(() => run(program), /read of acc/)
     })
 
-    test("code after a whole LOOP with its own fresh producer runs fine, unaffected by the exit-edge poisoning acc", () =>
+    test("code after a whole loop with its own fresh producer runs fine, unaffected by the exit-edge poisoning acc", () =>
     {
         const program: RtlProgram = {
             procedures: [{
                 argCount: 0,
                 body: [
-                    bare("LOOP"),
-                    CONST(0), bare("BLOCK_END"),
+                    bare("LOOP_PRE"),
                     CONST(5), bare("RETURN"),
+                    CONST(0), bare("BLOCK_END"),
                     CONST(42), bare("RETURN"),
                 ],
             }],
@@ -93,6 +93,27 @@ describe("run — §8.7 acc liveness across control flow", () =>
         const result = run(program)
         assert.equal(result.ok, true)
         assert.equal(result.acc, 42)
+    })
+
+    test("LOOP_POST runs its body before ever testing (isa-core.md §4.5)", () =>
+    {
+        // r0 counts iterations; the condition is false on the first test,
+        // so a pre-test loop would leave it at 0 and this one leaves it 1.
+        const program: RtlProgram = {
+            procedures: [{
+                argCount: 0,
+                body: [
+                    CONST(0), PUSH(),
+                    bare("LOOP_POST"),
+                    LOAD(0), opImm("ADD", 1), STORE(0), bare("BLOCK_END"),
+                    CONST(0), bare("BLOCK_END"),
+                    LOAD(0), bare("RETURN"),
+                ],
+            }],
+        }
+        const result = run(program)
+        assert.equal(result.ok, true)
+        assert.equal(result.acc, 1)
     })
 })
 

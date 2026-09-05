@@ -192,17 +192,17 @@ describe("FALLTHROUGH — continuing into the next case", () =>
             CONST(0), bare("RETURN"),
         ]), /no next case to continue into/))
 
-    test("it cannot close a LOOP sub-block", () =>
+    test("it cannot close a loop sub-block", () =>
     {
         assert.throws(() => program([
-            bare("LOOP"), CONST(0), bare("FALLTHROUGH"), CONST(1), bare("BLOCK_END"),
-            CONST(0), bare("RETURN"),
-        ]), /condition sub-block must close with BLOCK_END, not FALLTHROUGH/)
-
-        assert.throws(() => program([
-            bare("LOOP"), CONST(0), bare("BLOCK_END"), CONST(1), bare("FALLTHROUGH"),
+            bare("LOOP_PRE"), CONST(0), bare("FALLTHROUGH"), CONST(1), bare("BLOCK_END"),
             CONST(0), bare("RETURN"),
         ]), /body sub-block must close with BLOCK_END, not FALLTHROUGH/)
+
+        assert.throws(() => program([
+            bare("LOOP_PRE"), CONST(0), bare("BLOCK_END"), CONST(1), bare("FALLTHROUGH"),
+            CONST(0), bare("RETURN"),
+        ]), /condition sub-block must close with BLOCK_END, not FALLTHROUGH/)
     })
 
     test("it cannot close the procedure body", () =>

@@ -25,16 +25,16 @@
  */
 
 import type { RtlProc, RtlProgram, RtlInstr, ExtOpPayload } from "./rtl"
-import { isExtInstr, isStackComboInstr, isRegComboInstr, isImmComboInstr, SHIFT_OPS, UNARY_ALU_OPS } from "./rtl"
+import { isExtInstr, isStackComboInstr, isRegComboInstr, isImmComboInstr, isLoopOpcode, SHIFT_OPS, UNARY_ALU_OPS } from "./rtl"
 import type { Extension, ExtOpEffect } from "./extension"
 import { accOutOf } from "./extension"
 
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** How a block ended: `"end"` leaves the construct, `"fall"` continues into
- *  the next case (§4.5's `FALLTHROUGH`), `"terminated"` leaves the
- *  procedure. */
-type Close = "end" | "fall" | "terminated"
+ *  the next case (§4.5's `FALLTHROUGH`), `"default"` into that dispatch's
+ *  own last case (`DEFAULT`), `"terminated"` leaves the procedure. */
+type Close = "end" | "fall" | "default" | "terminated"
 
 interface WalkResult
 {
@@ -157,19 +157,10 @@ function walkProcedure<E extends { ext: string } = ExtOpPayload>(
      *  value into it, or (a write-back-in-place combo, REG_REG/PEEK_PEEK,
      *  or entering a `BR_TABLE`/`LOOP` split successor) clobbers it —
      *  matching `raise.ts`'s own `this.acc = undefined` and `vm.ts`'s own
-     *  dynamic tracking.
-     *
-     *  `commit` is false only for a probe walk that exists purely to
-     *  confirm a second possible entry value doesn't fail (see `LOOP`
-     *  below) — it must not append to `callSites` a second time for the
-     *  same call site, so it's threaded through every recursive `walk`
-     *  call and gates that one push. Nothing else needs gating: `walk`'s
-     *  own structural shape (which `pc`s it visits, `close`,
-     *  `nextPc`) never depends on `accLive`, only whether `requireAcc`
-     *  throws does — so a probe walk always visits exactly the same
-     *  instructions a committed walk of the same sub-block would, and
-     *  `peak = Math.max(...)` below can't come out differently either. */
-    function walk(pc: number, entryTos: number, entryAccLive: boolean, commit: boolean = true): WalkResult
+     *  dynamic tracking. Every block is walked exactly once — §7.2's block
+     *  order is what makes a loop's condition reachable only after all of
+     *  its predecessors are known. */
+    function walk(pc: number, entryTos: number, entryAccLive: boolean): WalkResult
     {
         let tos = entryTos
         let accLive = entryAccLive
@@ -192,6 +183,7 @@ function walkProcedure<E extends { ext: string } = ExtOpPayload>(
 
             if(instr.op === "BLOCK_END") return { nextPc: pc + 1, close: "end", exitAccLive: accLive }
             if(instr.op === "FALLTHROUGH") return { nextPc: pc + 1, close: "fall", exitAccLive: accLive }
+            if(instr.op === "DEFAULT") return { nextPc: pc + 1, close: "default", exitAccLive: accLive }
             if(instr.op === "RETURN")
             {
                 // Not `requireAcc`: a procedure that establishes no value on
@@ -204,6 +196,17 @@ function walkProcedure<E extends { ext: string } = ExtOpPayload>(
             if(instr.op === "TRAP") return { nextPc: pc + 1, close: "terminated", exitAccLive: accLive }
 
             if(instr.op === "PUSH") { requireAcc("PUSH"); tos++; pc++; continue }
+
+            if(instr.op === "DROP")
+            {
+                // §4.4: `#0` is unencodable, and §8.1 holds a DROP to the
+                // same floor every block closer respects.
+                if(instr.imm < 1) fail(pc, `DROP ${instr.imm}: at least one slot (isa-core.md §4.4)`)
+                if(tos - instr.imm < entryTos)
+                    fail(pc, `DROP ${instr.imm}: would take TOS (${tos}) below this block's entry depth (${entryTos})`)
+                tos -= instr.imm
+                pc++; continue
+            }
 
             if(isStackComboInstr(instr))
             {
@@ -223,7 +226,7 @@ function walkProcedure<E extends { ext: string } = ExtOpPayload>(
                 if(tos - stackArgs < entryTos)
                     fail(pc, `CALL ${instr.calleeIndex}: only ${tos - entryTos} value(s) pushed, needs ${stackArgs}`)
                 if(callee.argCount > 0) requireAcc(`CALL ${instr.calleeIndex}`)
-                if(commit) callSites.push({ calleeIndex: instr.calleeIndex, tos })
+                callSites.push({ calleeIndex: instr.calleeIndex, tos })
                 tos -= stackArgs
                 accLive = calleeReturnsValue(instr.calleeIndex) // the callee's return value, if it leaves one
                 pc++; continue
@@ -251,7 +254,7 @@ function walkProcedure<E extends { ext: string } = ExtOpPayload>(
                     const stackArgs = stackArgsOf(callee.argCount)
                     if(tos - stackArgs < entryTos)
                         fail(pc, `EXT ${instr.ext}: only ${tos - entryTos} value(s) pushed, needs ${stackArgs}`)
-                    if(commit) callSites.push({ calleeIndex, tos })
+                    callSites.push({ calleeIndex, tos })
                     tos -= stackArgs
                 }
 
@@ -287,12 +290,17 @@ function walkProcedure<E extends { ext: string } = ExtOpPayload>(
                     // isa-core.md §8.7: a split clobbers acc unconditionally
                     // — each case is a split successor, so it starts dead
                     // regardless of what was live going into the dispatch.
-                    const arm = walk(p, tos, false, commit)
+                    const arm = walk(p, tos, false)
                     p = arm.nextPc
 
                     if(arm.close === "fall")
                     {
                         if(k === blocks - 1) fail(p - 1, `FALLTHROUGH closing the default case: there is no next case to continue into`)
+                        continue
+                    }
+                    if(arm.close === "default")
+                    {
+                        if(k === blocks - 1) fail(p - 1, `DEFAULT closing the default case: it is already the case DEFAULT names`)
                         continue
                     }
                     if(arm.close === "terminated") continue
@@ -311,46 +319,42 @@ function walkProcedure<E extends { ext: string } = ExtOpPayload>(
                 continue
             }
 
-            if(instr.op === "LOOP")
+            if(isLoopOpcode(instr.op))
             {
-                // Entering the condition sub-block for the first time
-                // (from before LOOP) is ordinary sequential flow, not a
-                // split successor — it inherits whatever accLive already
-                // was. The body, though, IS a split successor of the
-                // condition's own branch decision (isa-core.md §8.7), so
-                // it always starts dead, regardless of what the condition
-                // itself leaves behind.
-                const cond = walk(pc + 1, tos, accLive, commit)
-                if(cond.close !== "end") fail(pc, `LOOP's condition sub-block must close with BLOCK_END, not ${cond.close === "fall" ? "FALLTHROUGH" : "a terminator"}`)
+                // Body first (isa-core.md §7.2). Its only predecessors are
+                // the condition's own branch decision under LOOP_PRE, and
+                // that branch plus the sequential entry edge under
+                // LOOP_POST — a CFG split either way, so it starts dead
+                // (§8.7).
+                const body_ = walk(pc + 1, tos, false)
+                if(body_.close === "fall" || body_.close === "default")
+                    fail(body_.nextPc - 1, `a loop's body sub-block must close with BLOCK_END, not ${body_.close === "fall" ? "FALLTHROUGH" : "DEFAULT"}`)
+                if(body_.close === "terminated" && instr.op === "LOOP_POST")
+                    fail(body_.nextPc - 1, `LOOP_POST's body sub-block closed by a terminator would leave its condition sub-block unreachable (isa-core.md §7.2)`)
+
+                // Every predecessor of the condition sub-block is now
+                // known, which is the whole point of the order: the body's
+                // fallthrough always, plus the opener's own entry edge
+                // under LOOP_PRE. Acc is live entering it iff it is live on
+                // all of them — one forward pass, no re-walk.
+                const fromBody = body_.close === "terminated" ? undefined : body_.exitAccLive
+                const fromEntry = instr.op === "LOOP_PRE" ? accLive : undefined
+                const condEntry = [fromBody, fromEntry].filter(v => v !== undefined).every(v => v)
+
+                const cond = walk(body_.nextPc, tos, condEntry)
+                if(cond.close !== "end") fail(pc, `a loop's condition sub-block must close with BLOCK_END, not ${cond.close === "terminated" ? "a terminator" : cond.close === "fall" ? "FALLTHROUGH" : "DEFAULT"}`)
                 // That BLOCK_END is the loop's own continue/exit dispatch
                 // (§4.5), and a dispatch reads acc (§8.7) — same
                 // requirement BR_TABLE's own requireAcc above imposes,
                 // just carried by the sub-block's exit rather than by the
                 // opener.
                 if(!cond.exitAccLive)
-                    fail(cond.nextPc - 1, `LOOP condition sub-block's BLOCK_END: read of acc after a write-back-in-place combo or a CFG split clobbered it (isa-core.md §8.7's acc-clobbering convention)`)
-                const body_ = walk(cond.nextPc, tos, false, commit)
-                if(body_.close === "fall") fail(body_.nextPc - 1, `LOOP's body sub-block must close with BLOCK_END, not FALLTHROUGH`)
-                if(body_.close !== "terminated" && body_.exitAccLive !== accLive)
-                {
-                    // A real back-edge exists, and it feeds the condition
-                    // sub-block a different entry value than the external
-                    // one just walked above (accLive is boolean, so this
-                    // is the only other value that could ever reach it on
-                    // iteration 2+). Confirm the condition sub-block
-                    // doesn't fail under that entry either — probe-only,
-                    // so nested call sites aren't double-counted. Bounded
-                    // to one extra walk, never a fixed-point search.
-                    const reentry = walk(pc + 1, tos, body_.exitAccLive, false)
-                    if(!reentry.exitAccLive)
-                        fail(reentry.nextPc - 1, `LOOP condition sub-block's BLOCK_END: read of acc, dead on the back-edge's own entry (isa-core.md §8.7's acc-clobbering convention)`)
-                }
-                pc = body_.nextPc
-                // Code after the whole LOOP is reached only via the
-                // condition sub-block's own external-entry exit path
-                // (isa-core.md §7.2, §8.7) — never via the body or its
-                // back-edge, and the exit is itself a split successor of
-                // the condition's branch, so it starts dead too.
+                    fail(cond.nextPc - 1, `loop condition sub-block's BLOCK_END: read of acc after a write-back-in-place combo or a CFG split clobbered it (isa-core.md §8.7's acc-clobbering convention)`)
+
+                pc = cond.nextPc
+                // Code after the whole loop is reached only via the
+                // condition sub-block's own false edge (isa-core.md §7.2,
+                // §8.7), itself a split successor, so it starts dead.
                 accLive = false
                 continue
             }

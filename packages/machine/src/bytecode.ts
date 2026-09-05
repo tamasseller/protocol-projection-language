@@ -10,10 +10,9 @@
  * `arg_count` immediately followed by its own body, no stored body length
  * — a body is self-delimiting (§8.4: nothing follows a terminator within
  * the same block), so `decodeProgram` derives each one's own end by
- * tracking open `LOOP`/`BR_TABLE` nesting the same way any consumer of the
- * bytecode already has to, stopping at the first terminator back at depth
- * zero (§7.2's bare-terminator loop-body closer means that's frame-*kind*
- * aware, not just a nesting count — see `decodeProcBody` below).
+ * tracking open loop/`BR_TABLE` nesting the same way any consumer of the
+ * bytecode already has to, stopping at the first terminator reached with
+ * nothing open at all — see `decodeProcBody` below.
  * Deliberately *not* wire-encoding a procedure's extension header fields
  * (§2.3/§11.4); see §5.5 for why nothing has ever needed that to survive
  * serialization.
@@ -28,6 +27,7 @@
  */
 
 import type { RtlInstr, RtlProc, RtlProgram, BinaryOpcode, UnaryOpcode, ExtOpPayload } from "./rtl"
+import { isLoopOpcode } from "./rtl"
 import type { Extension } from "./extension"
 import { validateProgram } from "./validate"
 
@@ -97,14 +97,23 @@ const UNARY_OPS: readonly UnaryOpcode[] =
 /** Sub-codes of the `MISC_UNARY` escape (§5.3), in sub-code order. */
 const MISC_UNARY_OPS: readonly UnaryOpcode[] = ["REVBITS", "CLZ"]
 
-/** §5.2's last three codes: one escape per instruction class, each taking a
- *  sub-code as its trailing LEB128 operand (§5.3). */
-const MISC_CF = 125
+/** §5.2's last three codes: three escapes, each taking a sub-code as its
+ *  trailing LEB128 operand (§5.3). */
+const MISC_BINARY = 125
 const MISC_UNARY = 126
-const MISC_BINARY = 127
+const MISC_OTHER = 127
 
 const MISC_NAMES: Record<number, string> =
-    { [MISC_CF]: "MISC_CF", [MISC_UNARY]: "MISC_UNARY", [MISC_BINARY]: "MISC_BINARY" }
+    { [MISC_BINARY]: "MISC_BINARY", [MISC_UNARY]: "MISC_UNARY", [MISC_OTHER]: "MISC_OTHER" }
+
+/** `MISC_OTHER`'s assigned sub-codes (§5.3). `DROP #1..#4` occupy the four
+ *  codes above `DROP_EXT`, so a small count's sub-code is `n + 2`. */
+const SUB_FALLTHROUGH = 0
+const SUB_DEFAULT = 1
+const SUB_DROP_EXT = 2
+/** Small `DROP` counts, and the bias the extended form is encoded with. */
+const DROP_SMALL_MAX = 4
+const DROP_EXT_BIAS = DROP_SMALL_MAX + 1
 
 /** `CONST #0..#15`'s first code — the small immediate is `code - this`. */
 const SMALL_CONST_BASE = 109
@@ -164,12 +173,20 @@ export function encodeInstr<E extends { ext: string } = ExtOpPayload>(instr: Rtl
     switch (instr.op)
     {
         case "BLOCK_END": return [96]
-        case "LOOP": return [97]
-        case "FALLTHROUGH": return [99]
+        case "LOOP_PRE": return [97]
+        case "LOOP_POST": return [98]
+        case "FALLTHROUGH": return [MISC_OTHER, SUB_FALLTHROUGH]
+        case "DEFAULT": return [MISC_OTHER, SUB_DEFAULT]
+        case "DROP":
+            // §5.4: the extended operand is biased by 5, so `#1..#4` have
+            // only their own sub-codes and `#0` — a no-op — none (§4.4).
+            if (instr.imm >= 1 && instr.imm <= DROP_SMALL_MAX) return [MISC_OTHER, SUB_DROP_EXT + instr.imm]
+            if (instr.imm < 1) throw new Error(`encodeInstr: DROP ${instr.imm} is not encodable (isa-core.md §4.4: n >= 1)`)
+            return [MISC_OTHER, SUB_DROP_EXT, ...encodeLeb128(instr.imm - DROP_EXT_BIAS)]
         case "BR_TABLE":
             // §5.4: the extended operand is biased by 2, so `#1` has only
             // its own code and `#0` has no encoding at all (§4.5).
-            if (instr.imm === 1) return [98]
+            if (instr.imm === 1) return [99]
             if (instr.imm < 1) throw new Error(`encodeInstr: BR_TABLE ${instr.imm} is not encodable (isa-core.md §4.5: N >= 1)`)
             return [100, ...encodeLeb128(instr.imm - 2)]
         case "CALL":
@@ -243,9 +260,9 @@ export function decodeInstr<E extends { ext: string } = ExtOpPayload>(bytes: Uin
     switch (code)
     {
         case 96: return { instr: { op: "BLOCK_END" }, next: pos }
-        case 97: return { instr: { op: "LOOP" }, next: pos }
-        case 98: return { instr: { op: "BR_TABLE", imm: 1 }, next: pos }
-        case 99: return { instr: { op: "FALLTHROUGH" }, next: pos }
+        case 97: return { instr: { op: "LOOP_PRE" }, next: pos }
+        case 98: return { instr: { op: "LOOP_POST" }, next: pos }
+        case 99: return { instr: { op: "BR_TABLE", imm: 1 }, next: pos }
         case 100: { const r = decodeLeb128(bytes, pos); return { instr: { op: "BR_TABLE", imm: r.value + 2 }, next: r.next } }
         case 101: { const r = decodeLeb128(bytes, pos); return { instr: { op: "CALL", calleeIndex: r.value }, next: r.next } }
         case 102: return { instr: { op: "RETURN" }, next: pos }
@@ -257,9 +274,9 @@ export function decodeInstr<E extends { ext: string } = ExtOpPayload>(bytes: Uin
         case 108: { const r = decodeLeb128(bytes, pos); return { instr: { op: "CONST", imm: r.value }, next: r.next } }
     }
 
-    if (code < MISC_CF) return { instr: { op: "CONST", imm: code - SMALL_CONST_BASE }, next: pos }
+    if (code < MISC_BINARY) return { instr: { op: "CONST", imm: code - SMALL_CONST_BASE }, next: pos }
 
-    return decodeMisc(code, decodeLeb128(bytes, pos), offset)
+    return decodeMisc(bytes, code, decodeLeb128(bytes, pos), offset)
 }
 
 /**
@@ -267,12 +284,25 @@ export function decodeInstr<E extends { ext: string } = ExtOpPayload>(bytes: Uin
  * that sub-code is assigned, so an unassigned one has no known length —
  * hence every one of them is *rejected* here rather than skipped over.
  */
-function decodeMisc<E extends { ext: string } = ExtOpPayload>(code: number, sub: { value: number; next: number }, offset: number): { instr: RtlInstr<E>; next: number }
+function decodeMisc<E extends { ext: string } = ExtOpPayload>(bytes: Uint8Array, code: number, sub: { value: number; next: number }, offset: number): { instr: RtlInstr<E>; next: number }
 {
     if (code === MISC_UNARY)
     {
         const op = MISC_UNARY_OPS[sub.value]
         if (op) return { instr: { op }, next: sub.next }
+    }
+
+    if (code === MISC_OTHER)
+    {
+        if (sub.value === SUB_FALLTHROUGH) return { instr: { op: "FALLTHROUGH" }, next: sub.next }
+        if (sub.value === SUB_DEFAULT) return { instr: { op: "DEFAULT" }, next: sub.next }
+        if (sub.value === SUB_DROP_EXT)
+        {
+            const n = decodeLeb128(bytes, sub.next)
+            return { instr: { op: "DROP", imm: n.value + DROP_EXT_BIAS }, next: n.next }
+        }
+        if (sub.value <= SUB_DROP_EXT + DROP_SMALL_MAX)
+            return { instr: { op: "DROP", imm: sub.value - SUB_DROP_EXT }, next: sub.next }
     }
 
     throw new Error(`decodeInstr: ${MISC_NAMES[code]!} at offset ${offset}: ` +
@@ -316,7 +346,7 @@ export function encodeProgram<E extends { ext: string } = ExtOpPayload>(program:
 
 /** One frame of `decodeProcBody`'s own open-block tracking. Both openers
  *  are a count of closers still to come: `N + 1` for a `BR_TABLE`'s cases
- *  plus its default case (§4.5), two for a `LOOP`'s condition and body
+ *  plus its default case (§4.5), two for a loop's body and condition
  *  sub-blocks. `dispatch` is not needed to *count* — the two close
  *  identically — only to say what §8.5 lets close them. */
 type ScanFrame = { remaining: number; dispatch: boolean }
@@ -344,14 +374,14 @@ function decodeProcBody<E extends { ext: string } = ExtOpPayload>(bytes: Uint8Ar
         pos = next
 
         if (instr.op === "BR_TABLE") { stack.push({ remaining: instr.imm + 1, dispatch: true }); continue }
-        if (instr.op === "LOOP") { stack.push({ remaining: 2, dispatch: false }); continue }
+        if (isLoopOpcode(instr.op)) { stack.push({ remaining: 2, dispatch: false }); continue }
 
-        if (instr.op === "BLOCK_END" || instr.op === "FALLTHROUGH")
+        if (instr.op === "BLOCK_END" || instr.op === "FALLTHROUGH" || instr.op === "DEFAULT")
         {
             const top = stack[stack.length - 1]
             if (!top) throw new Error(`decodeProcBody: ${instr.op} with no open block at offset ${pos}`)
-            if (!top.dispatch && instr.op === "FALLTHROUGH")
-                throw new Error(`decodeProcBody: FALLTHROUGH closing a LOOP sub-block at offset ${pos}`)
+            if (!top.dispatch && instr.op !== "BLOCK_END")
+                throw new Error(`decodeProcBody: ${instr.op} closing a loop sub-block at offset ${pos}`)
             top.remaining -= 1
             if (top.remaining === 0) stack.pop()
             continue
@@ -379,12 +409,13 @@ function decodeProcBody<E extends { ext: string } = ExtOpPayload>(bytes: Uint8Ar
 
             // §8.5: a terminator closes a dispatch case exactly as a
             // BLOCK_END would, counting against the same N + 1 closers, and
-            // it closes a LOOP's *body* sub-block — but never a LOOP's
-            // condition, which requires BLOCK_END. Leaving that frame open
-            // is what surfaces such input as a later decode error instead
-            // of silently accepting it here; counting it instead would let
-            // a malformed body run into the next procedure's bytes.
-            if (!top.dispatch && top.remaining === 2) continue
+            // it closes a loop's *body* sub-block — the first of the two,
+            // so `remaining` is still 2 there. A loop's condition (the
+            // second) requires BLOCK_END. Leaving that frame open is what
+            // surfaces such input as a later decode error instead of
+            // silently accepting it here; counting it instead would let a
+            // malformed body run into the next procedure's bytes.
+            if (!top.dispatch && top.remaining === 1) continue
 
             top.remaining -= 1
             if (top.remaining === 0) stack.pop()

@@ -233,11 +233,20 @@ function translateStmt(s: Stmt<CodecExtInstr>, entryNode: TypeNode | undefined, 
             return
 
         case StmtKind.Loop:
+            // One shape for both openers (isa-core.md §4.5): the test sits
+            // ahead of the body for `LOOP_PRE` and after it for `LOOP_POST`,
+            // which is the only thing the two differ in.
             b.block("for (;;) {", () =>
             {
-                translateStmts(s.cond, entryNode, g, b)
-                b.line(`if (!(${translateExpr(s.test, g)})) break`)
+                const test = (): void =>
+                {
+                    translateStmts(s.cond, entryNode, g, b)
+                    b.line(`if (!(${translateExpr(s.test, g)})) break`)
+                }
+
+                if(s.pre) test()
                 translateStmts(s.body, entryNode, g, b)
+                if(!s.pre) test()
             })
             return
     }

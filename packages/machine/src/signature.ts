@@ -29,8 +29,9 @@ export function returnsValue(stmts: readonly Statement[], what: string): boolean
             {
                 case "ReturnStatement": if(s.argument) valued = true; else empty = true; break
                 case "IfStatement": body(s.consequent); if(s.alternate) body(s.alternate); break
-                case "WhileStatement": case "ForStatement": body(s.body); break
+                case "WhileStatement": case "DoWhileStatement": case "ForStatement": body(s.body); break
                 case "SwitchStatement": for(const c of s.cases) walk(c.consequent); break
+                case "BlockStatement": walk(s.body); break
                 default: break
             }
         }

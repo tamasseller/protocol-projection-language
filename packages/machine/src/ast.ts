@@ -16,22 +16,24 @@ export interface Program
 }
 
 export type Statement =
+    | BlockStatement
     | IfStatement
     | WhileStatement
+    | DoWhileStatement
     | ForStatement
     | SwitchStatement
     | VariableDeclaration
+    | BreakStatement
     | ReturnStatement
     | ExpressionStatement
 
 /**
  * The single construct directly governed by if/else/while/for: either a
- * brace-delimited block or one bare statement. `BlockStatement` is reachable
- * only here — it is deliberately not a member of `Statement`, so a bare
- * `{ ... }` cannot appear as a standalone statement. Every `BlockStatement`
- * reached through a `ControlBody` position is the immediate body of a branch
- * or loop, so it always has a real RTL block construct backing it (see
- * grammer.pegjs's `ControlBody` rule and isa-core.md §10.2/§10.3, §8.1).
+ * brace-delimited block or one bare statement. In a `ControlBody` position
+ * a `BlockStatement` *is* the branch's or loop's own RTL block, so its
+ * locals are reclaimed by that block's `BLOCK_END`; standalone (where it is
+ * an ordinary `Statement`) nothing closes it and the lowering ends the
+ * scope with a `DROP` instead (isa-core.md §4.4, §10.2).
  */
 export type ControlBody = BlockStatement | Statement
 
@@ -52,6 +54,14 @@ export interface IfStatement
 export interface WhileStatement
 {
     type: "WhileStatement"
+    test: Expression
+    body: ControlBody
+}
+
+/** `do B while (c);` — `LOOP_POST` (isa-core.md §4.5, §7.2). */
+export interface DoWhileStatement
+{
+    type: "DoWhileStatement"
     test: Expression
     body: ControlBody
 }
@@ -94,6 +104,13 @@ export interface VariableDeclarator
     varType: PrimType
     id: Identifier
     init: Expression | null
+}
+
+/** `break;` — legal only as a `switch` case's own closer, where it is that
+ *  case block's `BLOCK_END` and nothing irregular (isa-core.md §10.3). */
+export interface BreakStatement
+{
+    type: "BreakStatement"
 }
 
 export interface ReturnStatement

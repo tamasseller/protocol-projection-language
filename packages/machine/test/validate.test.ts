@@ -264,33 +264,49 @@ describe("validateProgram — §8.5 header/block well-formedness", () =>
         assert.throws(() => validateProgram(program), /no open block/)
     })
 
-    test("a LOOP whose condition sub-block closes with a terminator instead of BLOCK_END is rejected", () =>
+    test("a loop whose condition sub-block closes with a terminator instead of BLOCK_END is rejected", () =>
     {
         const program: RtlProgram = {
-            procedures: [{ argCount: 0, body: [CONST(0), bare("LOOP"), bare("RETURN")] }],
+            procedures: [{ argCount: 0, body: [bare("LOOP_PRE"), CONST(0), bare("BLOCK_END"), bare("RETURN")] }],
         }
         assert.throws(() => validateProgram(program), /condition sub-block must close with BLOCK_END/)
     })
 
-    test("a LOOP body closed by a terminator (never taking the back-edge) is accepted", () =>
+    test("a LOOP_PRE body closed by a terminator (never taking the back-edge) is accepted", () =>
     {
-        // isa-core.md §7.2: a legitimate, non-cyclic use of LOOP purely to
-        // host a pre-test. The condition's own exit path (acc=0) falls
-        // through past the *whole* construct, so there must be something
-        // reachable there too — not just inside the body. §8.7: that exit
-        // edge starts acc-dead, so the reachable code needs its own producer.
+        // isa-core.md §7.2: a legitimate, non-cyclic use of the construct
+        // purely to host a pre-test. The condition's own exit path (acc=0)
+        // falls through past the *whole* construct, so there must be
+        // something reachable there too — not just inside the body. §8.7:
+        // that exit edge starts acc-dead, so it needs its own producer.
         const program: RtlProgram = {
             procedures: [{
                 argCount: 0,
                 body: [
-                    bare("LOOP"),
-                    CONST(0), bare("BLOCK_END"),  // condition sub-block
+                    bare("LOOP_PRE"),
                     CONST(5), bare("RETURN"),     // body sub-block, closed by a terminator
+                    CONST(0), bare("BLOCK_END"),  // condition sub-block
                     CONST(9), bare("RETURN"),     // reached via the condition's own exit path — fresh producer (§8.7)
                 ],
             }],
         }
         assert.doesNotThrow(() => validateProgram(program))
+    })
+
+    test("a LOOP_POST body closed by a terminator is rejected — its condition would be unreachable", () =>
+    {
+        const program: RtlProgram = {
+            procedures: [{
+                argCount: 0,
+                body: [
+                    bare("LOOP_POST"),
+                    CONST(5), bare("RETURN"),
+                    CONST(0), bare("BLOCK_END"),
+                    CONST(9), bare("RETURN"),
+                ],
+            }],
+        }
+        assert.throws(() => validateProgram(program), /condition sub-block unreachable/)
     })
 
     test("a BR_TABLE case correctly falls through to code after the whole construct", () =>
@@ -403,31 +419,32 @@ describe("validateProgram — §8.7 acc liveness across control flow", () =>
         assert.throws(() => validateProgram(program), /read of acc/)
     })
 
-    test("a LOOP body reading acc immediately after the condition closes, with no producer of its own, is rejected", () =>
+    test("a loop body reading acc on entry, with no producer of its own, is rejected", () =>
     {
         const program: RtlProgram = {
             procedures: [{
-                argCount: 0,
+                argCount: 1,
                 body: [
-                    bare("LOOP"),
+                    bare("LOOP_PRE"),
+                    PUSH(), bare("BLOCK_END"),   // body: reads acc with no producer of its own
                     CONST(1), bare("BLOCK_END"), // condition sub-block: establishes and reads acc fine
-                    PUSH(), CONST(0), bare("RETURN"), // body: reads acc with no producer of its own
+                    CONST(0), bare("RETURN"),
                 ],
             }],
         }
         assert.throws(() => validateProgram(program), /read of acc/)
     })
 
-    test("code immediately after a whole LOOP reading acc, with no producer of its own, is rejected (the loop-exit shape a fused comparison's un-materialized boolean used to break)", () =>
+    test("code immediately after a whole loop reading acc, with no producer of its own, is rejected (the loop-exit shape a fused comparison's un-materialized boolean used to break)", () =>
     {
         const program: RtlProgram = {
             procedures: [{
                 argCount: 1,
                 body: [
-                    bare("LOOP"),
-                    LOAD(0), opImm("LT_U", 5), bare("BLOCK_END"),           // condition: r0 < 5
+                    bare("LOOP_PRE"),
                     LOAD(0), opImm("ADD", 1), STORE(0), bare("BLOCK_END"), // body: r0 = r0 + 1
-                    PUSH(), CONST(0), bare("RETURN"),                            // exit edge: reads acc (the LT_U result) with no producer of its own
+                    LOAD(0), opImm("LT_U", 5), bare("BLOCK_END"),          // condition: r0 < 5
+                    PUSH(), CONST(0), bare("RETURN"),                      // exit edge: reads acc (the LT_U result) with no producer of its own
                 ],
             }],
         }
@@ -501,16 +518,16 @@ describe("validateProgram — §8.7 acc liveness across control flow", () =>
         assert.throws(() => validateProgram(program), /read of acc/)
     })
 
-    test("a LOOP whose exit code never reads acc at all is still accepted", () =>
+    test("a loop whose exit code never reads acc at all is still accepted", () =>
     {
         const program: RtlProgram = {
             procedures: [{
                 argCount: 0,
                 body: [
-                    bare("LOOP"),
-                    CONST(0), bare("BLOCK_END"), // condition: acc=0, exits every time
+                    bare("LOOP_PRE"),
                     CONST(5), bare("RETURN"),    // body (statically present, never actually taken)
-                    trap(0),                      // exit edge: TRAP never reads acc, so the exit's own liveness never matters
+                    CONST(0), bare("BLOCK_END"), // condition: acc=0, exits every time
+                    trap(0),                     // exit edge: TRAP never reads acc, so the exit's own liveness never matters
                 ],
             }],
         }

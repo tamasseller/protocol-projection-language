@@ -24,7 +24,7 @@ earlier design had `acc ≥ N` skip every case instead, which saved a
   1. Every `if` therefore emitted its condition **complemented**, purely so
   the true arm could sit at `case[0]` — a normalization step in the lowerer,
   a table of inverted operators in the spec, and a second notion of truth
-  next to `LOOP`'s own lenient condition block.
+  next to a loop's own lenient condition block.
 - The skip edge held no instructions, so nothing could be flushed onto it
   and no value could cross the merge. A ternary had to reserve a slot ahead
   of the dispatch, `STORE` into it from both arms and `LOAD` it back —
@@ -39,34 +39,43 @@ With `case[N]` present, all four disappear at once. The cost is one
 `BLOCK_END` on an `if`-without-`else`, and one on a `switch` with no
 `default:`.
 
-**`LOOP` opens two blocks.** A condition sub-block (always run, leaves a
-decision in `acc`) plus a body sub-block (run conditionally, then loops
-back to the condition) gives a pre-test `while`/`for` for one opcode and
-one pair of block closers. A single-block loop would have to either
-duplicate the condition test or re-test inside the body. The cost is that
-`do`/`while` isn't directly expressible, since the condition block has no
-"skip the test on the first pass" notion, so a bottom-test loop needs an
-explicit first-iteration flag or iteration peeling at the lowering layer
-(isa-core.md §7.2). `do`/`while` is rare in codec logic, so paying two
-bytes at the few lowering sites that need it beats complicating the one
-opcode every loop uses.
+**A loop opens two blocks, body first.** A body sub-block plus a condition
+sub-block (leaves a decision in `acc`) covers every loop for one opcode and
+one pair of block closers; a single-block loop would have to either
+duplicate the condition test or re-test inside the body.
 
-**No `break`/`continue`.** The DSL exposes no such keyword, so no lowering
-path would ever emit the opcode, and carrying one costs encoding space and
-validation surface for nothing. A loop that would `break` early folds the
-early-exit test into its condition block.
+Emitting the body first is what lets a straight-line backend produce the
+rotated shape — enter at the condition, fall out of the body into it, one
+conditional branch back — without buffering the condition in order to move
+it. That costs one taken branch an iteration where condition-first costs
+two, and it splits a range-limited branch budget in half rather than making
+one branch span both blocks.
 
-**`FALLTHROUGH` costs a byte and saves a branch.** A dispatch case that
-continues into the next one is what C's `case 0: case 1: X` needs, and the
-table's own layout already puts the next case's body immediately after this
-one — so a backend implements it by *not* emitting the branch to the merge
-that a `BLOCK_END` close needs. It is the rare opcode that makes emitted
-code smaller than the construct it replaces.
+It also makes the pre/post-test distinction one bit: `LOOP_PRE` jumps over
+the body on entry, `LOOP_POST` does not, and nothing else differs. A
+condition-first layout could not express `do`/`while` at all without a
+"skip the test on the first pass" notion inside the condition block.
 
-The restriction that it only reaches the physically next case is the same
-"no offsets" property that makes every other target structural: two labels
-cannot name one body unless they are adjacent in the table. The alternative
-is duplicating the body, which is a size decision, not an encoding one.
+**No `break`/`continue` naming a loop.** Nothing encodes a jump to an
+enclosing block's exit or to a loop's own condition, so a loop that would
+`break` early folds the early-exit test into its condition. `break` inside
+a `switch` is a different thing and is allowed: it is that case block's own
+`BLOCK_END`, not an irregular exit.
+
+**`FALLTHROUGH` and `DEFAULT` save a branch each.** A dispatch case that
+continues into the next one is what C's fallthrough needs, and the table's
+own layout already puts the next case's body immediately after this one —
+so a backend implements it by *not* emitting the branch to the merge a
+`BLOCK_END` close needs. `DEFAULT` names that dispatch's own `case[N]`
+instead, which is where a gap inside a `switch` span goes and where a case
+written before the `default:` clause falls into; a backend emits one
+forward branch for it rather than a copy of the clause.
+
+Both reach only a case of their own dispatch — the next one, or the last
+one. That is the same "no offsets" property that makes every other target
+structural, and it is why two labels can share a body only when they are
+adjacent in the table. The alternative is duplicating the body, which is a
+size decision, not an encoding one.
 
 **`TRAP` is one generic opcode, not a per-domain family.** Any consumer of
 this ISA needs a way to stop and report a reason: a codec validating a
@@ -82,7 +91,7 @@ the response. Every real ISA made the same call: x86 `INT`, ARM
 
 **A split clobbers acc unconditionally (§8.7), stricter than it needs to be
 for any program this toolchain actually produces.** `lower.ts` never
-carries acc across a `BR_TABLE`/`LOOP` boundary — `lowerReturn` always
+carries acc across a `BR_TABLE` or loop boundary — `lowerReturn` always
 freshly re-lowers its own argument, `lowerBlock` is a flat concatenation of
 independently-lowered fragments, and no statement-level construct threads
 a value through a branch boundary — so no real compiled program is made
@@ -107,33 +116,42 @@ nested inside a larger expression still takes a slot, because something
 else runs between the merge and the consumer.
 
 **`BR_TABLE 0` has no encoding.** One always-taken block is a scoped block,
-not a branch — the bare block statement the DSL excludes below, and the one
-shape `N+1` blocks would otherwise make expressible by accident. Rejecting
+not a branch, and the one shape `N+1` blocks would otherwise make
+expressible by accident. A scoped block is what `DROP` (below) does without
+a dispatch at all. Rejecting
 it at the encoding rather than in the validator costs nothing: `N = 1` has
 a dedicated single-byte code, and the extended form's operand is biased by
 2 (isa-core.md §5.4), so neither 0 nor 1 can be spelled there. That also
 makes the encoding canonical — before the bias, `N = 1` and `N = 2` each
 had two spellings a decoder accepted and an encoder had to choose between.
 
-**`N = 1` gets the dedicated code; `N = 2` gave one back.** `if`, `if-else`
-and the ternary all lower to `BR_TABLE 1`, which leaves `N = 2` meaning
-"a `switch` group with two labels" — no more special than three. Retiring
-its dedicated code freed exactly one core byte, and `FALLTHROUGH` took it:
-at one byte instead of two, sharing a case body costs the same as the empty
-gap slot it replaces. Local flow still spends five codes, and `MISC_CF`
-stays empty as the growth path for control flow the block structure cannot
-express.
+**`N = 1` gets the dedicated code, `N = 2` does not.** `if`, `if-else` and
+the ternary all lower to `BR_TABLE 1`, which leaves `N = 2` meaning "a
+`switch` group with two labels" — no more special than three.
 
-**Bare block statements are excluded from the DSL.** A `{ ... }` is only
-reachable as the direct body of `if`/`else`/`while`/`for`. `BLOCK_END` is
-what resets TOS to a block's entry depth (isa-core.md §8.1), and a
-standalone brace-block has no `BR_TABLE` case or `LOOP` sub-block behind
-it, so it would have no `BLOCK_END` to perform that reset: a local declared
-inside would never be reclaimed at the register level even though the DSL
-considers it out of scope, silently aliasing whatever register a later
-declaration receives. Disallowing bare blocks keeps "every DSL scope closes
-via a real `BLOCK_END`" a structural invariant instead of a lowering-time
-special case.
+That leaves local flow exactly five single-byte codes: `BLOCK_END`, the two
+loop openers, and `BR_TABLE`'s two forms. Every one is a whole construct or
+its universal closer. `FALLTHROUGH`, `DEFAULT` and `DROP` sit behind
+`MISC_OTHER` instead, at two bytes, because each occurs at most once per
+`switch` label or per scope — the second byte falls where nothing hot pays
+it.
+
+**A DSL scope that no block closes ends with `DROP`.** `BLOCK_END` is what
+resets TOS to a block's entry depth (isa-core.md §8.1), and two DSL scopes
+have no block behind them to do it: a standalone `{ ... }`, and a `for`
+init's declarations, which C scopes to the loop. Without a reset, a local
+declared in either would stay allocated after the DSL considers it out of
+scope, silently aliasing whatever register a later declaration receives.
+
+`DROP #n` (§4.4) is that reset without the block: it names how many slots
+go, reads nothing, and is held to the same floor §8.1 imposes on every
+closer. What holds is "every DSL scope reclaims its own slots", which a
+block boundary enforces where there is one and `DROP` where there is not.
+
+It is not a `POP`. A single-value pop has no producer anywhere in the
+toolchain, because every stack operand is consumed by the combo that reads
+it; `DROP` reclaims a whole scope's run at once and is emitted per scope,
+not per value.
 
 ---
 
@@ -223,14 +241,15 @@ price for something rare, and the wrong one for something in every loop.
 benchmark workload, both are one instruction on the target anyway, and both
 already reach a helper vector in `jit-armv6m` (`triggersLRSave`,
 `proc_scan.cpp`) — so a second byte is noise against what they already
-cost. `POP` was dropped outright rather than moved: it had no producer
-anywhere in the toolchain, because every stack operand is consumed by the
-combo that reads it and every block's `BLOCK_END` reclaims the rest.
+cost. There is no single-value `POP` at all: every stack operand is consumed
+by the combo that reads it, and every block's `BLOCK_END` reclaims the rest,
+so nothing would ever emit one.
 
 `MISC_BINARY` is held empty for the general-computing arithmetic the core
 should own rather than push onto a *domain* extension — `UDIV`/`IDIV`/`MOD`
-above all, which the DSL currently has no lowering for at all
-(`docs/dsl-limitations.md`).
+above all, which the DSL currently has no lowering for at all (isa-core.md
+§10.3). It is the one escape still empty; `MISC_UNARY` holds `CLZ`/`REVBITS`
+and `MISC_OTHER` holds `FALLTHROUGH`, `DEFAULT` and `DROP`.
 
 The candidate the original pocket displaced was a constant-synthesis op for
 low-entropy value shapes (powers of two, all-ones masks, contiguous bit

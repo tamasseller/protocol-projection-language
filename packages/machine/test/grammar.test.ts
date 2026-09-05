@@ -327,35 +327,73 @@ describe("Rejection", () =>
         assert.throws(() => parse("struct x { };"), SyntaxError)
     })
 
-    // Expected to throw — do-while is banned (top-test loops only)
-    test("rejects do-while", () =>
-    {
-        assert.throws(() => parse("do { x = x - 1; } while (x > 0);"), SyntaxError)
-    })
-
-    // Expected to throw — break/continue are banned (no intra-loop jumps)
-    test("rejects break", () =>
-    {
-        assert.throws(() => parse("while (x) { break; }"), SyntaxError)
-    })
-
+    // Expected to throw — no `continue`: nothing encodes a jump to a loop's
+    // own condition block (isa-core.md §4.5, §10.3).
     test("rejects continue", () =>
     {
         assert.throws(() => parse("while (x) { continue; }"), SyntaxError)
     })
+})
 
-    // Expected to throw — a bare `{ ... }` is not a standalone statement: a
-    // Block is only reachable as the direct body of if/else/while/for
-    // (ControlBody in grammer.pegjs), because only those positions have a
-    // real RTL block construct to reclaim the block's locals at BLOCK_END
-    // (see isa-core.md §20.2, §15.1).
-    test("rejects bare block statement at top level", () =>
+// ——————————————————————————————————————————————
+// 6. Constructs the ISA grew opcodes for
+// ——————————————————————————————————————————————
+
+describe("Post-test loops, bare blocks, break, declarator lists", () =>
+{
+    test("do-while parses as its own statement kind", () =>
     {
-        assert.throws(() => parse("u32 x = 1; { u32 y = 2; } return x;"), SyntaxError)
+        const ast = p("do { x = x - 1; } while (x > 0);")
+        assert.equal(ast.body[0].type, "DoWhileStatement")
+        assert.equal(ast.body[0].body.type, "BlockStatement")
+        assert.equal(ast.body[0].test.operator, ">")
     })
 
-    test("rejects bare block statement nested in a loop body", () =>
+    test("do-while accepts a single statement as its body", () =>
     {
-        assert.throws(() => parse("while (x) { { u32 y = 1; } }"), SyntaxError)
+        const ast = p("do x = x - 1; while (x);")
+        assert.equal(ast.body[0].type, "DoWhileStatement")
+        assert.equal(ast.body[0].body.type, "ExpressionStatement")
+    })
+
+    test("a bare block is a statement of its own", () =>
+    {
+        const ast = p("u32 x = 1; { u32 y = 2; } return x;")
+        assert.equal(ast.body.length, 3)
+        assert.equal(ast.body[1].type, "BlockStatement")
+        assert.equal(ast.body[1].body[0].declarations[0].id.name, "y")
+    })
+
+    test("a bare block nests inside a loop body", () =>
+    {
+        const ast = p("while (x) { { u32 y = 1; } }")
+        assert.equal(ast.body[0].body.body[0].type, "BlockStatement")
+    })
+
+    test("break parses inside a switch case", () =>
+    {
+        const ast = p("switch (x) { case 1: y = 1; break; }")
+        const consequent = ast.body[0].cases[0].consequent
+        assert.equal(consequent.length, 2)
+        assert.equal(consequent[1].type, "BreakStatement")
+    })
+
+    test("one type name covers a comma-separated declarator list", () =>
+    {
+        const ast = p("u16 a, b = 2, c;")
+        const decls = ast.body[0].declarations
+        assert.equal(decls.length, 3)
+        assert.deepEqual(decls.map((d: {id: {name: string}}) => d.id.name), ["a", "b", "c"])
+        assert.deepEqual(decls.map((d: {varType: string}) => d.varType), ["u16", "u16", "u16"])
+        assert.equal(decls[0].init, null)
+        assert.equal(decls[1].init.value, 2)
+        assert.equal(decls[2].init, null)
+    })
+
+    test("a for init takes a declarator list too", () =>
+    {
+        const ast = p("for (u32 i = 0, n = 8; i < n; i++) x = x + i;")
+        assert.equal(ast.body[0].init.type, "VariableDeclaration")
+        assert.equal(ast.body[0].init.declarations.length, 2)
     })
 })

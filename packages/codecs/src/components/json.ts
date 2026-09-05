@@ -173,7 +173,7 @@ function jsonUnionBody(match: UnionFieldsMatch, depth: number, resolve: Resolve)
     match.variantMatches.forEach((v, variantIndex) =>
     {
         cases.push(allUnit
-            ? ir`case ${variantIndex}: ${emitLiteral(`"${v.name}"`)}`
+            ? ir`case ${variantIndex}: ${emitLiteral(`"${v.name}"`)} break;`
             // The payload is resolved at the *same* depth, not depth+1 —
             // `{"name": ...}` is an inline wrapper, not its own nesting
             // level the way a struct's braces are.
@@ -182,6 +182,7 @@ function jsonUnionBody(match: UnionFieldsMatch, depth: number, resolve: Resolve)
                     ${emitLiteral(`{"${v.name}": `)}
                     call_codec(${resolve(v.type, depth)}, 0, ${variantIndex});
                     ${emitLiteral("}")}
+                    break;
               `)
     })
 

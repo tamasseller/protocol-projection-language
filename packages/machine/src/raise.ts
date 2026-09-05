@@ -95,9 +95,10 @@ export const enum StmtKind
      *  (isa-rationale.md), and nothing here recovers which DSL surface form
      *  produced it (nor does a target backend need to know). */
     Dispatch = "dispatch",
-    /** One LOOP: `cond` statements compute `test`, evaluated before every
-     *  iteration (including the first); `body` runs while `test` is
-     *  non-zero. */
+    /** One loop: `cond` statements compute `test`, and `body` runs while
+     *  `test` is non-zero. `pre` says whether the test is evaluated before
+     *  the first iteration too (`LOOP_PRE`) or only after each one
+     *  (`LOOP_POST`) — isa-core.md §4.5. */
     Loop = "loop",
     /** A procedure RETURN. */
     Return = "return",
@@ -109,7 +110,7 @@ export type Stmt<E extends { ext: string } = ExtOpPayload> =
     | {kind: StmtKind.Assign; slot: number; value: Expr<E>}
     | {kind: StmtKind.ExprStmt; value: Expr<E>}
     | {kind: StmtKind.Dispatch; test: Expr<E>; cases: Stmt<E>[][]}
-    | {kind: StmtKind.Loop; cond: Stmt<E>[]; test: Expr<E>; body: Stmt<E>[]}
+    | {kind: StmtKind.Loop; pre: boolean; cond: Stmt<E>[]; test: Expr<E>; body: Stmt<E>[]}
     | {kind: StmtKind.Return; value: Expr<E>}
     | {kind: StmtKind.Trap; code: number}
 
@@ -164,7 +165,7 @@ type PendingAcc<E extends { ext: string } = ExtOpPayload> = {expr: Expr<E>; pure
  *  `"terminated"` reaches nothing. `trailing` is the acc value it left, on
  *  the two closes that leave one. */
 type Arm<E extends { ext: string } = ExtOpPayload> =
-    {stmts: Stmt<E>[]; trailing?: PendingAcc<E>; close: "end" | "fall" | "terminated"}
+    {stmts: Stmt<E>[]; trailing?: PendingAcc<E>; close: "end" | "fall" | "default" | "terminated"}
 
 class Raiser<E extends { ext: string } = ExtOpPayload>
 {
@@ -348,8 +349,18 @@ class Raiser<E extends { ext: string } = ExtOpPayload>
      *  in that arm and only that arm. */
     private foldFallthrough(arms: Arm<E>[]): Stmt<E>[][]
     {
+        // Right to left, so a chain of them lands whole: by the time arm k
+        // is folded, arm k+1 already carries everything it continues into.
+        // `DEFAULT` names the last arm rather than the next one, and that
+        // arm is fully folded from the start — it continues into nothing.
         for(let k = arms.length - 2; k >= 0; k--)
-            if(arms[k]!.close === "fall") arms[k]!.stmts = [...arms[k]!.stmts, ...arms[k + 1]!.stmts]
+        {
+            const into = arms[k]!.close === "fall" ? arms[k + 1]
+                : arms[k]!.close === "default" ? arms[arms.length - 1]
+                : undefined
+
+            if(into) arms[k]!.stmts = [...arms[k]!.stmts, ...into.stmts]
+        }
 
         return arms.map(a => a.stmts)
     }
@@ -410,6 +421,14 @@ class Raiser<E extends { ext: string } = ExtOpPayload>
                     this.pc++
                     continue
 
+                case "DROP":
+                    // Slots going out of scope (isa-core.md §4.4). Nothing
+                    // is emitted: a target's own locals die with the block
+                    // they were declared in, and acc is untouched.
+                    this.tos -= i.imm
+                    this.pc++
+                    continue
+
                 case "ADD": case "SUB": case "RSUB": case "MUL":
                 case "AND": case "OR": case "XOR": case "SHL": case "SHR": case "ASR":
                 case "EQ": case "NE":
@@ -456,6 +475,13 @@ class Raiser<E extends { ext: string } = ExtOpPayload>
                     return {stmts, trailing, close: "fall"}
                 }
 
+                case "DEFAULT":
+                {
+                    const trailing = this.acc
+                    this.pc++
+                    return {stmts, trailing, close: "default"}
+                }
+
                 case "BR_TABLE":
                 {
                     const prev = this.acc
@@ -476,19 +502,24 @@ class Raiser<E extends { ext: string } = ExtOpPayload>
                         arms.push(this.withBlock(() => this.blockBody()))
                     }
 
-                    // A case that fell through ends where the case it ran
-                    // into ends, so that one's close and value are what
-                    // reach the merge from it. Its own trailing value is
-                    // dropped where it stands (§4.5: the next case starts
-                    // with acc dead), which for an impure one still means
+                    // A case that continued into another ends where that
+                    // one ends, so its close and value are what reach the
+                    // merge from it. Its own trailing value is dropped
+                    // where it stands (§4.5: the case it enters starts with
+                    // acc dead), which for an impure one still means
                     // keeping the side effect.
                     const reaching = arms.map(a => a)
                     for(let k = arms.length - 2; k >= 0; k--)
-                        if(reaching[k]!.close === "fall")
-                            reaching[k] = {stmts: reaching[k]!.stmts, close: reaching[k + 1]!.close, trailing: reaching[k + 1]!.trailing}
+                    {
+                        const into = reaching[k]!.close === "fall" ? reaching[k + 1]
+                            : reaching[k]!.close === "default" ? reaching[arms.length - 1]
+                            : undefined
+
+                        if(into) reaching[k] = {stmts: reaching[k]!.stmts, close: into.close, trailing: into.trailing}
+                    }
 
                     for(const a of arms)
-                        if(a.close === "fall" && a.trailing && !a.trailing.pure)
+                        if((a.close === "fall" || a.close === "default") && a.trailing && !a.trailing.pure)
                             a.stmts.push({kind: StmtKind.ExprStmt, value: a.trailing.expr})
 
                     const cases = this.foldFallthrough(arms)
@@ -519,11 +550,13 @@ class Raiser<E extends { ext: string } = ExtOpPayload>
                     continue
                 }
 
-                case "LOOP":
+                case "LOOP_PRE":
+                case "LOOP_POST":
                 {
+                    const pre = i.op === "LOOP_PRE"
                     this.pc++
                     // Not a raw reset: whatever's pending here is whatever
-                    // ran immediately before this LOOP (e.g. listEncodeRule's
+                    // ran immediately before the loop (e.g. listEncodeRule's
                     // own `write(0, W, left);` right before its `while`) —
                     // whose side effect must still land in `stmts`, exactly
                     // like every other "acc's about to become untrustworthy"
@@ -532,15 +565,17 @@ class Raiser<E extends { ext: string } = ExtOpPayload>
                     // bug this comment is now here to stop reintroducing.
                     this.killAcc(stmts)
 
-                    const {stmts: condStmts, trailing} = this.withBlock(() => this.blockBody())
-                    if(!trailing) throw new Error(`raise: LOOP condition block left no test value at pc ${this.pc}`)
-                    // Same reasoning as BR_TABLE's own case above: the loop
-                    // body may open with a bare RETURN/TRAP.
+                    // Body first (isa-core.md §7.2), entered dead under
+                    // both openers (§8.7). `closedBlock` leaves acc unknown
+                    // again, which is what the condition block starts from.
                     this.acc = this.unknownAcc()
-
                     const body = this.withBlock(() => this.closedBlock())
 
-                    stmts.push({kind: StmtKind.Loop, cond: condStmts, test: trailing.expr, body})
+                    const {stmts: condStmts, trailing} = this.withBlock(() => this.blockBody())
+                    if(!trailing) throw new Error(`raise: loop condition block left no test value at pc ${this.pc}`)
+                    this.acc = this.unknownAcc()
+
+                    stmts.push({kind: StmtKind.Loop, pre, cond: condStmts, test: trailing.expr, body})
                     continue
                 }
 

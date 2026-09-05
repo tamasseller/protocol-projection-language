@@ -26,25 +26,23 @@ Program
 // 2. Statements
 // ---------------------------------------------------------------------
 Statement
-  = _ s:(IfStatement
+  = _ s:(Block
+  / IfStatement
+  / DoWhileStatement
   / WhileStatement
   / ForStatement
   / SwitchStatement
   / DeclarationStatement
+  / BreakStatement
   / ReturnStatement
   / ExpressionStatement) { return s; }
 
 // The single construct directly governed by if/else/while/for: either a
-// brace-delimited block or one bare statement. A `Block` is reachable only
-// here — it is deliberately not a `Statement` in its own right, so a bare
-// `{ ... }` cannot appear as a standalone statement (e.g. nested inside
-// another block, or at the top level of a procedure body). Every `Block`
-// reached via `ControlBody` is the immediate body of a branch or loop, so it
-// always has a real RTL block construct (a `BR_TABLE` case or a `LOOP` body
-// block) backing it — see docs/isa-core.md §10.2/§10.3 and §8.1. A `Block` with
-// no such construct behind it would have no `BLOCK_END` to reclaim its
-// locals' TOS depth at, silently corrupting register allocation for any
-// declaration that follows it.
+// brace-delimited block or one bare statement. In this position the `Block`
+// *is* the branch's or loop's own RTL block, so its locals go out with that
+// block's `BLOCK_END`; standalone (as an ordinary `Statement`) nothing closes
+// it and the lowering ends the scope with a `DROP` instead — see
+// docs/isa-core.md §4.4 and §10.2.
 ControlBody
   = Block
   / Statement
@@ -63,6 +61,11 @@ IfStatement
 WhileStatement
   = "while" _ "(" _ test:Expression _ ")" _ body:ControlBody {
       return { type: "WhileStatement", test, body };
+    }
+
+DoWhileStatement
+  = "do" _ body:ControlBody _ "while" _ "(" _ test:Expression _ ")" _ ";" {
+      return { type: "DoWhileStatement", test, body };
     }
 
 ForStatement
@@ -90,12 +93,19 @@ SwitchCase
       return { type: "SwitchCase", test: null, consequent };
     }
 
+// One type name, then any number of comma-separated declarators sharing it.
+// Each is its own push, in order, exactly as if written on separate lines.
 DeclarationStatement
-  = varType:TypeName _ id:Identifier _ init:("=" _ expr:Expression { return expr; })? _ ";" { 
-      return { 
-        type: "VariableDeclaration", 
-        declarations: [{ type: "VariableDeclarator", varType, id, init: init !== null ? init : null }]
-      }; 
+  = varType:TypeName _ head:Declarator tail:(_ "," _ d:Declarator { return d; })* _ ";" {
+      return {
+        type: "VariableDeclaration",
+        declarations: [head, ...tail].map(d => ({ type: "VariableDeclarator", varType, id: d.id, init: d.init }))
+      };
+    }
+
+Declarator
+  = id:Identifier _ init:("=" _ expr:Expression { return expr; })? {
+      return { id, init: init !== null ? init : null };
     }
 
 // The six primitive types. Order matters only in that no name is a prefix
@@ -103,6 +113,11 @@ DeclarationStatement
 TypeName "type name"
   = name:("u32" / "u16" / "u8" / "i32" / "i16" / "i8") !([a-zA-Z0-9_]) {
       return name;
+    }
+
+BreakStatement
+  = "break" _ ";" {
+      return { type: "BreakStatement" };
     }
 
 ReturnStatement
@@ -269,7 +284,7 @@ Identifier
 
 ReservedWord
   = ( "if" / "else" / "while" / "for" / "switch" / "case" / "default"
-    / "break" / "continue" / "return"
+    / "do" / "break" / "continue" / "return"
     / "u32" / "u16" / "u8" / "i32" / "i16" / "i8"
     ) !([a-zA-Z0-9_])
 

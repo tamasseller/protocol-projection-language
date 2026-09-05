@@ -121,12 +121,20 @@ export const UNARY_ALU_OPS: ReadonlySet<string> = new Set<UnaryOpcode>([
 export type ControlOpcode =
     | "RETURN"
     | "BLOCK_END"
-    | "LOOP"
+    | "LOOP_PRE"
+    | "LOOP_POST"
     | "FALLTHROUGH"
+    | "DEFAULT"
 
 /** The block closers: `BLOCK_END` leaves the construct, `FALLTHROUGH`
- *  continues into the next case (§4.5). */
-export const BLOCK_CLOSERS: ReadonlySet<string> = new Set(["BLOCK_END", "FALLTHROUGH"])
+ *  continues into the next case, `DEFAULT` into that dispatch's own last
+ *  one (§4.5). */
+export const BLOCK_CLOSERS: ReadonlySet<string> = new Set(["BLOCK_END", "FALLTHROUGH", "DEFAULT"])
+
+/** The two loop openers, which differ only in where the construct is
+ *  entered (§4.5) — every consumer that only counts sub-blocks wants this
+ *  rather than either name. */
+export const isLoopOpcode = (op: string): boolean => op === "LOOP_PRE" || op === "LOOP_POST"
 
 /** Move-class opcodes with a register operand — unfused local access, no
  *  ALU combining (§4.4). */
@@ -197,8 +205,9 @@ export type BaseRtlInstr =
     // 4. Bare: unary ALU (acc in place), no-operand move (PUSH), and
     //    no-operand control flow.
     | { op: UnaryOpcode | ControlOpcode | "PUSH" }
-    // 5. Parametric: single numeric parameter (BR_TABLE case count, TRAP code).
-    | { op: "BR_TABLE" | "TRAP"; imm: number }
+    // 5. Parametric: single numeric parameter (BR_TABLE case count, TRAP
+    //    code, DROP's slot count).
+    | { op: "BR_TABLE" | "TRAP" | "DROP"; imm: number }
     // 6. Call: procedure invocation by resolved procedure-table index
     //    (isa-core.md §2.3, §4.6) — never a bare name; resolving a callee
     //    name to its table index is `lower.ts`'s job, on the fly, as it
@@ -240,8 +249,8 @@ export type ExtInstr = ExtInstrOf
 export const isExtInstr = <E extends { ext: string } = ExtOpPayload>(i: RtlInstr<E>): i is ExtInstrOf<E> =>
     i.op === "EXT"
 
-export const isParametricInstr = <E extends { ext: string } = ExtOpPayload>(i: RtlInstr<E>): i is Extract<RtlInstr<E>, { op: "BR_TABLE" | "TRAP" }> =>
-    i.op === "BR_TABLE" || i.op === "TRAP"
+export const isParametricInstr = <E extends { ext: string } = ExtOpPayload>(i: RtlInstr<E>): i is Extract<RtlInstr<E>, { op: "BR_TABLE" | "TRAP" | "DROP" }> =>
+    i.op === "BR_TABLE" || i.op === "TRAP" || i.op === "DROP"
 
 export const isRegComboInstr = <E extends { ext: string } = ExtOpPayload>(i: RtlInstr<E>): i is Extract<RtlInstr<E>, { combo: RegCombo }> =>
     "combo" in i && (i.combo === "REG_ACC" || i.combo === "REG_REG")
@@ -288,9 +297,14 @@ export const opStack = <E extends { ext: string } = ExtOpPayload>(op: BinaryOpco
     ({ op, combo })
 
 /** Bare unary ALU (`NEG`, `NOT`, `CLZ`, `REVBITS`) or no-operand control flow
- *  (`RETURN`, `BLOCK_END`, `LOOP`). */
+ *  (`RETURN`, `BLOCK_END`, `LOOP_PRE`, ...). */
 export const bare = <E extends { ext: string } = ExtOpPayload>(op: UnaryOpcode | ControlOpcode): RtlInstr<E> =>
     ({ op })
+
+/** `DROP #n` — reclaim `n` slots at a scope that ends where no block
+ *  boundary does (isa-core.md §4.4). `n` is at least 1. */
+export const drop = <E extends { ext: string } = ExtOpPayload>(n: number): RtlInstr<E> =>
+    ({ op: "DROP", imm: n })
 
 /** `BR_TABLE #n` — open a dispatch with `n` indexed cases plus a default
  *  case (isa-core.md §4.5: `n + 1` blocks in all). `n` is at least 1. */
@@ -361,7 +375,7 @@ function blockClose<E extends { ext: string } = ExtOpPayload>(body: readonly Rtl
     {
         const i = body[pc]!
 
-        if(i.op === "BR_TABLE" || i.op === "LOOP")
+        if(i.op === "BR_TABLE" || isLoopOpcode(i.op))
         {
             let p = pc + 1
             let reaches = false
@@ -381,7 +395,7 @@ function blockClose<E extends { ext: string } = ExtOpPayload>(body: readonly Rtl
         }
 
         if(i.op === "BLOCK_END") return {next: pc + 1, exits: true, reachable}
-        if(i.op === "FALLTHROUGH" || i.op === "RETURN" || i.op === "TRAP") return {next: pc + 1, exits: false, reachable}
+        if(i.op === "FALLTHROUGH" || i.op === "DEFAULT" || i.op === "RETURN" || i.op === "TRAP") return {next: pc + 1, exits: false, reachable}
 
         pc++
     }
@@ -423,6 +437,7 @@ export function reachesEnd<E extends { ext: string } = ExtOpPayload>(fragment: r
 //   RETURN / BLOCK_END / ...    bare control
 //   BR_TABLE 3                  parametric
 //   TRAP 0                      parametric
+//   DROP #2                     parametric
 //   CALL 2                      call
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -460,6 +475,8 @@ export function format(instr: RtlInstr): string
         return `BR_TABLE ${instr.imm}`
     if (instr.op === "TRAP")
         return `TRAP ${instr.imm}`
+    if (instr.op === "DROP")
+        return `DROP #${instr.imm}`
 
     // Move-class
     if (instr.op === "LOAD" || instr.op === "STORE")

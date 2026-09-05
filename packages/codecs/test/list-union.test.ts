@@ -46,11 +46,11 @@ describe("codec extension — list of u8 (COUNT/OPEN_LIST/ENTER_NEXT/CALL_CODEC_
 
         return [
             ...prelude,
-            bare("LOOP"),
-            LOAD(0), opImm("NE", 0), bare("BLOCK_END"),
+            bare("LOOP_PRE"),
             callCodecNextInstr(1, 0),
             LOAD(0), opImm("SUB", 1), STORE(0),
             bare("BLOCK_END"),
+            LOAD(0), opImm("NE", 0), bare("BLOCK_END"),
             CONST(0), bare("RETURN"),
         ]
     }

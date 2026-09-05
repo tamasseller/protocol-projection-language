@@ -6,6 +6,7 @@ import "./ts-alternative-rules.runtime.test"
 import "./codec-codegen.runtime.test"
 import "./codec-codegen-alt-rules.runtime.test"
 import "./binary-op-codegen.runtime.test"
+import "./control-flow-codegen.runtime.test"
 import "./bridging-codec.runtime.test"
 
 import {generateJsTypes, generateJsCodecs} from "../src/index"

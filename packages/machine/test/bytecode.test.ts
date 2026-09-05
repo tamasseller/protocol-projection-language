@@ -20,7 +20,7 @@ import {
     encodeProgram, decodeProgram, encodeLeb128, decodeLeb128,
 } from "../src/bytecode"
 import {
-    opReg, opRegWriteback, opStack, opImm, bare, brTable, trap, call,
+    opReg, opRegWriteback, opStack, opImm, bare, brTable, drop, trap, call,
     LOAD, STORE, PUSH, CONST,
 } from "../src/rtl"
 import type { RtlInstr, RtlProgram, BinaryOpcode } from "../src/rtl"
@@ -56,9 +56,9 @@ const UNARY = ["NEG", "NOT", "SXTB", "SXTH", "UXTB", "UXTH"] as const
 for (const [i, op] of UNARY.entries())
     rows.push({ byte: 90 + i, instr: bare(op) })
 rows.push({ byte: 96, instr: bare("BLOCK_END") })
-rows.push({ byte: 97, instr: bare("LOOP") })
-rows.push({ byte: 98, instr: brTable(1) })
-rows.push({ byte: 99, instr: bare("FALLTHROUGH") })
+rows.push({ byte: 97, instr: bare("LOOP_PRE") })
+rows.push({ byte: 98, instr: bare("LOOP_POST") })
+rows.push({ byte: 99, instr: brTable(1) })
 rows.push({ byte: 100, instr: brTable(2) })
 rows.push({ byte: 101, instr: call(REG) })
 rows.push({ byte: 102, instr: bare("RETURN") })
@@ -71,17 +71,23 @@ rows.push({ byte: 108, instr: CONST(EXT_IMM) })
 for (let k = 0; k <= 15; k++)
     rows.push({ byte: 109 + k, instr: CONST(k) })
 
-// §5.3's three escapes. Only MISC_UNARY has assigned sub-codes.
+// §5.3's three escapes. MISC_BINARY is the one with nothing assigned yet.
 const MISC_BYTES = [125, 126, 127]
 const miscRows: { byte: number; sub: number; instr: RtlInstr }[] = [
     { byte: 126, sub: 0, instr: bare("REVBITS") },
     { byte: 126, sub: 1, instr: bare("CLZ") },
+    { byte: 127, sub: 0, instr: bare("FALLTHROUGH") },
+    { byte: 127, sub: 1, instr: bare("DEFAULT") },
+    { byte: 127, sub: 3, instr: drop(1) },
+    { byte: 127, sub: 4, instr: drop(2) },
+    { byte: 127, sub: 5, instr: drop(3) },
+    { byte: 127, sub: 6, instr: drop(4) },
 ]
 const miscRejected: [number, number, RegExp][] = [
     [125, 0, /sub-code 0 is reserved/],
     [125, 1, /sub-code 1 is reserved/],
     [126, 2, /sub-code 2 is reserved/],
-    [127, 0, /sub-code 0 is reserved/],
+    [127, 7, /sub-code 7 is reserved/],
     [127, 9, /sub-code 9 is reserved/],
 ]
 
@@ -178,7 +184,7 @@ describe("Bytecode codec — small/extended boundary cases", () =>
 
     test("BR_TABLE: N=1 is dedicated, N>=2 is the extended form biased by 2", () =>
     {
-        assert.deepEqual(encodeInstr(brTable(1)), [98])
+        assert.deepEqual(encodeInstr(brTable(1)), [99])
         assert.deepEqual(encodeInstr(brTable(2)), [100, 0])
         assert.deepEqual(encodeInstr(brTable(3)), [100, 1])
         assert.deepEqual(encodeInstr(brTable(130)), [100, 128, 1])
@@ -234,15 +240,15 @@ describe("Bytecode codec — full-body round trip", () =>
     test("a small procedure body round-trips exactly", () =>
     {
         // u32 n = 5; while (n != 1) { n = n >> 1; } return n; — a plausible
-        // shape (LOOP, comparison, shift, arithmetic write-back, RETURN),
+        // shape (a loop, comparison, shift, arithmetic write-back, RETURN),
         // not a real lowered procedure (no register allocation performed
-        // here, just instruction variety).
+        // here, just instruction variety). Body block first (§7.2).
         const body: RtlInstr[] = [
             CONST(5), STORE(0),
-            bare("LOOP"),
-            LOAD(0), opImm("NE", 1),
-            bare("BLOCK_END"),
+            bare("LOOP_PRE"),
             LOAD(0), opImm("SHR", 1), STORE(0),
+            bare("BLOCK_END"),
+            LOAD(0), opImm("NE", 1),
             bare("BLOCK_END"),
             LOAD(0), bare("RETURN"),
         ]
@@ -340,19 +346,19 @@ describe("Bytecode codec — program framing (isa-core.md §5.5)", () =>
         assert.deepEqual([...bytes], [2, 0, 102, 0, 109 + 1, 102])
     })
 
-    test("a LOOP body block closed by a bare terminator (isa-core.md §7.2) still self-delimits correctly", () =>
+    test("a loop body block closed by a bare terminator (isa-core.md §7.2) still self-delimits correctly", () =>
     {
-        // The one shape decodeProcBody's frame-*kind* tracking exists for:
-        // a terminator that closes an inner loop must not be mistaken for
-        // the end of the whole procedure when an outer scope's own bytes
-        // still follow it.
+        // A terminator closing the *first* sub-block leaves the frame open
+        // for the condition, so it must not be mistaken for the end of the
+        // whole procedure.
         const program: RtlProgram = {
             procedures: [
                 {
                     argCount: 0,
                     body: [
-                        CONST(1), bare("LOOP"), bare("BLOCK_END"),
-                        CONST(42), bare("RETURN"), // bare terminator closes the loop body — not the procedure
+                        bare("LOOP_PRE"),
+                        CONST(42), bare("RETURN"), // bare terminator closes the body block — not the procedure
+                        CONST(1), bare("BLOCK_END"),
                         CONST(0), bare("RETURN"),  // the outer scope's own tail, reached via the cond-false exit
                     ],
                 },
@@ -365,18 +371,31 @@ describe("Bytecode codec — program framing (isa-core.md §5.5)", () =>
         assert.equal(decoded.next, bytes.length)
     })
 
-    test("a terminator does not close a LOOP's condition sub-block (isa-core.md §8.5)", () =>
+    test("a terminator does not close a loop's condition sub-block (isa-core.md §8.5)", () =>
     {
-        // §7.2 lets a LOOP's *body* close with a bare terminator, but its
-        // condition needs BLOCK_END. Counting one there would close the
-        // loop a sub-block early and run the walk into whatever follows
-        // this procedure; leaving the frame open makes it a decode error.
+        // §7.2 lets a loop's *body* close with a bare terminator, but its
+        // condition — the second sub-block — needs BLOCK_END. Counting one
+        // there would close the loop early and run the walk into whatever
+        // follows this procedure; leaving the frame open makes it a decode
+        // error instead.
         const bytes = encodeBody([
-            bare("LOOP"), CONST(1), bare("RETURN"),
+            bare("LOOP_PRE"), CONST(1), bare("BLOCK_END"), CONST(1), bare("RETURN"),
             CONST(0), bare("RETURN"),
         ])
         assert.throws(() => decodeProgram(Uint8Array.from([1, 0, ...bytes])),
             /ran off the end of the buffer/)
+    })
+
+    test("DROP's small and extended forms both round-trip (isa-core.md §5.4)", () =>
+    {
+        for(const n of [1, 2, 3, 4, 5, 6, 100, 1000])
+        {
+            const encoded = encodeInstr(drop(n))
+            assert.equal(encoded.length, n <= 4 ? 2 : n <= 132 ? 3 : 4, `DROP #${n}: wrong length`)
+            assert.deepEqual(decodeInstr(Uint8Array.from(encoded), 0).instr, drop(n))
+        }
+
+        assert.throws(() => encodeInstr(drop(0)), /not encodable/)
     })
 
     test("a BR_TABLE case closed by a bare terminator (isa-core.md §8.5) still counts against N and self-delimits correctly", () =>

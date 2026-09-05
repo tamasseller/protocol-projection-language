@@ -13,11 +13,11 @@
  */
 
 import type {
-    Statement, ControlBody, IfStatement, WhileStatement,
-    ForStatement, SwitchStatement, VariableDeclaration, ReturnStatement,
-    ExpressionStatement, Expression,
+    Statement, ControlBody, BlockStatement, IfStatement, WhileStatement,
+    DoWhileStatement, ForStatement, SwitchStatement, SwitchCase,
+    VariableDeclaration, ReturnStatement, ExpressionStatement, Expression,
 } from "./ast"
-import {RtlProc, RtlProgram, RtlInstr, bare, brTable, CONST, PUSH, LOAD, opImm, trap, fallsThrough, reachesEnd} from "./rtl"
+import {RtlProc, RtlProgram, RtlInstr, bare, brTable, drop, CONST, PUSH, LOAD, opImm, trap, fallsThrough, reachesEnd} from "./rtl"
 import type {ExtOpPayload} from "./rtl"
 import type {RtlNode} from "./east"
 import type {Procedure} from "./ir"
@@ -28,7 +28,6 @@ import {returnsValue} from "./signature"
 import type {ProcSignature} from "./types"
 import {lift, conditionalToAcc, assignedConditionalToAcc} from "./lift"
 import {tileExpression} from "./expr"
-import {instrBytes} from "./encoding"
 import type {TileRequest} from "./expr"
 import type {Extension} from "./extension"
 
@@ -190,12 +189,23 @@ function closeProcBody<E extends { ext: string } = ExtOpPayload>(body: RtlInstr<
     return [...body, bare<E>("RETURN")]
 }
 
+/**
+ * Statements after one that cannot fall through are dropped rather than
+ * emitted: §8.4 rejects an instruction following a terminator in the same
+ * block, and C says such a statement can never run anyway. Only a
+ * construct that emits no block of its own — a `do`/`while` whose body
+ * always terminates — reaches this, since every real block structurally
+ * continues into its own merge whatever its arms do.
+ */
 function lowerBlock<E extends { ext: string } = ExtOpPayload>(stmts: readonly Statement[], alloc: RegAlloc<E>): RtlInstr<E>[]
 {
     const ret: RtlInstr<E>[] = []
 
     for(const s of stmts)
+    {
         ret.push(...lowerStmt(s, alloc))
+        if(!fallsThrough(ret)) break
+    }
 
     return ret
 }
@@ -206,10 +216,13 @@ function lowerStmt<E extends { ext: string } = ExtOpPayload>(stmt: Statement, al
     {
         case "ExpressionStatement": return lowerExprStmt(stmt, alloc)
         case "VariableDeclaration": return lowerVarDecl(stmt, alloc)
+        case "BlockStatement": return lowerBareBlock(stmt, alloc)
         case "IfStatement": return lowerIf(stmt, alloc)
         case "SwitchStatement": return lowerSwitch(stmt, alloc)
         case "WhileStatement": return lowerWhile(stmt, alloc)
+        case "DoWhileStatement": return lowerDoWhile(stmt, alloc)
         case "ForStatement": return lowerFor(stmt, alloc)
+        case "BreakStatement": throw new Error(`break outside a switch case: the ISA has no opcode for irregular exit (isa-core.md §4.5, §10.3)`)
         case "ReturnStatement": return lowerReturn(stmt, alloc)
         default: throw new Error(`Unsupported statement type: ${stmt}`)
     }
@@ -227,6 +240,28 @@ function lowerControlBody<E extends { ext: string } = ExtOpPayload>(body: Contro
     return body.type === "BlockStatement"
         ? lowerBlock(body.body, alloc)
         : lowerStmt(body, alloc)
+}
+
+/**
+ * A standalone `{ ... }`, backed by no block construct at all: its locals
+ * are ordinary pushes in the enclosing block, and `DROP #n` is what ends
+ * the scope (isa-core.md §4.4). The enclosing scope's own numbering is
+ * therefore unchanged — the slots are genuinely reclaimed, not skipped
+ * past. Nothing is dropped where no path reaches the end, which would be
+ * dead code (§8.4).
+ */
+function lowerBareBlock<E extends { ext: string } = ExtOpPayload>(s: BlockStatement, alloc: RegAlloc<E>): RtlInstr<E>[]
+{
+    const scope = new RegAlloc<E>(alloc)
+    const body = lowerBlock(s.body, scope)
+    return [...body, ...scopeCleanup(scope.depth - alloc.depth, fallsThrough(body))]
+}
+
+/** `DROP #n` closing a scope that no `BLOCK_END` closes — omitted when
+ *  there is nothing to reclaim, or when nothing reaches here (§8.4). */
+function scopeCleanup<E extends { ext: string } = ExtOpPayload>(slots: number, reached: boolean = true): RtlInstr<E>[]
+{
+    return slots > 0 && reached ? [drop<E>(slots)] : []
 }
 
 function lowerExprStmt<E extends { ext: string } = ExtOpPayload>(s: ExpressionStatement, alloc: RegAlloc<E>): RtlInstr<E>[]
@@ -354,16 +389,20 @@ function lowerIf<E extends { ext: string } = ExtOpPayload>(s: IfStatement, alloc
  */
 const CHAIN_LINK_BYTES = 7
 
+/** What one missing label inside a merged span costs. A gap cannot share
+ *  `case[N]`'s code — `BR_TABLE`'s index is exact below `N` — so it needs a
+ *  case of its own: a lone `DEFAULT` (two bytes) to reach the `default:`
+ *  clause, or a lone `BLOCK_END` (one) where there is no clause to reach
+ *  and falling out of the construct is already what "no label matched"
+ *  means. Neither depends on how big the clause itself is, which is what
+ *  makes merging worth considering at all for a switch that has one. */
+const gapCost = (hasDefault: boolean): number => hasDefault ? 2 : 1
+
 /** Ascending labels into runs — a label is a *value*, not a position, so
  *  only consecutive ones map onto `BR_TABLE`'s index directly.
  *
- *  Two runs are worth merging into one table whenever the gap between them
- *  is cheaper than the second table that would otherwise separate them. A
- *  gap costs one copy of the default block per missing label (`gapBytes`),
- *  since `BR_TABLE`'s index is exact below `N` and a gap therefore cannot
- *  share `case[N]`'s code. With no `default:` clause that is a lone
- *  `BLOCK_END`; a substantial one makes merging never worth it, which is
- *  the right answer rather than a special case. */
+ *  Two runs are worth merging into one table whenever the gaps between them
+ *  cost less than the second table that would otherwise separate them. */
 function switchGroups(labels: readonly number[], gapBytes: number): number[][]
 {
     const groups: number[][] = [[labels[0]!]]
@@ -388,6 +427,59 @@ function caseLabel(test: Expression): number
     return test.value >>> 0
 }
 
+/**
+ * A clause's statements with a trailing `break;` taken off. That `break` is
+ * not an irregular exit — it is exactly this case block's own `BLOCK_END`
+ * (isa-core.md §10.3), so removing it here is all it takes. One anywhere
+ * else in the body would be a jump to the merge from inside a nested
+ * block, which nothing encodes; `lowerStmt` rejects those where it finds
+ * them.
+ */
+function trimBreak(c: SwitchCase): {stmts: Statement[]; breaks: boolean}
+{
+    const last = c.consequent[c.consequent.length - 1]
+
+    return last?.type === "BreakStatement"
+        ? {stmts: c.consequent.slice(0, -1), breaks: true}
+        : {stmts: c.consequent, breaks: false}
+}
+
+type SwitchClause = {label: number | null; stmts: Statement[]; breaks: boolean}
+
+/**
+ * What closes clause `i`, from C's rule that a case body with no `break`
+ * runs on into whatever is written *next in the source*.
+ *
+ * Emission order is label-value order, and `FALLTHROUGH` continues into the
+ * case physically next in the table (isa-core.md §4.5), so the two only
+ * agree when the source-next clause is the value-next label. `DEFAULT`
+ * covers the one other direction that is expressible — into a `default:`
+ * clause, which is `case[N]` wherever it was written. Everything else wants
+ * a branch naming a block, and is rejected rather than mis-lowered (§7.1).
+ */
+function caseCloser(clauses: readonly SwitchClause[], i: number): "BLOCK_END" | "FALLTHROUGH" | "DEFAULT"
+{
+    const self = clauses[i]!
+    const next = clauses[i + 1]
+
+    // A `break`, or nothing written after this clause at all: C leaves the
+    // switch either way.
+    if(self.breaks || !next) return "BLOCK_END"
+
+    if(next.label === null) return "DEFAULT"
+
+    if(self.label === null)
+        throw new Error(`The default clause falls through into case ${next.label}: ` +
+            `write it last, or end it with break — nothing names a specific case to continue into`)
+
+    if(next.label !== self.label + 1)
+        throw new Error(`case ${self.label} falls through into case ${next.label}, which is not the next value: ` +
+            `a case continues into the one physically next in the table (isa-core.md §7.1), so only ` +
+            `case ${self.label + 1} would work — end it with break, or repeat the statements`)
+
+    return "FALLTHROUGH"
+}
+
 function lowerSwitch<E extends { ext: string } = ExtOpPayload>(s: SwitchStatement, alloc: RegAlloc<E>): RtlInstr<E>[]
 {
     const disc = lowerExpression(s.discriminant, alloc,
@@ -400,83 +492,63 @@ function lowerSwitch<E extends { ext: string } = ExtOpPayload>(s: SwitchStatemen
     if(labelled.length === 0) throw new Error(`A switch needs at least one case`)
 
     const seen = new Set<number>()
-    const sorted = labelled
-        .map(c =>
-        {
-            const label = caseLabel(c.test!)
-
-            if(seen.has(label)) throw new Error(`Duplicate switch case label ${label}`)
-            seen.add(label)
-
-            return {label, stmts: c.consequent}
-        })
-        .sort((a, b) => a.label - b.label)
-
-    // C's `case 0: case 1: X` — an empty body shares the next label's.
-    // `FALLTHROUGH` (isa-core.md §4.5) continues into the case physically
-    // next in the table, so the shared label has to be the next one:
-    // anything else would land in a gap filler, which exits to the default.
-    for(const [i, c] of sorted.entries())
+    const clauses = s.cases.map(c =>
     {
-        if(c.stmts.length > 0) continue
+        if(c.test === null) return {label: null, ...trimBreak(c)}
 
-        const next = sorted[i + 1]
-        if(!next || next.label !== c.label + 1)
-            throw new Error(`Empty body for case ${c.label}: it can only share the body of case ${c.label + 1}, ` +
-                `which this switch does not have — repeat the statements under each label instead`)
-    }
+        const label = caseLabel(c.test)
+        if(seen.has(label)) throw new Error(`Duplicate switch case label ${label}`)
+        seen.add(label)
 
-    // The `default:` clause is a case block of its own — `case[N]`, run
-    // only when no label matched, never also when a non-terminating case
-    // fell out of the construct. A gap inside a group runs it too, so a
-    // gap costs one copy of it and grouping cannot be decided without its
-    // size; the throwaway scope here measures, the real one below emits.
-    const lowerDefault = (scope: RegAlloc<E>): RtlInstr<E>[] =>
-    {
-        if(!defaults[0]) return [bare<E>("BLOCK_END")]
+        return {label, ...trimBreak(c)}
+    })
 
-        const body = lowerBlock(defaults[0].consequent, scope)
-        assert.ok(body, `Failed to lower switch default clause`)
-        return closeBlock(body)
-    }
-
-    const gapBytes = lowerDefault(new RegAlloc<E>(alloc)).reduce((n, i) => n + instrBytes(i), 0)
-    const groups = switchGroups(sorted.map(c => c.label), gapBytes)
+    const sorted = clauses.filter(c => c.label !== null).sort((a, b) => a.label! - b.label!)
+    const groups = switchGroups(sorted.map(c => c.label!), gapCost(defaults.length > 0))
 
     // A chain needs the discriminant more than once, and acc does not
     // survive the first split (isa-core.md §8.7) — so it goes to a slot,
     // reserved by the `PUSH` that stores it. One group needs no chain, so
     // it dispatches straight out of acc.
+    // The discriminant's own slot is reclaimed after the construct, so it
+    // gets a scope of its own — the enclosing scope must go on numbering
+    // from where it already was, not past a slot that is gone.
     const chained = groups.length > 1
-    const slot = chained ? alloc.alloc(`?${alloc.depth}`) : -1
+    const disc_ = new RegAlloc<E>(alloc)
+    const slot = chained ? disc_.alloc(`?${disc_.depth}`) : -1
 
     // Case scopes are built after that allocation: a scope snapshots its
     // parent's numbering (scope.ts), so one built earlier would sit on the
     // discriminant's own slot.
     const bodyOf = new Map<number, RtlInstr<E>[]>()
-    for(const c of sorted)
+    let otherwise: RtlInstr<E>[] = [bare<E>("BLOCK_END")]
+
+    for(const [i, c] of clauses.entries())
     {
-        if(c.stmts.length === 0) { bodyOf.set(c.label, [bare<E>("FALLTHROUGH")]); continue }
+        const body = lowerBlock(c.stmts, new RegAlloc<E>(disc_))
+        assert.ok(body, `Failed to lower switch ${c.label === null ? "default clause" : `case ${c.label}`}`)
 
-        const body = lowerBlock(c.stmts, new RegAlloc<E>(alloc))
-        assert.ok(body, `Failed to lower switch case ${c.label}`)
-        bodyOf.set(c.label, closeBlock(body))
+        const closed = fallsThrough(body) ? [...body, bare<E>(caseCloser(clauses, i))] : body
+
+        if(c.label === null) otherwise = closed
+        else bodyOf.set(c.label, closed)
     }
-
-    const otherwise = lowerDefault(new RegAlloc<E>(alloc))
 
     const load = (): RtlInstr<E>[] => [LOAD<E>(slot)]
     const shift = (lo: number): RtlInstr<E>[] => lo === 0 ? [] : [opImm<E>("SUB", lo)]
 
-    /** One group as a `BR_TABLE` over `label - lo`. An absent label inside
-     *  the span gets its own copy of the default block: `BR_TABLE`'s index
-     *  is exact below `N`, so a gap cannot share `case[N]`'s code — which
-     *  is exactly what `switchGroups` prices a gap at. */
+    /** A missing label inside a merged span: `BR_TABLE`'s index is exact
+     *  below `N`, so it cannot share `case[N]`'s code and needs a block of
+     *  its own — `DEFAULT` to reach the clause, or a plain exit where there
+     *  is none. What `gapCost` prices, and nothing bigger. */
+    const gap = (): RtlInstr<E>[] => [bare<E>(defaults.length > 0 ? "DEFAULT" : "BLOCK_END")]
+
+    /** One group as a `BR_TABLE` over `label - lo`. */
     function table(group: number[], from: RtlInstr<E>[], dflt: RtlInstr<E>[]): RtlInstr<E>[]
     {
         const lo = group[0]!
         const span = group[group.length - 1]! - lo + 1
-        const filled = [...Array(span)].map((_, i) => bodyOf.get(lo + i) ?? otherwise)
+        const filled = [...Array(span)].map((_, i) => bodyOf.get(lo + i) ?? gap())
 
         return [...from, ...shift(lo), brTable(span), ...filled.flat(), ...dflt]
     }
@@ -491,39 +563,76 @@ function lowerSwitch<E extends { ext: string } = ExtOpPayload>(s: SwitchStatemen
             index === groups.length - 1 ? otherwise : closeBlock(chain(index + 1)))
     }
 
+    const construct = chained ? [PUSH<E>(), ...chain(0)] : table(groups[0]!, [], otherwise)
+
     return [
         ...disc.fragment,
-        ...(chained ? [PUSH<E>(), ...chain(0)] : table(groups[0]!, [], otherwise)),
+        ...construct,
+        // The chain's own discriminant slot outlives the construct — every
+        // case reset TOS to a depth above it — so it is dropped here, the
+        // same way any other scope that no block boundary closes ends
+        // (isa-core.md §4.4).
+        ...scopeCleanup<E>(disc_.depth - alloc.depth, reachesEnd(construct)),
+    ]
+}
+
+/**
+ * Both loop forms, which differ only in the opener (isa-core.md §7.2):
+ * `LOOP_PRE` for `while`/`for`, `LOOP_POST` for `do`/`while`. The body
+ * block is emitted first and the condition second.
+ *
+ * The condition sub-block is a block of its own: a ternary in the test
+ * re-reserves its slot on every pass and the sub-block's `BLOCK_END` drops
+ * it again (§8.1), so the scope holding it must be a child of the loop's,
+ * not shared with the body's.
+ */
+function lowerLoop<E extends { ext: string } = ExtOpPayload>(
+    opener: "LOOP_PRE" | "LOOP_POST",
+    test: Expression,
+    what: string,
+    body: RtlInstr<E>[],
+    alloc: RegAlloc<E>,
+): RtlInstr<E>[]
+{
+    const cond = lowerExpression(test, new RegAlloc<E>(alloc),
+        {demand: "acc", what}).fragment
+
+    return [
+        bare(opener),
+        ...closeBlock(body),
+        ...cond,
+        bare("BLOCK_END"),
     ]
 }
 
 function lowerWhile<E extends { ext: string } = ExtOpPayload>(s: WhileStatement, alloc: RegAlloc<E>): RtlInstr<E>[]
 {
-    // The condition sub-block is a block of its own: a ternary in the test
-    // re-reserves its slot on every pass and the sub-block's `BLOCK_END`
-    // drops it again (isa-core.md §8.1), so the scope holding it must be a
-    // child, or the body would number its locals above a slot that is gone
-    // by the time the body runs.
-    const test = lowerExpression(s.test, new RegAlloc<E>(alloc),
-        {demand: "acc", what: "while test expression"})
+    const body = lowerControlBody(s.body, new RegAlloc<E>(alloc))
+    assert.ok(body, `Failed to lower while body`)
 
-    const bodyTerm = lowerControlBody(s.body, new RegAlloc<E>(alloc))
-    assert.ok(bodyTerm, `Failed to lower while body`)
+    return lowerLoop("LOOP_PRE", s.test, "while test expression", body, alloc)
+}
 
-    return [
-        bare("LOOP"),
-        ...test.fragment,
-        bare("BLOCK_END"),
-        ...closeBlock(bodyTerm),
-    ]
+function lowerDoWhile<E extends { ext: string } = ExtOpPayload>(s: DoWhileStatement, alloc: RegAlloc<E>): RtlInstr<E>[]
+{
+    const body = lowerControlBody(s.body, new RegAlloc<E>(alloc))
+    assert.ok(body, `Failed to lower do-while body`)
+
+    // §8.5: a `LOOP_POST` body closed by a terminator leaves the condition
+    // unreachable. The construct is then pointless rather than wrong, so
+    // the body is emitted on its own and what follows never runs the test.
+    if(!fallsThrough(body))
+        return body
+
+    return lowerLoop("LOOP_POST", s.test, "do-while test expression", body, alloc)
 }
 
 function lowerFor<E extends { ext: string } = ExtOpPayload>(s: ForStatement, alloc: RegAlloc<E>): RtlInstr<E>[]
 {
-    // C scopes a `for` init's declarations to the loop, but their registers
-    // live until the enclosing block ends — nothing pops them at the
-    // back-edge. So they get a scope of their own for name visibility, and
-    // the enclosing scope is told to number past them at the end.
+    // C scopes a `for` init's declarations to the loop, and so does this:
+    // they get a scope of their own for name visibility, and a `DROP #n`
+    // after the whole construct reclaims their slots (isa-core.md §4.4) —
+    // no block boundary sits where that scope ends.
     const loop = new RegAlloc<E>(alloc)
 
     const init: RtlInstr<E>[] = (s.init) ?
@@ -544,30 +653,28 @@ function lowerFor<E extends { ext: string } = ExtOpPayload>(s: ForStatement, all
     const test = lowerExpression(testExpr, new RegAlloc<E>(loop),
         {demand: "acc", what: "for-loop test expression"}).fragment
 
+
     const bodyScope = new RegAlloc<E>(loop)
     const body = lowerControlBody(s.body, bodyScope)
-    const bodyStmts = s.body.type === "BlockStatement" ? s.body.body : [s.body]
 
     // The update runs at the end of the body block, with the body's own
     // locals still pushed — so a ternary in it must number its slot above
     // them, while its names still resolve in the enclosing scope the way
-    // C's do.
-    const update = s.update
+    // C's do. It is dead code when the body always terminates first (e.g.
+    // every path `return`s), and omitted then (§8.4).
+    const update = s.update && fallsThrough(body)
         ? lowerExprStmt({type: "ExpressionStatement", expression: s.update},
             new RegAlloc<E>(loop, undefined, undefined, bodyScope.depth))
         : []
 
-    alloc.consume(loop.depth - alloc.depth)
+    const construct = [...body, ...update]
 
     return [
         ...init,
-        bare("LOOP"),
+        bare("LOOP_PRE"),
+        ...closeBlock(construct),
         ...test,
         bare("BLOCK_END"),
-        ...body,
-        // The increment is dead code when the body always terminates first
-        // (e.g. every path `return`s) — omit it and the back-edge closer
-        // with it, matching the terminator-closed body shape (§14.4).
-        ...(fallsThrough(body) ? [...update, bare("BLOCK_END")] : []),
+        ...scopeCleanup(loop.depth - alloc.depth),
     ]
 }

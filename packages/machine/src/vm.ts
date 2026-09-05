@@ -30,6 +30,7 @@
 
 import assert from "assert"
 import type {RtlProgram, RtlProc, RtlInstr, ExtOpPayload} from "./rtl"
+import {isLoopOpcode} from "./rtl"
 import type {Extension, ExtOpEffect} from "./extension"
 import {accOutOf} from "./extension"
 
@@ -53,7 +54,7 @@ class Trap
 /** The `MAX_STEPS` watchdog tripping — its own type rather than a plain
  *  `Error`, because it is emphatically *not* the same kind of event as the
  *  malformed-IR throws around it. isa-core.md §9 is explicit that
- *  termination is not guaranteed ("a `LOOP` whose condition block never
+ *  termination is not guaranteed ("a loop whose condition block never
  *  tests false runs indefinitely. The ISA promises bounded resource usage,
  *  not termination"), so a program that trips this is legal, and a caller
  *  using this VM as an oracle needs to tell "the interpreter gave up on a
@@ -159,9 +160,9 @@ export function evalUnary(V: number, op: RtlInstr["op"]): number
 
 // ── Skipping over not-taken blocks ──────────────────────────────────────────
 //
-// A "block" is one BR_TABLE case-body or one LOOP sub-block: a run of
+// A "block" is one BR_TABLE case-body or one loop sub-block: a run of
 // instructions ending at its own BLOCK_END or terminator. Skipping a nested
-// BR_TABLE/LOOP requires skipping *all* of its own sub-blocks first — a flat
+// BR_TABLE/loop requires skipping *all* of its own sub-blocks first — a flat
 // nesting counter gets this wrong for a BR_TABLE with more than one case, so
 // this is real (if shallow) recursive descent, mirroring the grammar
 // directly: "skip a construct" = skip its N case-blocks or its 2 loop
@@ -172,7 +173,7 @@ function skipConstruct<E extends { ext: string } = ExtOpPayload>(body: RtlInstr<
 {
     const opener = body[pc]
     if(opener.op === "BR_TABLE") return skipBlocks(body, pc + 1, opener.imm + 1)
-    // LOOP: condition block + body block.
+    // A loop: body block + condition block (isa-core.md §7.2).
     return skipBlocks(body, pc + 1, 2)
 }
 
@@ -187,9 +188,9 @@ function skipBlocks<E extends { ext: string } = ExtOpPayload>(body: RtlInstr<E>[
         {
             if(p >= body.length) throw new Error(`ran off the end of the procedure body while skipping`)
             const i = body[p]
-            if(i.op === "BR_TABLE" || i.op === "LOOP") { p = skipConstruct(body, p); continue }
+            if(i.op === "BR_TABLE" || isLoopOpcode(i.op)) { p = skipConstruct(body, p); continue }
             p++
-            if(i.op === "BLOCK_END" || i.op === "FALLTHROUGH" || i.op === "RETURN" || i.op === "TRAP") break
+            if(i.op === "BLOCK_END" || i.op === "FALLTHROUGH" || i.op === "DEFAULT" || i.op === "RETURN" || i.op === "TRAP") break
         }
     }
     return p
@@ -198,14 +199,17 @@ function skipBlocks<E extends { ext: string } = ExtOpPayload>(body: RtlInstr<E>[
 // ── The control stack ───────────────────────────────────────────────────────
 //
 // What BLOCK_END does depends on what's on top: closing a BR_TABLE case
-// falls through past the remaining sibling cases; closing a LOOP's
-// condition block either exits (skip the body block) or enters it;
-// closing a LOOP's body block is an unconditional back-edge to the opener.
+// falls through past the remaining sibling cases; closing a loop's body
+// block continues into the condition block physically next to it; closing
+// a loop's condition block is the back-edge-or-exit decision (§7.2).
+//
+// `bodyPc` is where the body block starts, which is the back-edge target
+// and — under LOOP_PRE — the thing the opener itself jumps over.
 
 type BlockFrame =
     | {kind: "case"; remaining: number; entryTos: number}
-    | {kind: "loopCond"; loopPc: number; entryTos: number}
-    | {kind: "loopBody"; loopPc: number; entryTos: number}
+    | {kind: "loopCond"; bodyPc: number; entryTos: number}
+    | {kind: "loopBody"; bodyPc: number; entryTos: number}
 
 /** Run one procedure to completion. All VM state is local to this call —
  *  a nested CALL is just a nested call to this function, against
@@ -225,7 +229,7 @@ function runProc<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E
     // acc into r(N-1) at entry precisely because it is already there.
     let acc = args.length > 0 ? args[args.length - 1]! : 0
     // Poisoned by a write-back-in-place combo (REG_REG/PEEK_PEEK) or by
-    // entering a BR_TABLE/LOOP split successor (isa-core.md §8.7) — matches
+    // entering a BR_TABLE/loop split successor (isa-core.md §8.7) — matches
     // raise.ts's own `this.acc = undefined`. `acc` itself stays a plain
     // `number` (whatever it last held) so reading it while poisoned still
     // throws instead of silently returning a stale, bit-accurate-by-luck
@@ -399,10 +403,47 @@ function runProc<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E
                 break
             }
 
-            case "LOOP":
-                ctrl.push({kind: "loopCond", loopPc: pc, entryTos: tos})
+            case "LOOP_PRE":
+                // Enter at the condition: jump over the body block, which
+                // is emitted first (isa-core.md §7.2). This edge is an
+                // unconditional jump, not a split, so acc rides across it.
+                ctrl.push({kind: "loopCond", bodyPc: pc + 1, entryTos: tos})
+                pc = skipBlocks(body, pc + 1, 1)
+                break
+
+            case "LOOP_POST":
+                // Enter at the body, which the condition's own branch also
+                // enters — a split successor either way, so acc is dead.
+                accLive = false
+                ctrl.push({kind: "loopBody", bodyPc: pc + 1, entryTos: tos})
                 pc++
                 break
+
+            case "DEFAULT": {
+                const top = ctrl.pop()
+                if(!top) throw new Error(`DEFAULT at ${pc}: no open block`)
+                if(top.kind !== "case") throw new Error(`DEFAULT at ${pc}: not closing a dispatch case`)
+                if(top.remaining === 0) throw new Error(`DEFAULT at ${pc}: this is already the default case`)
+
+                assert.ok(tos >= top.entryTos, `TOS underflow at DEFAULT ${pc}: below block entry depth`)
+                tos = top.entryTos
+
+                // Straight to case[N], skipping every sibling between here
+                // and it. Like any case entry, it starts dead.
+                accLive = false
+                pc = skipBlocks(body, pc + 1, top.remaining - 1)
+                ctrl.push({kind: "case", remaining: 0, entryTos: top.entryTos})
+                break
+            }
+
+            case "DROP": {
+                const top = ctrl[ctrl.length - 1]
+                const floor = top ? top.entryTos : 0
+                assert.ok(tos - i.imm >= floor, `TOS underflow at DROP ${pc}: below block entry depth`)
+                tos -= i.imm
+                pc++
+                break
+            }
 
             case "FALLTHROUGH": {
                 const top = ctrl.pop()
@@ -442,19 +483,20 @@ function runProc<E extends { ext: string } = ExtOpPayload>(program: RtlProgram<E
                 }
                 if(top.kind === "loopCond")
                 {
-                    requireAccLive("LOOP condition")
+                    requireAccLive("loop condition")
                     // isa-core.md §8.7: both successors of this split — the
-                    // exit and the body — start dead, regardless of what
-                    // the condition itself left behind.
+                    // exit and the back-edge — start dead, regardless of
+                    // what the condition itself left behind.
                     accLive = false
-                    if(acc === 0) { pc = skipBlocks(body, pc + 1, 1); break } // exit: skip the body block
-                    ctrl.push({kind: "loopBody", loopPc: top.loopPc, entryTos: top.entryTos})
-                    pc++
+                    if(acc === 0) { pc++; break } // exit: the condition is the last sub-block
+                    ctrl.push({kind: "loopBody", bodyPc: top.bodyPc, entryTos: top.entryTos})
+                    pc = top.bodyPc
                     break
                 }
-                // loopBody: unconditional back-edge to the opener, which
-                // re-enters the condition block.
-                pc = top.loopPc
+                // loopBody: unconditional continue into the condition
+                // block, which sits physically right here.
+                ctrl.push({kind: "loopCond", bodyPc: top.bodyPc, entryTos: top.entryTos})
+                pc++
                 break
             }
 
