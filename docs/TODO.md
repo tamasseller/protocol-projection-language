@@ -3,11 +3,6 @@
 
 # Current
 
-- @ppl/machine
-  - process improvements.md with regard to recent ISA revision
-  - `switch` gap filling now copies the `default:` clause per gap; if that
-    shows up as size, the alternative is a per-group range test again
-
 # The move
 
 - Move @ppl/machine and JIT to separate root repos, publish on github

@@ -26,3 +26,7 @@ npm-debug.log*
 # require()'d back in a test (any package's test/ dir) — distinct from a
 # package's own committed generated/ output (e.g. packages/example/generated/).
 **/test/.codegen-scratch/
+
+# The MOG repos being split out of this tree — their own git, not this one's.
+/mog-core/
+/mog-jit/
