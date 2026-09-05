@@ -12,7 +12,7 @@
 import { describe, test } from "node:test"
 import assert from "node:assert/strict"
 
-import { encodeInstr, decodeInstr, encodeBody, decodeBody } from "mog-core"
+import { encodeInstr, decodeInstr, encodeBody, decodeBody, ir, lowerProgram, proc } from "mog-core"
 import { callCodecInstr, callCodecNextInstr, cloneRdInstr, cloneWrInstr, countInstr, enterInstr, enterNextInstr, hasNextInstr, loadValInstr, openListInstr, readInstr, readSeqInstr, seekInstr, storeValInstr, tagInstr, writeInstr, writeSeqInstr } from "../../src/codecs/engine/codec-ext-instr"
 import type { CodecExtInstr } from "../../src/codecs/engine/codec-ext-instr"
 import type { ExtInstrOf, Extension } from "mog-core"
@@ -21,6 +21,7 @@ import { struct, union, unit, u8, list } from "../../src/core/index"
 import { codecWireCodec } from "../../src/codecs/engine/wire"
 import { buildCodec } from "../../src/codecs/engine/resolver"
 import { binaryEncodeRules } from "../../src/codecs/components/binary-rules"
+import { codecRules } from "../../src/codecs/engine/codec-extension"
 
 const ext: Extension<CodecExtInstr> = { codec: codecWireCodec }
 
@@ -161,6 +162,18 @@ describe("wire.ts — SEEK's signed delta", () =>
             const { instr } = decodeInstr(Uint8Array.from(encoded), 0, ext)
             assert.deepEqual(instr, seekInstr(0, delta), `delta=${delta}`)
         }
+    })
+
+    test("a negative delta stays negative all the way from the DSL to the wire and back", () =>
+    {
+        // The delta is an extension operand, not a core immediate: nothing
+        // between `ir` and `encodeSigned` may coerce it to a machine word.
+        const program = lowerProgram(proc([], ir`clone_rd(0, 1); seek(1, -2); return;`), { rules: codecRules })
+        const lowered = program.procedures[0]!.body.find(i => i.op === "EXT" && (i as ExtInstrOf<CodecExtInstr>).ext === "SEEK")
+        assert.deepEqual(lowered, seekInstr(1, -2))
+
+        const { instr } = decodeInstr(Uint8Array.from(encodeInstr(lowered!, ext)), 0, ext)
+        assert.deepEqual(instr, seekInstr(1, -2))
     })
 })
 
