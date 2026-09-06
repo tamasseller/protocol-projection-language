@@ -4,6 +4,31 @@ A running record of decisions whose reasoning must outlive the change that
 made them. One entry per decision, kept tight — the specifications live in
 each repo's own docs.
 
+## The repos are independent, and cross-repo references pay for it
+
+**Decided, and in force.** `ppl`, `mog-core`, `mog-jit` and `ppl-example` are
+four repos that happen to sit side by side. Each depends on its siblings by
+published git URL, never by path — so each clones and builds on its own, with
+no workspace tooling and no path dependency to keep in sync.
+
+The cost is that nothing crosses a repo boundary for free, in either code or
+prose. Two forms of it have already been paid:
+
+- **Code.** A local `mog-core` change is invisible to its three dependents
+  until it is pushed *and* reinstalled. Verifying an unpushed change from a
+  dependent means copying built output into that dependent's `node_modules`
+  by hand. That state is not durable and does not survive an install — say so
+  wherever it is relied on, and undo it.
+- **Prose.** Rationale that lives at the workspace root cannot be cited from
+  inside a repo by a path that still resolves in a standalone clone. Name it
+  descriptively instead — "the workspace's `docs/decisions.md`, <entry
+  title>" — so a reader outside the workspace gets a readable pointer rather
+  than a broken link. `ppl/src/codecs/engine/scope.ts` is the first of these.
+
+Neither is a defect in the split; both are its price, and the split is worth
+it. What matters is that the workaround is visible at the point it is used,
+rather than looking like something that works.
+
 ## Where an extension's authoring ergonomics live (ppl)
 
 **Decided, and implemented in `ppl/src/codecs/engine/scope.ts`.** What
