@@ -17,8 +17,12 @@ prose. Two forms of it have already been paid:
 - **Code.** A local `mog-core` change is invisible to its three dependents
   until it is pushed *and* reinstalled. Verifying an unpushed change from a
   dependent means copying built output into that dependent's `node_modules`
-  by hand. That state is not durable and does not survive an install — say so
-  wherever it is relied on, and undo it.
+  by hand. That state is not durable and does not survive an install, so say
+  so wherever it is relied on. A copy that is no longer needed should go; one
+  the tree has since come to depend on cannot be undone by deleting it —
+  publishing is the only undo, and until then a dependent must not be
+  committed against the unpublished change, or it stops building from a clean
+  clone.
 - **Prose.** Rationale that lives at the workspace root cannot be cited from
   inside a repo by a path that still resolves in a standalone clone. Name it
   descriptively instead — "the workspace's `docs/decisions.md`, <entry
