@@ -60,18 +60,3 @@ design and the specifications; what lands here is what to do next.
   - write a case-study like doc about the example project, explain all the mechanisms that solve the challanges.
   - create a definitive guide to all the important bits. It is supposed to give enough insight to a skilled reader to comprehend the operation of the whole system. Also fold in the root docs, some of those are early superseeded drafts, never touched since, but may contain important information and there's the specification of the extension of the MOG ISA.
 
-## Open question: where do repo-local TODOs live?
-
-Unresolved, flagged by both sessions. "All TODO-like stuff to the workspace
-root" and handover.md's "per-repo TODO stays local, cross-repo goes to root"
-were both stated. ppl's moved up because it was management-level; mog-core's
-and mog-jit's did not, because they are working state tied to source lines and
-coverage classification and would degrade in a shared file. Needs a ruling.
-
-## Known non-blocking issues
-
-Both are mog-core-level, salvaged from ppl's deleted ROADMAP.md — parked here
-until the question above is settled.
-
-- parser, not tiling, is the bottleneck on large expressions: at 128+ leaves grammer.pegjs's recursive-descent parser dominates wall-clock, tileExpr is flat in tree width. Not investigated further.
-- two DSL limits follow from the ISA, both in isa-core.md §10.3: no divide (`/` and `%` parse, no opcode), and `switch` fallthrough only between labels adjacent in value.

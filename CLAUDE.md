@@ -12,4 +12,14 @@ Existing prose in this repo is verbose in places. That is not licence to add mor
 
 ## Docs
 
-`docs/TODO.md` and similar: status first, one fact per line. Not multi-paragraph rationale.
+Status first, one fact per line. Not multi-paragraph rationale.
+
+Two files at the workspace root, and no others of their kind — no per-repo
+`TODO.md`, no handover or notes file anywhere:
+
+- `docs/TODO.md` is the master plan, written by hand. Never add to it. Change
+  it only when told to, and then only what you were told.
+- `docs/FINDINGS.md` is where every discovery goes, from any repo. It is read
+  in order to be picked from, so it stays short: an entry leaves when it is
+  promoted, fixed, or falsified. What a fix pins belongs in a test; what a
+  decision preserves belongs in the repo's own design doc.
