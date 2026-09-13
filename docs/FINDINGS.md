@@ -33,15 +33,31 @@ The 5-byte LEB128 immediate loses to three short instructions on cost.
 `a - 0xffffffe1` is `a + 31`.
 **Promote as:** fold wrap-around subtraction into addition.
 
-## mog-core: the generated parser could be replaced by a hand-written one
+## mog-core: `switch` fallthrough is restricted by the table's value order
 
-**Status:** open. No longer a performance item — the 4x-per-nesting-level
-parse cost was two rules parsing their operand twice, and is fixed.
-What remains: `build:grammar` is a build step, `src/parser.js` is 98KB of
-generated code carried in git, peggy is a devDependency.
-Against it: peggy's "Expected X but found Y" is free, and
-`mog-jit/fuzz/ts/invalid.ts` classifies refusals on that text.
-**Promote as:** decide whether to hand-write the parser, or keep peggy and stop treating it as debt.
+**Status:** open, design proposal. `mog-core/src/lower.ts`'s `caseCloser`,
+isa-core.md §7.1 and §10.3.
+Three spellings are rejected: fallthrough across a value gap, backward
+fallthrough, and fallthrough out of a `default:` not written last.
+All three have one cause — the table is value-ordered, C's fallthrough is
+textually-ordered, and `FALLTHROUGH` means "the physically next case".
+Only the bytecode encoding has that problem. JS and C++ let cases be written
+in any order, the VM walks a tree, and a JIT or AOT backend emits the same
+forward branch it already emits for every `BLOCK_END`.
+So a consumer targeting only the JS codegen is refused a construct for a
+representation it never uses, because the rejection sits in the shared lowerer.
+`FALLTHROUGH #k` — continue at case `k` of this dispatch, forward only —
+closes the gap and mid-`default:` cases. The target is a table index, so no
+offsets and no block crossing, and acc liveness at case `k` is the join
+`FALLTHROUGH` already creates.
+It subsumes `FALLTHROUGH` and `DEFAULT`: one code for two, three bytes
+instead of two, on the irregular case only. `raise.ts` stays total.
+Backward fallthrough stays unencodable — body duplication, which
+isa-rationale.md already treats as a size decision.
+§7.1 names `MISC_OTHER` as the growth path and declines to specify it.
+Touches bytecode.ts, vm.ts, validate.ts, raise.ts and the JIT's decoder; a
+wire change, so the fuzz seed binaries regenerate.
+**Promote as:** add `FALLTHROUGH #k`, forward-only, naming a case of its own dispatch.
 
 ## mog-jit: the frame does not bind the extension set
 
@@ -188,14 +204,3 @@ Stage 3: parallelism, for the 56-core server — it also lets the `--dbg-every`
 and `--cov-every` downsampling be dropped, making coverage attribution exact.
 **Promote as:** build stages 2 and 3 of the fuzz pipeline.
 
-## A long-lived target service is possible but not justified
-
-**Status:** settled, no action expected. Kept because the question recurs.
-`fuzz/src/readc-spike/` established that SYS_READC works on this QEMU and
-machine, but only through an explicit `-chardev`, and it is non-blocking and
-lossy — interleaving SYS_WRITE0 on the same chardev drops every other byte.
-All three reasons to build it have since gone: the batch window is 128KB not
-24KB, coverage says the campaign is reach-bound not throughput-bound, and
-the 20s hang budget has cost nothing in 40000 candidates.
-What it would still buy is a diagnostic: a SysTick watchdog would return a
-hang as `LANDING_CANCELLED` naming its program, instead of a dead batch.

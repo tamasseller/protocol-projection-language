@@ -7,9 +7,6 @@ design and the specifications; what lands here is what to do next.
 
 ### Codec extension
 
-- TS side carriers adopted where an id was hand-picked: struct rules, delta-leb128's walks, iso8601-demo
-  - everywhere else a bare 0 is just o0/i0 — documentation value only, no collision to prevent
-  
 - Crypto primitives (CRC, hash, MAC, cipher, AEAD) — design sketch in crypto.md, nothing implemented.
   - No reserved opcodes remain; needs the extension-level escape crypto.md §2.1 proposes.
   - Key material: host-bound key slot table, never an ISA value or an object handle (§5). Key establishment (DH) stays above this layer.
@@ -34,6 +31,7 @@ design and the specifications; what lands here is what to do next.
   - structure it like a proper application to validate and showcase the ergonomics
 
 - tools
+  - semantic compatibility analyser (schema evolution linter)
   - codec back and forth tester
     - known semantic value test vector roundtrip
     - semantic value fuzzing?
