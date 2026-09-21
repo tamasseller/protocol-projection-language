@@ -1,0 +1,9 @@
+for i in $(dirname $(realpath $(find . -mindepth 2 -maxdepth 2 -name '.git' -type d)))
+do 
+	(\
+		cd $i && \
+		echo && \
+		echo $(tput setaf 7)$(tput bold)--- $(basename $i) ---$(tput sgr0) && \
+		git status \
+	); 
+done
