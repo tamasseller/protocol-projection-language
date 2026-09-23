@@ -14,7 +14,7 @@ four: `CLAUDE.md`, `.claude/`, and `docs/`:
 - `docs/TODO.md` — the master plan, hand-written, one section per repo
 - `docs/FINDINGS.md` — discoveries from any repo, waiting to be picked into the plan
 - `docs/decisions.md` — reasoning that must outlive the change that made it
-- `docs/crypto.md`, `docs/quantities.md` — design sketches, nothing implemented
+- `docs/crypto.md` — design sketch, nothing implemented
 
 Each repo's own `docs/` keeps its specifications and architecture. Everything
 that is a plan or a finding lands here, whichever repo it came from.

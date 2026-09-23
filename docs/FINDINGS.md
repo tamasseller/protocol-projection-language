@@ -204,3 +204,19 @@ Stage 3: parallelism, for the 56-core server — it also lets the `--dbg-every`
 and `--cov-every` downsampling be dropped, making coverage attribution exact.
 **Promote as:** build stages 2 and 3 of the fuzz pipeline.
 
+## ppl: a bridged integer or list is never range- or capacity-checked
+
+**Status:** open. `src/core/reconcile.ts`'s `resolve`, `src/target-js/engine/codec-codegen-ext.ts`'s `STORE_VAL`/`LOAD_VAL`.
+A matched integer leaf always resolves to a bare `bridge`; generated code converts it with no check.
+An image `u16` decoded into a local `u8` stores the value unchecked; a local value outside the image's range reaches the codec on encode.
+List capacity is ignored the same way.
+A decoded value is also never checked against the image's own range: `integer(0, 100)` on a 1-byte wire can decode as 200.
+**Promote as:** reconciliation.md §7 stage 3 (validation seams, integer domains).
+
+## ppl: an unbounded list gets a 1-byte count prefix, unchecked
+
+**Status:** open. `src/codecs/components/binary-rules.ts`'s `countPrefixWidth`.
+With no `capacity`, the default binary list rules size the count prefix as if capacity were 255.
+Nothing checks the count against it: `write` goes through `DataView.setUint8`, which wraps.
+A 300-element list encodes as count 44 followed by all 300 elements; decode reads 44 and misreads the rest.
+**Promote as:** a variable-length count for unbounded lists, and reconciliation.md §5.2's validation seam for lengths.

@@ -29,8 +29,8 @@ There is none left:
   three escapes carrying an unbounded LEB128 sub-code space — core-owned.
 - The codec extension's 128 were filled exactly by `WRITE_SEQ`/`READ_SEQ`
   (codec-extension.md §6.4, wire.ts's band table).
-- `0xD1`-`0xFF` is free in the *type tree* encoding (codec-image.md §6.2),
-  a different stream, and quantities.md §6 already claims a tag there.
+- `0xD1`-`0xFF` is free in the *type tree* encoding (codec-image.md §3.2),
+  a different stream, and reconciliation.md §3.1 already claims a tag there.
 
 `Extension` is also singular: bytecode.ts routes every byte ≥128 to one
 `Extension.codec`, so a standalone crypto extension is not expressible.
@@ -89,20 +89,17 @@ load-bearing decision:
 
 ### 3.1 Instruction sketch
 
-Nine sub-codes, enough for all five stages of §6. Handle and iterator IDs
+Six sub-codes, enough for all five stages of §6. Handle and iterator IDs
 are LEB128 after the escape's sub-code — no compact index forms, by
 `WRITE_SEQ`'s argument (codec-extension.md §6.4): the per-op cost amortizes
 over the range the op processes. `alg` is a length-prefixed UTF-8 name
 (§4), inline rather than a string-table reference, which keeps
-codec-image.md §6.3's invariant that a program section carries no names
+codec-image.md §3.3's invariant that a program section carries no names
 intact.
 
 | Op | Effect |
 |---|---|
-| `INIT c, "alg"` | fresh context in slot `c` |
-| `INIT_KEY c, "alg", key` | ditto, bound to key slot `key` (§5) |
-| `SET_PARAM c, "name", value` | a literal integer parameter (§4.1) |
-| `SET_PARAM_BYTES c, "name", bytes` | a literal byte-string parameter (§4.1) |
+| `INIT c, "alg", params` | fresh, fully configured context in slot `c` |
 | `ABSORB c, iter` | consume `acc` bytes from `stream[iter]` into `c` |
 | `FINAL c, iter` | write `acc` bytes of result to `stream[iter]` |
 | `FINAL_VAL c` | `acc` = the result as an integer (CRC, ≤32 bits) |
@@ -112,6 +109,20 @@ intact.
 `FINAL`'s `acc` is the output length, which is what an XOF needs; for a
 fixed-length algorithm it must equal the natural digest length or trap,
 rather than a second opcode existing to say the same thing.
+
+**A context's whole configuration is one instruction.** Every part of it
+is literal (isa-core.md §11.3), so nothing is gained by spreading it over
+several ops, and codegen — whose lowering differs wholesale between a CRC,
+an HMAC and a cipher — dispatches on one instruction with the algorithm,
+key and every parameter in view, rather than reassembling a context from
+an `INIT` and a trail of setters.
+
+`params` is a TLV list: per entry a NUL-terminated UTF-8 name, then a
+LEB128 length and that many value bytes; an empty name ends the list. The
+value's meaning is fixed by its name, never by the encoding, so a reader
+that knows no names can still skip every entry. Integer-valued parameters
+are unsigned little-endian, as wide as the value's length. A repeated name
+is a decode error.
 
 A string operand costs nothing in `mog-core`: `ExtOpPayload`'s numeric
 `operands` is only the default payload shape, `CodecExtInstr` already
@@ -128,11 +139,11 @@ isa-core.md §11.2, as `ExtOpEffect` (`mog-core/src/extension.ts`). All
 
 | Op | Acc |
 |---|---|
-| `INIT`/`INIT_KEY`/`VERIFY` | `killsAcc` |
+| `INIT`/`VERIFY` | `killsAcc` |
 | `ABSORB`/`FINAL`/`XFORM` | `readsAcc` (the byte count) |
 | `FINAL_VAL` | `writesAcc` |
 
-`killsAcc` on the first three for the reason codec-extension.md §6.3 gives
+`killsAcc` on both for the reason codec-extension.md §6.3 gives
 for `ENTER`/`CLONE_*`: every one is helper-call work on a real target,
 where the accumulator's register is an argument register.
 
@@ -140,15 +151,13 @@ where the accumulator's register is an argument register.
 
 `validate-handles.ts`'s existing pattern, extended with a third
 environment. A crypto handle must be initialized before it is absorbed into
-or finished, and `INIT_KEY`'s key slot must be in range for the bound table
-(§5). Same-procedure-only, exactly as that file already checks stream forks
-and object handles — and exact rather than conservative, since §3's scoping
-is the real rule and not an approximation of a wider one.
+or finished, and a `key` parameter (§4.1), if present, must be in range
+for the bound table (§5). Same-procedure-only, exactly as that file already checks stream
+forks and object handles — and exact rather than conservative, since §3's
+scoping is the real rule and not an approximation of a wider one.
 
-One ordering rule: every `SET_PARAM` on a handle must precede the first
-`ABSORB`/`XFORM`/`FINAL` on it, so a context has one configuration phase
-and is never reconfigured mid-stream. The same flow-sensitive walk that
-tracks initialization tracks that.
+No ordering rule is needed: configuration exists only inside `INIT` (§3.1),
+so a context cannot be reconfigured mid-stream by construction.
 
 Neither `alg` nor a parameter name is validated here. Whether either is
 implemented is a target-codegen question, not a structural one, and failing
@@ -165,7 +174,7 @@ table it ships, a field name into the string table it ships. `alg = 47`
 resolves against a table nobody ships, and the two parties holding it were
 built independently, which is the definition of drift.
 
-This is the choice codec-image.md §2.1 already made for the same reason —
+This is the choice reconciliation.md §4.1 already made for the same reason —
 struct fields and union variants match by name, never by position, because
 two independently-evolved builds cannot be assumed to agree on a number
 neither of them allocated. Algorithm identity is that problem exactly.
@@ -186,7 +195,7 @@ length-prefixed handful of bytes against an image carrying a whole type
 tree and two programs.
 
 It also makes the failure legible. An image may name an algorithm the
-consumer's build does not implement, which is codec-image.md §3's ordinary
+consumer's build does not implement, which is reconciliation.md §4's ordinary
 situation rather than a corruption. "unknown algorithm `SHAKE256`" is
 actionable at codegen; "unknown alg 47" is forensics.
 
@@ -217,12 +226,11 @@ need a wire-format change to express. So parameters are **named**, by the
 same rule and for the same reason — a parameter is named by the standards
 body that named the algorithm, not by this repo. For CRCs the names are
 Rocksoft's own field names (`width`, `poly`, `init`, `refin`, `refout`,
-`xorout`), so a custom CRC is `INIT c, "CRC"` followed by six
-`SET_PARAM`s, and a catalog CRC is just its catalog name with none.
+`xorout`), so a custom CRC is `INIT c, "CRC"` carrying six parameters,
+and a catalog CRC is just its catalog name with none.
 
-Two value shapes, because that is what the set actually contains: an
-integer (`SET_PARAM`) and a byte string (`SET_PARAM_BYTES`). Both are
-literal, as isa-core.md §11.3 requires of every extension operand anyway,
+Values are integers or byte strings, and the name alone says which. Both
+are literal, as isa-core.md §11.3 requires of every extension operand anyway,
 which is also the line that says where anything else goes: **a parameter is
 a compile-time constant; anything that varies per message is a stream range
 or arrives in `acc`.**
@@ -232,24 +240,22 @@ the rule the whole mechanism depends on, and the one a named bag invites
 getting wrong. A parameter is contractual — silently dropping `tag_len` 12
 yields a codec that runs and interoperates incorrectly, which is strictly
 worse than one that refuses to build. Same reasoning as isa-core.md §5.3's
-unassigned sub-codes and quantities.md §6's unknown decorator tag.
+unassigned sub-codes and reconciliation.md §3.1's unknown decorator tag.
 
-The generalization stops short of key material. A key could be spelled as
-one more named parameter, and should not be: a parameter is public contract
+Key material never becomes a parameter: a parameter is public contract
 that travels in the image identically for both parties, whereas a key is
-host-bound capability that never enters the image at all (§5). Sharing one
-mechanism would blur the single boundary this document works hardest to
-draw, and `INIT_KEY`'s slot operand is also what `validate-handles.ts`
-bounds-checks.
+host-bound capability that never enters the image at all (§5). What does
+travel is the `key` parameter, a slot index — public, literal, and the one
+parameter name `validate-handles.ts` itself interprets, to bounds-check it.
 
 Placement, then, is four-way and worth stating once:
 
 | what | where | why |
 |---|---|---|
 | algorithm identity | the `INIT` name (§4) | named by a standards body |
-| contractual constants | named parameters (§4.1) | literal, in the image, both sides must agree |
+| contractual constants | `INIT`'s named parameters (§4.1) | literal, in the image, both sides must agree |
 | per-message data (IV, nonce, AAD, payload, tag) | stream ranges (§3) | varies per message |
-| key material | a host-bound slot (§5) | never in the image at all |
+| key material | a host-bound slot, selected by the `key` parameter (§5) | never in the image at all |
 
 ## 5. Key material
 
@@ -258,11 +264,11 @@ Two constraints settle it:
 - **A key is never an ISA value.** The value stack is 32-bit integers and
   `acc` is a register.
 - **A key is never an object handle.** The object tree is the application's
-  data model, and codec-image.md §3's whole reconciliation story assumes
+  data model, and reconciliation.md §4's whole reconciliation story assumes
   everything in it is describable, defaultable and wire-shippable. A key is
   none of those.
 
-So: a **host-bound key slot table**. `INIT_KEY`'s `key` operand is a
+So: a **host-bound key slot table**. `INIT`'s `key` parameter is a
 literal index into a table the host binds at codec instantiation, exactly
 parallel to `createCodecExtension`'s existing `root: Handle` parameter. In
 a test the slot holds bytes; in firmware it holds a PSA `psa_key_id_t`, a
@@ -279,10 +285,10 @@ the application's.
 **The image carries a per-slot requirement, never a key or a key
 identity.** "Slot 0 must be an AES-128 key" is what a consumer's codegen
 needs to check it has something to bind before generating code it cannot
-run. This is a new kind of image content: codec-image.md §5's list is a
+run. This is a new kind of image content: codec-image.md §2's list is a
 type tree plus two programs, and a crypto-using program is the first thing
 needing a third entry. Whether that warrants a container version bump is
-open, as it is in quantities.md §6.
+open, as it is in reconciliation.md §3.1.
 
 ## 6. Staging
 
@@ -330,7 +336,7 @@ What being a transform op introduces:
   no mechanism: the codec body positions it with ordinary `READ`/`WRITE`,
   and it reaches the context through `ABSORB` like anything else. A legacy
   protocol's *fixed* IV is the other case, a schema constant rather than
-  per-message data, so it is a `SET_PARAM_BYTES` (§4.1) — with the usual
+  per-message data, so it is a byte-string parameter (§4.1) — with the usual
   caveat that a fixed IV is fatal for CTR and GCM and merely bad for CBC.
 - **No padding in the op.** Padding is bytes, and the DSL already writes
   bytes. Keeping it out leaves `XFORM` a pure range transform; CBC's
