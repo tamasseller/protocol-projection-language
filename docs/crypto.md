@@ -21,6 +21,17 @@ They are not core ops. isa-core.md §5.3 reserves `MISC_BINARY` for
 general-purpose arithmetic the core should own; a CRC is domain work, and
 belongs where the stream iterators it reads from already live.
 
+### 1.1 Placement: beneath the codec mapping
+
+- A CRC, MAC or AEAD tag is wire detail. No schema field or semantic type names it.
+- The codec layer computes and writes it on encode, reads and checks it on decode.
+- Happy path is transparent: the decoded tree is exactly what the unframed codec yields.
+- The only visible behaviour is a `TRAP` on mismatch.
+- Crypto not intertwined with packet framing (handshakes, application-level signing or encryption) is an application concern (§8).
+- The carrier is a framing codec rule, opted in through the rules array like `delta-leb128.ts`: `framed(spec, inner)` wraps `inner`'s fragment in a prologue and epilogue.
+- It wraps a rule, not a procedure: `CALL_CODEC` binds only `child(src, ref)` (codec-extension.md §3.3), so a frame cannot delegate its own `o0`.
+- The frame's fork iterators and crypto handles come from `CodecScope`, so they cannot collide with `inner`'s.
+
 ## 2. Opcode space
 
 There is none left:
@@ -83,9 +94,15 @@ load-bearing decision:
   sense: the raw byte run's start and end are visible to a target's
   `raise.ts` pass with nothing op-internal left to account for, so a
   hardware CRC unit or a DMA descriptor can take the whole range.
-- Byte counts arrive in `acc`, the way `WRITE_SEQ`/`READ_SEQ` take their
-  element count (codec-extension.md §3.5), keeping every op agnostic to how
-  the surrounding codec encoded the length.
+- **An absorbed range ends at another iterator, not a count.** `ABSORB c,
+  src, end` advances reader `src` until it reaches `end`'s position. Every
+  iterator is a fork of the one stream (codec-extension.md §2.1), so the
+  positions compare; `src` already past `end` traps. A frame covers a body
+  that a delegate wrote or read, and the frame never learns its length.
+- `XFORM`'s count alone arrives in `acc`, as `WRITE_SEQ`'s does
+  (codec-extension.md §3.5): a decoder's ciphertext lies ahead of every
+  cursor, so only framing (a length prefix) says where it ends.
+- Output and tag lengths are context configuration (§3.1), never operands.
 
 ### 3.1 Instruction sketch
 
@@ -100,15 +117,16 @@ intact.
 | Op | Effect |
 |---|---|
 | `INIT c, "alg", params` | fresh, fully configured context in slot `c` |
-| `ABSORB c, iter` | consume `acc` bytes from `stream[iter]` into `c` |
-| `FINAL c, iter` | write `acc` bytes of result to `stream[iter]` |
+| `ABSORB c, src, end` | advance reader `src` to `end`'s position, absorbing every byte it passes |
+| `FINAL c, iter` | write the result, at its configured length, to `stream[iter]` |
 | `FINAL_VAL c` | `acc` = the result as an integer (CRC, ≤32 bits) |
 | `XFORM c, src, dst` | transform `acc` bytes from `stream[src]` to `stream[dst]` (§6.1) |
-| `VERIFY c, iter` | compare against the tag at `stream[iter]`; `TRAP` on mismatch |
+| `VERIFY c, iter, code` | read the configured tag length from `stream[iter]` and compare; `TRAP code` on mismatch |
 
-`FINAL`'s `acc` is the output length, which is what an XOF needs; for a
-fixed-length algorithm it must equal the natural digest length or trap,
-rather than a second opcode existing to say the same thing.
+Output length is configuration: the natural digest length, a `tag_len`
+parameter for a truncated tag, an `out_len` parameter for an XOF (§4.1).
+`FINAL` and `VERIFY` read it from the context, so the two directions
+cannot disagree on it. `code` is a literal, as in `TRAP` (isa-core.md §4.5).
 
 **A context's whole configuration is one instruction.** Every part of it
 is literal (isa-core.md §11.3), so nothing is gained by spreading it over
@@ -139,11 +157,11 @@ isa-core.md §11.2, as `ExtOpEffect` (`mog-core/src/extension.ts`). All
 
 | Op | Acc |
 |---|---|
-| `INIT`/`VERIFY` | `killsAcc` |
-| `ABSORB`/`FINAL`/`XFORM` | `readsAcc` (the byte count) |
+| `INIT`/`ABSORB`/`FINAL`/`VERIFY` | `killsAcc` |
+| `XFORM` | `readsAcc` (the byte count) |
 | `FINAL_VAL` | `writesAcc` |
 
-`killsAcc` on both for the reason codec-extension.md §6.3 gives
+`killsAcc` on all four for the reason codec-extension.md §6.3 gives
 for `ENTER`/`CLONE_*`: every one is helper-call work on a real target,
 where the accumulator's register is an argument register.
 
@@ -152,7 +170,8 @@ where the accumulator's register is an argument register.
 `validate-handles.ts`'s existing pattern, extended with a third
 environment. A crypto handle must be initialized before it is absorbed into
 or finished, and a `key` parameter (§4.1), if present, must be in range
-for the bound table (§5). Same-procedure-only, exactly as that file already checks stream
+for the bound table (§5). `ABSORB`'s `src` must be a `CLONE_RD` fork;
+`end` may be any iterator. Same-procedure-only, exactly as that file already checks stream
 forks and object handles — and exact rather than conservative, since §3's
 scoping is the real rule and not an approximation of a wider one.
 
@@ -162,6 +181,28 @@ so a context cannot be reconfigured mid-stream by construction.
 Neither `alg` nor a parameter name is validated here. Whether either is
 implemented is a target-codegen question, not a structural one, and failing
 there is what produces a useful message (§4).
+
+### 3.4 `ir` surface: string literals
+
+The `ir` language has only numeric literals (`ast.ts`'s `Literal`), and
+`alg` and parameter names are strings. The additions, all in `mog-core`:
+
+- **Grammar** (`grammer.pegjs`): `"..."`, UTF-8, escapes `\"` and `\\` only, so a name is always valid UTF-8. Byte strings as `x"0a1b..."`, even digit count, lowercase hex.
+- **AST**: `StringLiteral { value: string; raw }` and `BytesLiteral { value: readonly number[]; raw }`, leaves beside `Literal`, reused as-is by `east.ts`.
+- **Types** (`types.ts`): neither has a value type. Legal only as a builtin or extension call's argument; anywhere else (operand, assignment, procedure argument, `return`) is a type error. ISA values stay 32-bit integers.
+- **Matcher**: `pString()`/`pBytes()`, matching only their own literal. `pConst()` never matches one.
+- **Parameter lists**: `pImmediate()` matches a constant, string or byte string. `INIT`'s rule is `pBuiltinCall("crypto_init", pConst(), pString(), pTail(pImmediate()))`, the tail read as name/value pairs.
+- A malformed tail (odd length, non-string name, repeated name) fails in the rule's lowering, at compile time.
+- Byte strings are needed first by stage 4's fixed IV; stage 1 needs only `StringLiteral`.
+
+```
+crypto_init(0, "CRC", "width", 16, "poly", 0x1021, "init", 0xffff,
+            "refin", 0, "refout", 0, "xorout", 0);
+```
+
+DSL names are `crypto_init`, `absorb`, `final`, `final_val`, `xform`,
+`verify`, with operands in §3.1's order and `XFORM`'s count as a trailing
+`pRtl("acc")`, as `write_seq` takes its count.
 
 ## 4. Algorithm identity
 
@@ -295,10 +336,11 @@ open, as it is in reconciliation.md §3.1.
 Each stage named by the new problem it introduces, not by algorithm count:
 
 1. **CRC.** Catalog-named, or named `"CRC"` with Rocksoft parameters for
-   the long tail (§4.1); no key material, no isolation question.
-   codec-extension.md §8.4's loop collapses to
-   `INIT`/`ABSORB`/`FINAL_VAL`, and it builds the whole range-I/O
-   plumbing.
+   the long tail (§4.1); no key material, no isolation question. Encode:
+   fork at body start, `inner`'s body, `ABSORB`, `FINAL_VAL`, `WRITE`.
+   Decode: the same `ABSORB`, then `READ` and codec-extension.md §8.7's
+   compare-and-`TRAP`. Builds the range-I/O plumbing, §3.4's string
+   literal and §1.1's `framed` rule. Done when §6.2 passes.
 2. **Hashes, fixed and XOF (SHAKE).** Introduces variable output length,
    which is what forces `FINAL`'s destination to be a stream iterator
    rather than `acc`.
@@ -347,6 +389,19 @@ Composing a bare cipher correctly is the schema author's job. The standard
 failure is an unauthenticated CBC padding oracle, and stage 5 is the
 default when nothing forces the split.
 
+### 6.2 Stage 1 tests
+
+- `ppl/test/codecs/crc-frame.test.ts`, under the interpreter:
+  - a `framed` struct round-trips to the tree it was encoded from;
+  - its wire bytes are the unframed codec's bytes followed by the CRC;
+  - a frame around a variable-length delegated body (a list) round-trips, which exercises `ABSORB`'s catch-up;
+  - each implemented catalog name, and its `"CRC"` parameter spelling, yields the catalog's `check` value over `"123456789"`;
+  - one flipped bit in body or CRC traps with the frame's code, and nothing else observable differs.
+- `ppl/test/target-js/crc-frame.runtime.test.ts`: the round-trip and trap cases again, through generated code.
+- `wire.test.ts`: the escape and every sub-code round-trip, `params` TLV included; an unassigned sub-code is rejected; `SEEK`'s single-code form.
+- `validate-handles.test.ts`: rejects `ABSORB` on an uninitialized handle, `ABSORB` from a writer fork, a handle used outside its procedure.
+- `mog-core`: a string literal parses with both escapes; one outside a call argument is a type error.
+
 ## 7. Target codegen
 
 One native call per op. `target-js`'s `codec-codegen-ext.ts` gains one case
@@ -358,6 +413,7 @@ precedent exactly, and the reason §3 insists on the range form.
 ## 8. Out of scope
 
 - **Key establishment** (§5).
+- **Crypto not tied to packet framing** (§1.1): handshakes, application-level signing or encryption.
 - **Composable `Extension`s in `mog-core`** (§2.1).
 - **Signatures and asymmetric operations.** A different lifecycle, with no
   streaming update in this shape, and no call-out case yet.
@@ -374,7 +430,7 @@ precedent exactly, and the reason §3 insists on the range form.
 | **CRC RevEng catalog** | the canonical CRC naming registry (`CRC-32/ISO-HDLC` and ~100 more), so §4's names are looked up rather than invented. |
 | **Rocksoft CRC model** | the (width, poly, init, refin, refout, xorout) parametrization, whose field names are §4.1's parameter names for an unnamed CRC. |
 | **NIST SP 800-38C / 38D** | tag length, and CCM's nonce length, as explicit *mode* parameters rather than part of the algorithm's name — §4.1's motivating case beyond CRC. |
-| **FIPS 202 / NIST SP 800-185** | XOF semantics: output length is a caller parameter, which is what §3.1's `FINAL` is shaped around. |
+| **FIPS 202 / NIST SP 800-185** | XOF semantics: output length is a caller parameter, which §4.1 makes `out_len`. |
 | **RFC 5116** | the AEAD interface (nonce, AAD, tag) stage 5 implements. |
 | **TLS 1.2 record layer (RFC 5246)** | the cipher-plus-separate-MAC composition §6.1 exists to support. |
 | **mbedTLS, TinyCrypt** | the reality check on what an embedded target's library actually offers, and at what granularity. |
