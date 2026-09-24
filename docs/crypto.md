@@ -31,6 +31,7 @@ belongs where the stream iterators it reads from already live.
 - The carrier is a framing codec rule, opted in through the rules array like `delta-leb128.ts`: `framed(spec, inner)` wraps `inner`'s fragment in a prologue and epilogue.
 - It wraps a rule, not a procedure: `CALL_CODEC` binds only `child(src, ref)` (codec-extension.md §3.3), so a frame cannot delegate its own `o0`.
 - The frame's fork iterators and crypto handles come from `CodecScope`, so they cannot collide with `inner`'s.
+- `CodecScope` gains a third allocator, `CryptoId`, splicing as its number like `IterId`, per procedure as §3 scopes handles.
 
 ## 2. Opcode space
 
@@ -106,7 +107,7 @@ load-bearing decision:
 
 ### 3.1 Instruction sketch
 
-Six sub-codes, enough for all five stages of §6. Handle and iterator IDs
+Five sub-codes, enough for all five stages of §6. Handle and iterator IDs
 are LEB128 after the escape's sub-code — no compact index forms, by
 `WRITE_SEQ`'s argument (codec-extension.md §6.4): the per-op cost amortizes
 over the range the op processes. `alg` is a length-prefixed UTF-8 name
@@ -119,7 +120,6 @@ intact.
 | `INIT c, "alg", params` | fresh, fully configured context in slot `c` |
 | `ABSORB c, src, end` | advance reader `src` to `end`'s position, absorbing every byte it passes |
 | `FINAL c, iter` | write the result, at its configured length, to `stream[iter]` |
-| `FINAL_VAL c` | `acc` = the result as an integer (CRC, ≤32 bits) |
 | `XFORM c, src, dst` | transform `acc` bytes from `stream[src]` to `stream[dst]` (§6.1) |
 | `VERIFY c, iter, code` | read the configured tag length from `stream[iter]` and compare; `TRAP code` on mismatch |
 
@@ -127,6 +127,13 @@ Output length is configuration: the natural digest length, a `tag_len`
 parameter for a truncated tag, an `out_len` parameter for an XOF (§4.1).
 `FINAL` and `VERIFY` read it from the context, so the two directions
 cannot disagree on it. `code` is a literal, as in `TRAP` (isa-core.md §4.5).
+
+A CRC's result is an integer, and its wire form is configuration too:
+`ceil(width / 8)` bytes, unused high bits zero, in the order the
+`byteorder` parameter gives (0 little-endian, 1 big-endian). Its default
+follows `refout`: little-endian for a reflected CRC, big-endian otherwise,
+the convention the catalog's reflected and unreflected CRCs are sent in.
+No op yields a result into `acc`: nothing on the happy path reads it (§1.1).
 
 **A context's whole configuration is one instruction.** Every part of it
 is literal (isa-core.md §11.3), so nothing is gained by spreading it over
@@ -159,7 +166,6 @@ isa-core.md §11.2, as `ExtOpEffect` (`mog-core/src/extension.ts`). All
 |---|---|
 | `INIT`/`ABSORB`/`FINAL`/`VERIFY` | `killsAcc` |
 | `XFORM` | `readsAcc` (the byte count) |
-| `FINAL_VAL` | `writesAcc` |
 
 `killsAcc` on all four for the reason codec-extension.md §6.3 gives
 for `ENTER`/`CLONE_*`: every one is helper-call work on a real target,
@@ -185,10 +191,13 @@ there is what produces a useful message (§4).
 ### 3.4 `ir` surface: string literals
 
 The `ir` language has only numeric literals (`ast.ts`'s `Literal`), and
-`alg` and parameter names are strings. The additions, all in `mog-core`:
+`alg` and parameter names are strings. Compile-time string literals are an
+extension-agnostic `mog-core` DSL feature that the core itself never
+consumes; other extensions can use them too (debug or log output). The spec
+moves to isa-core.md §10 when built. The additions:
 
 - **Grammar** (`grammer.pegjs`): `"..."`, UTF-8, escapes `\"` and `\\` only, so a name is always valid UTF-8. Byte strings as `x"0a1b..."`, even digit count, lowercase hex.
-- **AST**: `StringLiteral { value: string; raw }` and `BytesLiteral { value: readonly number[]; raw }`, leaves beside `Literal`, reused as-is by `east.ts`.
+- **AST**: `StringLiteral { value: string; raw }` and `BytesLiteral { value: readonly number[]; raw }`, leaves beside `Literal`, reused as-is by `east.ts`, and added to `ast.ts`'s closed `recurseOver`/`mapOver` switches and to `explain.ts`.
 - **Types** (`types.ts`): neither has a value type. Legal only as a builtin or extension call's argument; anywhere else (operand, assignment, procedure argument, `return`) is a type error. ISA values stay 32-bit integers.
 - **Matcher**: `pString()`/`pBytes()`, matching only their own literal. `pConst()` never matches one.
 - **Parameter lists**: `pImmediate()` matches a constant, string or byte string. `INIT`'s rule is `pBuiltinCall("crypto_init", pConst(), pString(), pTail(pImmediate()))`, the tail read as name/value pairs.
@@ -196,11 +205,11 @@ The `ir` language has only numeric literals (`ast.ts`'s `Literal`), and
 - Byte strings are needed first by stage 4's fixed IV; stage 1 needs only `StringLiteral`.
 
 ```
-crypto_init(0, "CRC", "width", 16, "poly", 0x1021, "init", 0xffff,
-            "refin", 0, "refout", 0, "xorout", 0);
+crypto_init(${c}, "CRC", "width", 16, "poly", 0x1021, "init", 0xffff,
+            "refin", 0, "refout", 0, "xorout", 0);   // CRC-16/IBM-3740
 ```
 
-DSL names are `crypto_init`, `absorb`, `final`, `final_val`, `xform`,
+DSL names are `crypto_init`, `absorb`, `final`, `xform`,
 `verify`, with operands in §3.1's order and `XFORM`'s count as a trailing
 `pRtl("acc")`, as `write_seq` takes its count.
 
@@ -270,6 +279,12 @@ Rocksoft's own field names (`width`, `poly`, `init`, `refin`, `refout`,
 `xorout`), so a custom CRC is `INIT c, "CRC"` carrying six parameters,
 and a catalog CRC is just its catalog name with none.
 
+- Catalog names are the whole RevEng catalogue, spelled exactly as each entry's `name=`.
+- An alias RevEng lists is rejected, and the error names its canonical entry.
+- The table is pinned to a dated catalogue snapshot, recorded beside it; each entry carries its `check` value.
+- `byteorder` is the one CRC parameter this repo names: Rocksoft models the value, not its wire form (§3.1).
+- A custom `"CRC"` is at most 32 bits wide, since `ir` integer literals are u32; wider CRCs are catalog names only.
+
 Values are integers or byte strings, and the name alone says which. Both
 are literal, as isa-core.md §11.3 requires of every extension operand anyway,
 which is also the line that says where anything else goes: **a parameter is
@@ -337,13 +352,11 @@ Each stage named by the new problem it introduces, not by algorithm count:
 
 1. **CRC.** Catalog-named, or named `"CRC"` with Rocksoft parameters for
    the long tail (§4.1); no key material, no isolation question. Encode:
-   fork at body start, `inner`'s body, `ABSORB`, `FINAL_VAL`, `WRITE`.
-   Decode: the same `ABSORB`, then `READ` and codec-extension.md §8.7's
-   compare-and-`TRAP`. Builds the range-I/O plumbing, §3.4's string
-   literal and §1.1's `framed` rule. Done when §6.2 passes.
-2. **Hashes, fixed and XOF (SHAKE).** Introduces variable output length,
-   which is what forces `FINAL`'s destination to be a stream iterator
-   rather than `acc`.
+   fork at body start, `inner`'s body, `ABSORB`, `FINAL`. Decode: the same
+   fork and `ABSORB`, then `VERIFY`. Builds the range-I/O plumbing, §3.4's
+   string literal and §1.1's `framed` rule. Done when §6.2 passes.
+2. **Hashes, fixed and XOF (SHAKE).** Introduces byte-string results and
+   `out_len` (§4.1).
 3. **MAC / HMAC.** First appearance of the key slot table (§5).
 4. **Bare cipher** (CTR, CBC). First *transform* op: stages 1-3 absorb a
    range and yield a small value, this one is range in, range out (§6.1).
@@ -393,10 +406,11 @@ default when nothing forces the split.
 
 - `ppl/test/codecs/crc-frame.test.ts`, under the interpreter:
   - a `framed` struct round-trips to the tree it was encoded from;
-  - its wire bytes are the unframed codec's bytes followed by the CRC;
+  - its wire bytes are the unframed codec's bytes followed by the CRC, in `byteorder`'s default and in both explicit orders;
   - a frame around a variable-length delegated body (a list) round-trips, which exercises `ABSORB`'s catch-up;
-  - each implemented catalog name, and its `"CRC"` parameter spelling, yields the catalog's `check` value over `"123456789"`;
-  - one flipped bit in body or CRC traps with the frame's code, and nothing else observable differs.
+  - every catalogue entry yields its `check` value over `"123456789"`, and so does its `"CRC"` parameter spelling where it is at most 32 bits wide;
+  - a RevEng alias is rejected, naming its canonical entry;
+  - one flipped bit in body or CRC makes `VERIFY` trap with the frame's code, and nothing else observable differs.
 - `ppl/test/target-js/crc-frame.runtime.test.ts`: the round-trip and trap cases again, through generated code.
 - `wire.test.ts`: the escape and every sub-code round-trip, `params` TLV included; an unassigned sub-code is rejected; `SEEK`'s single-code form.
 - `validate-handles.test.ts`: rejects `ABSORB` on an uninitialized handle, `ABSORB` from a writer fork, a handle used outside its procedure.

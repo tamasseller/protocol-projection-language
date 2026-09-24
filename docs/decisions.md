@@ -66,6 +66,10 @@ collide across independently-authored fragments is allocated → TS.
 Procedure identity already follows this rule: `${proc}` mints a name, no
 one writes `__proc7`.
 
+The freeze covers allocation and ergonomic syntax, not extension-agnostic
+literal forms: compile-time string literals are a `mog-core` DSL feature
+(crypto.md §3.4).
+
 ### Why not the DSL
 
 **Declaration statements** pinning compile-time constants are redundant
