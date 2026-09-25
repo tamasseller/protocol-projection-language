@@ -1,7 +1,7 @@
 # Crypto primitives
 
-**Status: design sketch, unimplemented.** TODO.md's "crypto
-extension". Nothing in `src/` references any of this yet.
+**Status: stages 1 (CRC), 2 (keyless hashes) and 3 (MACs) implemented; stages 4–5 unimplemented. §5's provider model supersedes stage 3's `keys` table; §7's injection point is unimplemented.** TODO.md's
+"crypto extension".
 
 ## 1. The gap
 
@@ -27,8 +27,15 @@ belongs where the stream iterators it reads from already live.
 - The codec layer computes and writes it on encode, reads and checks it on decode.
 - Happy path is transparent: the decoded tree is exactly what the unframed codec yields.
 - The only visible behaviour is a `TRAP` on mismatch.
-- Crypto not intertwined with packet framing (handshakes, application-level signing or encryption) is an application concern (§8).
-- The carrier is a framing codec rule, opted in through the rules array like `delta-leb128.ts`: `framed(spec, inner)` wraps `inner`'s fragment in a prologue and epilogue.
+- Anything in the packet may be a tree field; anything the host needs from it must be one (a sequence number, an explicit IV, a session id).
+- A crypto op sees exactly three things: packet ranges (§3), literal parameters (§4.1) and slots (§5).
+- Crypto above packet coding (handshakes, key derivation, nonce construction, session management) is the host's (§8).
+- Main target: application-layer protocols on untrusted channels, with crypto tailored to the application and devices. Transport protocols (TLS, ESP, QUIC) are a proof of generality, not a use case.
+- A real legacy codec's framing is custom DSL; the frame below is a composable utility that knows nothing of message structure.
+- The carrier is a framing codec rule, opted in through the rules array like `delta-leb128.ts`: `framedEncode`/`framedDecode(spec, inner, name?)` wrap `inner`'s fragment.
+- Wire layout `[crc][body]`: the CRC covers the rest of the stream, so a frame is the last thing its stream carries.
+- Encode is codec-extension.md §8.4's fixup: a placeholder through `i0`, the CRC written back through a parked `CLONE_WR` fork.
+- Decode verifies first: a reader clone absorbs the rest of the stream, `VERIFY` reads the tag through `i0`, and only then does the body decode.
 - It wraps a rule, not a procedure: `CALL_CODEC` binds only `child(src, ref)` (codec-extension.md §3.3), so a frame cannot delegate its own `o0`.
 - The frame's fork iterators and crypto handles come from `CodecScope`, so they cannot collide with `inner`'s.
 - `CodecScope` gains a third allocator, `CryptoId`, splicing as its number like `IterId`, per procedure as §3 scopes handles.
@@ -47,7 +54,7 @@ There is none left:
 `Extension` is also singular: bytecode.ts routes every byte ≥128 to one
 `Extension.codec`, so a standalone crypto extension is not expressible.
 
-### 2.1 An extension-level escape
+### 2.1 A crypto extension point
 
 `SEEK`'s band shrinks from `N + 1 = 5` codes to 1, with `iter` always
 LEB128'd alongside the zigzag `delta` it already carries. `SEEK` is
@@ -55,12 +62,13 @@ codec-extension.md §3.1's one op marked "(optional)", nothing in
 `src/codecs/components/` emits it, and its compact form therefore saves one
 byte on an op with no emitter. It stays fully functional, one byte longer.
 
-Of the four freed codes, one becomes `ESCAPE sub-code`, an unsigned LEB128
-sub-code plus whatever that sub-code's own operands are. This mirrors
-isa-core.md §5.3 one level down, for the same reason and with the same
+Of the four freed codes, byte 221 becomes `CRYPTO sub-code`: the extension
+point for crypto ops only, an unsigned LEB128 sub-code plus that op's own
+operands. It is shaped like isa-core.md §5.3's escapes, with the same
 payoff: two bytes instead of one, for a space that does not run out. A
 crypto op is per-message or per-field, never per-byte, so the second byte
-falls where nothing hot pays it. Three codes stay spare.
+falls where nothing hot pays it. The other three (222-224) stay spare and
+reserved.
 
 isa-core.md §5.3's unassigned-sub-code rule inherits verbatim. A sub-code
 has no length until it is assigned, so a decoder cannot skip an unknown one
@@ -82,7 +90,8 @@ Scoped like both of those: per frame, ids restarting at `c0` in every
 callee. A context is created and finished inside one procedure, which is
 also the shape a framing codec wants — the MAC covers what the delegated
 body wrote, and the delegate never sees the context computing it. Nothing
-below needs a context to outlive the call that made it.
+below needs a context to outlive the call that made it. State that outlives
+one codec invocation lives in slots (§5), never in a context.
 
 **All bulk data moves through stream iterators, never `acc`.** This is the
 load-bearing decision:
@@ -100,15 +109,17 @@ load-bearing decision:
   iterator is a fork of the one stream (codec-extension.md §2.1), so the
   positions compare; `src` already past `end` traps. A frame covers a body
   that a delegate wrote or read, and the frame never learns its length.
-- `XFORM`'s count alone arrives in `acc`, as `WRITE_SEQ`'s does
+- `ABSORB_REST c, src` advances reader `src` to the stream's end: the decode
+  side of a frame, whose body lies ahead of every cursor.
+- Open (§6.1): `XFORM`'s count alone arrives in `acc`, as `WRITE_SEQ`'s does
   (codec-extension.md §3.5): a decoder's ciphertext lies ahead of every
   cursor, so only framing (a length prefix) says where it ends.
 - Output and tag lengths are context configuration (§3.1), never operands.
 
 ### 3.1 Instruction sketch
 
-Five sub-codes, enough for all five stages of §6. Handle and iterator IDs
-are LEB128 after the escape's sub-code — no compact index forms, by
+Six sub-codes, enough for all five stages of §6. Handle and iterator IDs
+are LEB128 after the crypto sub-code — no compact index forms, by
 `WRITE_SEQ`'s argument (codec-extension.md §6.4): the per-op cost amortizes
 over the range the op processes. `alg` is a length-prefixed UTF-8 name
 (§4), inline rather than a string-table reference, which keeps
@@ -119,6 +130,7 @@ intact.
 |---|---|
 | `INIT c, "alg", params` | fresh, fully configured context in slot `c` |
 | `ABSORB c, src, end` | advance reader `src` to `end`'s position, absorbing every byte it passes |
+| `ABSORB_REST c, src` | advance reader `src` to the stream's end, absorbing every byte it passes |
 | `FINAL c, iter` | write the result, at its configured length, to `stream[iter]` |
 | `XFORM c, src, dst` | transform `acc` bytes from `stream[src]` to `stream[dst]` (§6.1) |
 | `VERIFY c, iter, code` | read the configured tag length from `stream[iter]` and compare; `TRAP code` on mismatch |
@@ -146,8 +158,8 @@ an `INIT` and a trail of setters.
 LEB128 length and that many value bytes; an empty name ends the list. The
 value's meaning is fixed by its name, never by the encoding, so a reader
 that knows no names can still skip every entry. Integer-valued parameters
-are unsigned little-endian, as wide as the value's length. A repeated name
-is a decode error.
+are unsigned little-endian, as wide as the value's length; a slot name is
+UTF-8. A repeated name is a decode error.
 
 A string operand costs nothing in `mog-core`: `ExtOpPayload`'s numeric
 `operands` is only the default payload shape, `CodecExtInstr` already
@@ -164,7 +176,7 @@ isa-core.md §11.2, as `ExtOpEffect` (`mog-core/src/extension.ts`). All
 
 | Op | Acc |
 |---|---|
-| `INIT`/`ABSORB`/`FINAL`/`VERIFY` | `killsAcc` |
+| `INIT`/`ABSORB`/`ABSORB_REST`/`FINAL`/`VERIFY` | `killsAcc` |
 | `XFORM` | `readsAcc` (the byte count) |
 
 `killsAcc` on all four for the reason codec-extension.md §6.3 gives
@@ -175,8 +187,7 @@ where the accumulator's register is an argument register.
 
 `validate-handles.ts`'s existing pattern, extended with a third
 environment. A crypto handle must be initialized before it is absorbed into
-or finished, and a `key` parameter (§4.1), if present, must be in range
-for the bound table (§5). `ABSORB`'s `src` must be a `CLONE_RD` fork;
+or finished. `ABSORB`'s `src` must be a `CLONE_RD` fork;
 `end` may be any iterator. Same-procedure-only, exactly as that file already checks stream
 forks and object handles — and exact rather than conservative, since §3's
 scoping is the real rule and not an approximation of a wider one.
@@ -184,7 +195,8 @@ scoping is the real rule and not an approximation of a wider one.
 No ordering rule is needed: configuration exists only inside `INIT` (§3.1),
 so a context cannot be reconfigured mid-stream by construction.
 
-Neither `alg` nor a parameter name is validated here. Whether either is
+Neither `alg` nor a parameter name is validated here, and nor is `key`:
+no slot exists when a program is validated (§5). Whether either is
 implemented is a target-codegen question, not a structural one, and failing
 there is what produces a useful message (§4).
 
@@ -194,10 +206,10 @@ The `ir` language has only numeric literals (`ast.ts`'s `Literal`), and
 `alg` and parameter names are strings. Compile-time string literals are an
 extension-agnostic `mog-core` DSL feature that the core itself never
 consumes; other extensions can use them too (debug or log output). The spec
-moves to isa-core.md §10 when built. The additions:
+is isa-core.md §10.2. The additions:
 
 - **Grammar** (`grammer.pegjs`): `"..."`, UTF-8, escapes `\"` and `\\` only, so a name is always valid UTF-8. Byte strings as `x"0a1b..."`, even digit count, lowercase hex.
-- **AST**: `StringLiteral { value: string; raw }` and `BytesLiteral { value: readonly number[]; raw }`, leaves beside `Literal`, reused as-is by `east.ts`, and added to `ast.ts`'s closed `recurseOver`/`mapOver` switches and to `explain.ts`.
+- **AST**: `StringLiteral { value: string; raw }` and `BytesLiteral { value: readonly number[]; raw }`, leaves beside `Literal`, reused as-is by `east.ts`; `explain.ts` never blames one.
 - **Types** (`types.ts`): neither has a value type. Legal only as a builtin or extension call's argument; anywhere else (operand, assignment, procedure argument, `return`) is a type error. ISA values stay 32-bit integers.
 - **Matcher**: `pString()`/`pBytes()`, matching only their own literal. `pConst()` never matches one.
 - **Parameter lists**: `pImmediate()` matches a constant, string or byte string. `INIT`'s rule is `pBuiltinCall("crypto_init", pConst(), pString(), pTail(pImmediate()))`, the tail read as name/value pairs.
@@ -209,7 +221,7 @@ crypto_init(${c}, "CRC", "width", 16, "poly", 0x1021, "init", 0xffff,
             "refin", 0, "refout", 0, "xorout", 0);   // CRC-16/IBM-3740
 ```
 
-DSL names are `crypto_init`, `absorb`, `final`, `xform`,
+DSL names are `crypto_init`, `absorb`, `absorb_rest`, `final`, `xform`,
 `verify`, with operands in §3.1's order and `XFORM`'s count as a trailing
 `pRtl("acc")`, as `write_seq` takes its count.
 
@@ -234,7 +246,9 @@ third party names, numbers for what this repo names.** `ref` and
 `codec_idx` are numeric because the compiler here assigns them and the
 image is self-contained. Field names are strings because the schema author
 names them and two authors must agree. An algorithm is named by a standards
-body, so it is a string. The escape's own sub-codes (§2.1) stay numeric:
+body, so it is a string. A slot is named by the schema author, and a party
+conforming to another's image must map it onto its own provider state, so
+it is a string too, inline like `alg`. The crypto sub-codes (§2.1) stay numeric:
 this repo allocates them in `opcodes.ts` and ships the code that reads
 them, with no second party in the loop.
 
@@ -285,11 +299,11 @@ and a catalog CRC is just its catalog name with none.
 - `byteorder` is the one CRC parameter this repo names: Rocksoft models the value, not its wire form (§3.1).
 - A custom `"CRC"` is at most 32 bits wide, since `ir` integer literals are u32; wider CRCs are catalog names only.
 
-Values are integers or byte strings, and the name alone says which. Both
+Values are integers or byte strings, or for a slot role a slot name, and the name alone says which.
+Lowering enforces the last: a slot role's value must be a string literal, and no other parameter's may be. Both
 are literal, as isa-core.md §11.3 requires of every extension operand anyway,
 which is also the line that says where anything else goes: **a parameter is
-a compile-time constant; anything that varies per message is a stream range
-or arrives in `acc`.**
+a compile-time constant; anything else is a stream range or a slot (§5).**
 
 **An unrecognized parameter name is a hard error, never ignored.** This is
 the rule the whole mechanism depends on, and the one a named bag invites
@@ -298,11 +312,11 @@ yields a codec that runs and interoperates incorrectly, which is strictly
 worse than one that refuses to build. Same reasoning as isa-core.md §5.3's
 unassigned sub-codes and reconciliation.md §3.1's unknown decorator tag.
 
-Key material never becomes a parameter: a parameter is public contract
-that travels in the image identically for both parties, whereas a key is
-host-bound capability that never enters the image at all (§5). What does
-travel is the `key` parameter, a slot index — public, literal, and the one
-parameter name `validate-handles.ts` itself interprets, to bounds-check it.
+Slot content never becomes a parameter: a parameter is public contract
+that travels in the image identically for both parties, whereas a slot is
+provider state that never enters the image at all (§5). What does travel
+is a slot name under a role name (`key`, `iv`, `nonce`): public, literal,
+and resolved like any other parameter.
 
 Placement, then, is four-way and worth stating once:
 
@@ -310,41 +324,54 @@ Placement, then, is four-way and worth stating once:
 |---|---|---|
 | algorithm identity | the `INIT` name (§4) | named by a standards body |
 | contractual constants | `INIT`'s named parameters (§4.1) | literal, in the image, both sides must agree |
-| per-message data (IV, nonce, AAD, payload, tag) | stream ranges (§3) | varies per message |
-| key material | a host-bound slot, selected by the `key` parameter (§5) | never in the image at all |
+| associated data, payload, tag | stream ranges (§3) | in the packet |
+| keys, IVs, nonces, counters | slots, selected by role parameters (§5) | outlive one invocation; the host manages them |
 
-## 5. Key material
+### 4.2 Hash names
 
-Two constraints settle it:
+Provided by `@noble/hashes`, pinned to 1.x: 2.x is ESM-only and ppl is CommonJS.
+A keyless digest gives integrity against accident, never authenticity; that is stage 3's MAC.
 
-- **A key is never an ISA value.** The value stack is 32-bit integers and
-  `acc` is a register.
-- **A key is never an object handle.** The object tree is the application's
-  data model, and reconciliation.md §4's whole reconciliation story assumes
-  everything in it is describable, defaultable and wire-shippable. A key is
-  none of those.
+| names | standard | parameters |
+|---|---|---|
+| `SHA-224` `SHA-256` `SHA-384` `SHA-512` `SHA-512/224` `SHA-512/256` | FIPS 180-4 | `tag_len`: truncate to a prefix |
+| `SHA3-224` `SHA3-256` `SHA3-384` `SHA3-512` | FIPS 202 | `tag_len` |
+| `SHAKE128` `SHAKE256` | FIPS 202 | `out_len`, required |
+| `BLAKE2b` `BLAKE2s` | RFC 7693 | `out_len` (default 64 / 32), `salt` and `personal` (16 / 8 bytes) |
+| `MD5` `SHA-1` | RFC 1321, RFC 3174 | `tag_len`; legacy wire formats only |
 
-So: a **host-bound key slot table**. `INIT`'s `key` parameter is a
-literal index into a table the host binds at codec instantiation, exactly
-parallel to `createCodecExtension`'s existing `root: Handle` parameter. In
-a test the slot holds bytes; in firmware it holds a PSA `psa_key_id_t`, a
-TPM object handle, a secure-element slot number. Isolation needs no extra
-mechanism, because the bytecode never held the key.
+- BLAKE2's `out_len` is its own digest, not a truncation.
+- BLAKE2's `key` makes it a MAC (§4.3).
 
-Two consequences:
+### 4.3 MAC names
 
-**Key establishment is above this layer.** DH, session negotiation,
-ratcheting: out of scope, as a hard boundary rather than an omission. A
-codec transforms bytes under a bound key; how that key came to be bound is
-the application's.
+| names | standard | parameters |
+|---|---|---|
+| `HMAC-<hash>`, for every fixed-length §4.2 name, e.g. `HMAC-SHA-256` | RFC 2104, RFC 4231 | `key`, required; `tag_len` |
+| `KMAC128` `KMAC256` | NIST SP 800-185 | `key` and `out_len`, required; `customization`, a byte string |
+| `BLAKE2b` `BLAKE2s` with `key` | RFC 7693 | §4.2's, plus `key` |
 
-**The image carries a per-slot requirement, never a key or a key
-identity.** "Slot 0 must be an AES-128 key" is what a consumer's codegen
-needs to check it has something to bind before generating code it cannot
-run. This is a new kind of image content: codec-image.md §2's list is a
-type tree plus two programs, and a crypto-using program is the first thing
-needing a third entry. Whether that warrants a container version bump is
-open, as it is in reconciliation.md §3.1.
+- A key is at least 1 byte; a BLAKE2 key at most its natural digest length (64 / 32).
+- AES-CMAC needs a block cipher: stage 4, with `@noble/ciphers`.
+- Poly1305 needs a fresh key per message: stage 5.
+- `VERIFY` compares every tag byte whatever the first mismatch; that is all §8's disclaimer leaves this repo to promise.
+
+## 5. Slots and the crypto provider
+
+- A slot is crypto provider state: a key, an IV, a nonce, a counter. `INIT` names slots under role parameters; an algorithm defines its roles.
+- A slot name is opaque UTF-8, compared exactly (§4), chosen by the schema author.
+- Reconciliation matches slots by name, as fields (reconciliation.md §4.1). Unimplemented.
+- A slot's algorithm and role, read off every `INIT` naming it, must agree between the two images; a mismatch is found at codegen.
+- A new slot extends the crypto side compatibly, but has no default: the consumer's host must provision it before conforming. Renaming is removing plus adding.
+- A context reads its slots, and updates them as its algorithm defines. On a `VERIFY` failure that handling is the provider's.
+- **Never an ISA value, never an object handle.** Slot content reaches neither `acc` nor the tree; the program only names slots.
+- The host manages slot content through the provider, however the target exposes that.
+- Representation, allocation (static or dynamic) and isolation (plain memory, a PSA key id, a secure element), uniform or per slot, are the target's.
+- In-packet data the host needs is a tree field. The host derives what it must from it (session keys, composite nonces) and loads slots for the packets that follow.
+- A decode whose crypto setup depends on the packet's clear part is two steps: one codec for the clear header, the host loads the slots, a second codec verifies and decodes the rest. The same shape as protocol layering, e.g. a gateway trunking end-to-end sessions over one transport session.
+- Only crypto state known before a packet is touched validates it.
+- A fresh IV on encode is loaded by the host: in practice a per-key counter, random only for CBC. An explicit part on the wire is a tree field the host also supplies.
+- Stage 3 implements slots as a per-call `keys: ReadonlyMap<string, Uint8Array>` table, checked by `keySlots`/`bindKeys`; §7's provider injection replaces it.
 
 ## 6. Staging
 
@@ -352,55 +379,33 @@ Each stage named by the new problem it introduces, not by algorithm count:
 
 1. **CRC.** Catalog-named, or named `"CRC"` with Rocksoft parameters for
    the long tail (§4.1); no key material, no isolation question. Encode:
-   fork at body start, `inner`'s body, `ABSORB`, `FINAL`. Decode: the same
-   fork and `ABSORB`, then `VERIFY`. Builds the range-I/O plumbing, §3.4's
-   string literal and §1.1's `framed` rule. Done when §6.2 passes.
+   parked tag fork and placeholder, `inner`'s body, `ABSORB`, `FINAL`.
+   Decode: `ABSORB_REST`, `VERIFY`, then `inner`'s body (§1.1). Builds the
+   range-I/O plumbing, §3.4's string literal and §1.1's framing rules.
 2. **Hashes, fixed and XOF (SHAKE).** Introduces byte-string results and
-   `out_len` (§4.1).
-3. **MAC / HMAC.** First appearance of the key slot table (§5).
-4. **Bare cipher** (CTR, CBC). First *transform* op: stages 1-3 absorb a
-   range and yield a small value, this one is range in, range out (§6.1).
-5. **AEAD.** Fuses 3 and 4 into one context, and adds a failure path:
-   decrypt can fail, so `VERIFY` traps with a codec-defined code
-   (codec-extension.md §8.7).
+   `out_len` (§4.1). No ISA change: a hash frame is §1.1's frame with a
+   §4.2 name.
+3. **MAC / HMAC.** First appearance of slots (§5).
+4. **Ciphers**, as modes of operation (§6.1). First *transform* op: stages
+   1-3 absorb a range and yield a small value, this one is range in, range
+   out.
+5. **AEAD.** `ABSORB` covers the associated data, sent in the clear;
+   `XFORM` the encrypted part; `FINAL`/`VERIFY` the tag. A nonce is a
+   per-algorithm slot input.
 
-Stage 5's hard problem, stated rather than solved: **a streaming decoder
-has already handed the application unverified plaintext by the time the tag
-check fails**, which conflicts with the sequential-cursor model
-codec-extension.md §3.4 commits to. The proposed rule is a mandatory
-two-pass — verify the tag over the whole range via a `CLONE_RD` fork first,
-then decode — which the existing fork mechanism supports with no new
-opcode. Confirm when stage 5 is built.
+Decode order is `XFORM`, `VERIFY`, then the body: no plaintext reaches a
+parser before the tag checks, which keeps codec-extension.md §3.4's
+sequential cursor.
 
-### 6.1 Bare encryption
+### 6.1 Modes of operation
 
-Included, not declined. Authentication composes at the layer above: that is
-what a TLS record layer does, and what every legacy protocol pairing a raw
-CBC or CTR cipher with a separate MAC does. Stage 3 plus stage 4 gives
-encrypt-then-MAC or MAC-then-encrypt with no further mechanism, and stage 5
-is the fused convenience rather than the only sanctioned path.
-
-What being a transform op introduces:
-
-- **Source and destination iterators.** In-place (`src == dst`) is the
-  ordinary encoder case: encrypt the range just written, through a
-  `CLONE_RD`/`CLONE_WR` fork pair. codec-extension.md §2.1's "a `CLONE_WR`
-  fork overwrites only, never appends" invariant is exactly the constraint
-  that makes it well-defined.
-- **IV and nonce are ranges.** One read from or written to the wire needs
-  no mechanism: the codec body positions it with ordinary `READ`/`WRITE`,
-  and it reaches the context through `ABSORB` like anything else. A legacy
-  protocol's *fixed* IV is the other case, a schema constant rather than
-  per-message data, so it is a byte-string parameter (§4.1) — with the usual
-  caveat that a fixed IV is fatal for CTR and GCM and merely bad for CBC.
-- **No padding in the op.** Padding is bytes, and the DSL already writes
-  bytes. Keeping it out leaves `XFORM` a pure range transform; CBC's
-  block-multiple requirement becomes a trap condition on a misaligned
-  range, not an implicit PKCS#7 nobody asked for.
-
-Composing a bare cipher correctly is the schema author's job. The standard
-failure is an unauthenticated CBC padding oracle, and stage 5 is the
-default when nothing forces the split.
+- A mode is a catalogue algorithm (`AES-128-CTR`, `AES-128-CBC`, `ChaCha20`, ...), never DSL composed from a block function: a target maps each onto its hardware when present.
+- Software-only algorithms (Keccak-based, ChaCha) are catalogue entries like any other.
+- The IV or nonce is a slot input (§5).
+- No padding in the op. Padding is bytes the DSL writes; CBC's block-multiple requirement is a trap on a misaligned range.
+- Open: `XFORM`'s extent. A count in `acc` (§3.1), or an end iterator as `ABSORB` takes, since an encoder knows its body only by iterator positions.
+- Open: decode's destination. In place, which makes the decode stream writable and has generated entry points copy the caller's input.
+- Open: a padding length computed at run time needs FINDINGS.md's remaining-length and `SEEK`-by-`acc` ops.
 
 ### 6.2 Stage 1 tests
 
@@ -408,13 +413,33 @@ default when nothing forces the split.
   - a `framed` struct round-trips to the tree it was encoded from;
   - its wire bytes are the unframed codec's bytes followed by the CRC, in `byteorder`'s default and in both explicit orders;
   - a frame around a variable-length delegated body (a list) round-trips, which exercises `ABSORB`'s catch-up;
+  - a frame followed by more of the stream traps;
   - every catalogue entry yields its `check` value over `"123456789"`, and so does its `"CRC"` parameter spelling where it is at most 32 bits wide;
   - a RevEng alias is rejected, naming its canonical entry;
-  - one flipped bit in body or CRC makes `VERIFY` trap with the frame's code, and nothing else observable differs.
+  - one flipped bit in body or CRC makes `VERIFY` trap with the frame's code before the body is read, and nothing else observable differs.
 - `ppl/test/target-js/crc-frame.runtime.test.ts`: the round-trip and trap cases again, through generated code.
-- `wire.test.ts`: the escape and every sub-code round-trip, `params` TLV included; an unassigned sub-code is rejected; `SEEK`'s single-code form.
-- `validate-handles.test.ts`: rejects `ABSORB` on an uninitialized handle, `ABSORB` from a writer fork, a handle used outside its procedure.
+- `wire.test.ts`: every crypto sub-code round-trips, `params` TLV included; an unassigned sub-code is rejected; `SEEK`'s single-code form.
+- `validate-handles.test.ts`: rejects `ABSORB` on an uninitialized handle, `ABSORB`/`ABSORB_REST` from a writer fork, a handle used outside its procedure.
 - `mog-core`: a string literal parses with both escapes; one outside a call argument is a type error.
+
+### 6.3 Stage 2 tests
+
+- `ppl/test/codecs/hash-frame.test.ts`:
+  - each §4.2 name's standard "abc" vector, and every implemented name has one;
+  - chunked absorption equals one-shot; a 1000-byte SHAKE256 output agrees with `node:crypto`;
+  - `tag_len`, `out_len`, `salt`, `personal`, and every missing, unknown or out-of-range parameter;
+  - hash frames round-trip, write the digest of the unframed bytes ahead of them, and trap on every single-bit flip.
+- `ppl/test/target-js/hash-frame.runtime.test.ts`: the interpreter's bytes, the round trip and the flip sweep, through generated code.
+
+### 6.4 Stage 3 tests
+
+- `ppl/test/codecs/mac-frame.test.ts`:
+  - RFC 2202 / RFC 4231 test cases 2 and 6 for `HMAC-MD5`, `HMAC-SHA-1` and SHA-2; every other `HMAC-<hash>` against `node:crypto`;
+  - SP 800-185 KMAC samples 1, 2 and 4; keyed BLAKE2b/s against the BLAKE2 KAT's first entry;
+  - `key` missing, and every unknown or out-of-range MAC parameter;
+  - `keySlots` / `bindKeys`: a missing slot, a key of the wrong length, one slot under two algorithms;
+  - MAC frames round-trip, write the tag of the unframed bytes ahead of them, trap on every single-bit flip and under a different key.
+- `ppl/test/target-js/mac-frame.runtime.test.ts`: the interpreter's bytes, the round trip, the flip sweep and the wrong key, through generated code; its entry points reject a missing or wrong-length key.
 
 ## 7. Target codegen
 
@@ -424,9 +449,18 @@ there. A target with a hardware unit specializes at its own `raise.ts`
 pass, optional and local to one instruction — codec-extension.md §3.5's
 precedent exactly, and the reason §3 insists on the range form.
 
+Every algorithm goes through a **crypto provider** in the target's runtime:
+an injection point with a default implementation.
+
+- target-js's default is today's `@noble/hashes` code; a backend can inject `node:crypto`, a web target WebCrypto.
+- An embedded target may implement only what its codecs use, in software, over an accelerator, or behind a secure world.
+- The interpreter takes a provider too, with the same default.
+- Where an unimplemented name fails is the target's: at startup when it resolves at run time, as an undefined reference when at compile time.
+- How a provider's calling convention fits the target's codegen and runtime is the target's.
+
 ## 8. Out of scope
 
-- **Key establishment** (§5).
+- **Key establishment, key derivation, nonce construction, session management** (§5): the host's, through whatever its provider offers.
 - **Crypto not tied to packet framing** (§1.1): handshakes, application-level signing or encryption.
 - **Composable `Extension`s in `mog-core`** (§2.1).
 - **Signatures and asymmetric operations.** A different lifecycle, with no
@@ -446,5 +480,5 @@ precedent exactly, and the reason §3 insists on the range form.
 | **NIST SP 800-38C / 38D** | tag length, and CCM's nonce length, as explicit *mode* parameters rather than part of the algorithm's name — §4.1's motivating case beyond CRC. |
 | **FIPS 202 / NIST SP 800-185** | XOF semantics: output length is a caller parameter, which §4.1 makes `out_len`. |
 | **RFC 5116** | the AEAD interface (nonce, AAD, tag) stage 5 implements. |
-| **TLS 1.2 record layer (RFC 5246)** | the cipher-plus-separate-MAC composition §6.1 exists to support. |
+| **TLS 1.2 record layer (RFC 5246)** | the cipher-plus-separate-MAC composition stages 3 and 4 give together. |
 | **mbedTLS, TinyCrypt** | the reality check on what an embedded target's library actually offers, and at what granularity. |

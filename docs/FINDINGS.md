@@ -220,3 +220,11 @@ With no `capacity`, the default binary list rules size the count prefix as if ca
 Nothing checks the count against it: `write` goes through `DataView.setUint8`, which wraps.
 A 300-element list encodes as count 44 followed by all 300 elements; decode reads 44 and misreads the rest.
 **Promote as:** a variable-length count for unbounded lists, and reconciliation.md §5.2's validation seam for lengths.
+
+## ppl: no iterator can be placed a runtime distance from the stream's end
+
+**Status:** open. ppl/docs/codec-extension.md §3.1.
+No op yields the bytes remaining; `HAS_NEXT` says only whether one more byte exists.
+`SEEK`'s delta is a literal, so no runtime count moves an iterator either.
+A trailing tag with no length field before it (Modbus RTU's CRC) is therefore inexpressible: `ABSORB`'s `end` can't be put the tag's length short of the end.
+**Promote as:** a remaining-length op and a `SEEK` by `acc`, in the codec extension's spare bytes 222–224.
